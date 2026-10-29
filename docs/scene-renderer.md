@@ -170,10 +170,10 @@ source, and repeat runs vary by about 20%). The first run's times are in parenth
 
 | Filter | vector ms | resvg ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| blur4 | 19.4 (19.7) | 30.4 | 0.64x | 3.0% |
-| blur16 | 19.7 (19.8) | 29.0 | 0.68x | 11% |
+| blur4 | 10.8 (19.7) | 34.2 | 0.32x | 3.0% |
+| blur16 | 9.2 (19.8) | 30.5 | 0.30x | 11% |
 | saturate | 3.3 (13.6) | 10.0 | 0.33x | 0% |
-| dilate3 | 24.6 (24.0) | 30.3 | 0.81x | 11% |
+| dilate3 | 1.3 (24.0) | 17.7 | 0.07x | 11% |
 | gamma | 2.5 (2.7) | 29.6 | 0.08x | 0% |
 | sharpen | 14.3 (48.3) | 21.6 | 0.66x | 0% |
 | turbulence | 50.4 (116.7) | 73.9 | 0.68x | 0% |

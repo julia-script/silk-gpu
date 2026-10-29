@@ -19,6 +19,12 @@ import silk.num.i32
 import silk.num.i64
 import silk.num.u8
 import silk.num.u32
+import silk.num.u64
+import silk.simd.simd
+import silk.simd.u8x16
+import silk.simd.u32x4
+import silk.simd.i32x4
+import silk.simd.f32x4
 import silk.num.usize
 import strips { minU32 }
 import pixmap { Pixmap, Rgba8, div255 }
@@ -367,6 +373,18 @@ impl BlurPlan {
   /// Kernel weights (sum 65536), centered.
   pub fn kernel(self: &Self) -> &[u32] { return self.weights.asSlice() }
   pub fn isIdentity(self: &Self) -> bool { return self.boxes.length() == 0 && self.weights.length() == 0 }
+  /// The farthest any pass reads from an element, in elements.
+  pub fn reach(self: &Self) -> usize {
+    let mut most = self.weights.length() / 2
+    let boxes = self.boxes.asSlice()
+    let mut p: usize = 0
+    while p < boxes.length {
+      let size = u32.toUsize(boxes[p])
+      if size > most { most = size }
+      p = p + 2
+    }
+    return most
+  }
 }
 
 /// `exp(x)` for `x <= 0` (silk-lang/silk#2539: the stdlib has no exp yet).
@@ -398,114 +416,206 @@ fn exp(x: f64) -> f64 {
 pub effect fn gaussianBlur(out: &mut Pixmap, input: &Pixmap, horizontal: &BlurPlan, vertical: &BlurPlan, region: Region) -> () ! OutOfMemoryError ? &mut Allocator {
   copy(&mut out, input, region)
   let r = region.clampTo(out.width(), out.height())
-  let mut line = List<u32>.make()
-  let mut scratch = List<u32>.make()
-  let longest = u32.toUsize(if r.x1 - r.x0 > r.y1 - r.y0 { r.x1 - r.x0 } else { r.y1 - r.y0 })
-  run line.appendRepeated(0, longest * 4)
-  run scratch.appendRepeated(0, longest * 4)
+  if r.x1 <= r.x0 || r.y1 <= r.y0 { return }
   let stride = u32.toUsize(out.width()) * 4
+  let width = u32.toUsize(r.x1 - r.x0)
+  let height = u32.toUsize(r.y1 - r.y0)
+  let left = u32.toUsize(r.x0) * 4
+  let top = u32.toUsize(r.y0)
   let d = out.dataMut()
-  // Rows.
-  let mut y = r.y0
-  while y < r.y1 {
-    let base = u32.toUsize(y) * stride + u32.toUsize(r.x0) * 4
-    run blurLine(&mut d, base, 4, u32.toUsize(r.x1 - r.x0), horizontal, &mut line, &mut scratch)
-    y = y + 1
+  // Every pass slides a window along a buffer of u32 lanes, one pixel (four lanes) per step
+  // across a row or a strip of up to STRIP pixels per step down the columns. Buffers are
+  // padded with transparent pixels on both ends, wide enough for every window, and the
+  // padding stays zero. Rows go first, then columns.
+  if !horizontal.isIdentity() {
+    let pad = horizontal.reach()
+    let mut first = List<u32>.make()
+    let mut second = List<u32>.make()
+    run first.appendRepeated(0, (width + 2 * pad) * 4)
+    run second.appendRepeated(0, (width + 2 * pad) * 4)
+    let mut sums = List<u32>.make()
+    run sums.appendRepeated(0, 4)
+    let mut y: usize = 0
+    while y < height {
+      let row = (top + y) * stride + left
+      widenRow(first.asMutSlice(), pad * 4, &d, row, width * 4)
+      let inFirst = blurPasses(first.asMutSlice(), second.asMutSlice(), sums.asMutSlice(), width, 4, pad, horizontal)
+      narrowRow(&mut d, row, if inFirst { first.asSlice() } else { second.asSlice() }, pad * 4, width * 4)
+      y = y + 1
+    }
   }
-  let mut x = r.x0
-  while x < r.x1 {
-    let base = u32.toUsize(r.y0) * stride + u32.toUsize(x) * 4
-    run blurLine(&mut d, base, stride, u32.toUsize(r.y1 - r.y0), vertical, &mut line, &mut scratch)
-    x = x + 1
+  if !vertical.isIdentity() {
+    let pad = vertical.reach()
+    let mut first = List<u32>.make()
+    let mut second = List<u32>.make()
+    run first.appendRepeated(0, (height + 2 * pad) * STRIP * 4)
+    run second.appendRepeated(0, (height + 2 * pad) * STRIP * 4)
+    let mut sums = List<u32>.make()
+    run sums.appendRepeated(0, STRIP * 4)
+    let mut x: usize = 0
+    while x < width {
+      let pixels = if x + STRIP < width { STRIP } else { width - x }
+      let unit = pixels * 4
+      // A narrower last strip moves the bottom padding into lanes earlier strips wrote.
+      if pixels < STRIP {
+        fillLanes(first.asMutSlice(), (pad + height) * unit, pad * unit)
+        fillLanes(second.asMutSlice(), (pad + height) * unit, pad * unit)
+      }
+      let mut y: usize = 0
+      while y < height {
+        widenRow(first.asMutSlice(), (pad + y) * unit, &d, (top + y) * stride + left + x * 4, unit)
+        y = y + 1
+      }
+      let inFirst = blurPasses(first.asMutSlice(), second.asMutSlice(), sums.asMutSlice(), height, unit, pad, vertical)
+      let result = if inFirst { first.asSlice() } else { second.asSlice() }
+      y = 0
+      while y < height {
+        narrowRow(&mut d, (top + y) * stride + left + x * 4, result, (pad + y) * unit, unit)
+        y = y + 1
+      }
+      x = x + pixels
+    }
   }
 }
 
-/// Blurs `count` pixels starting at byte `base`, `step` bytes apart, in place.
-effect fn blurLine(d: &mut [u8], base: usize, step: usize, count: usize, plan: &BlurPlan, line: &mut List<u32>, scratch: &mut List<u32>) -> () ! OutOfMemoryError ? &mut Allocator {
-  if plan.isIdentity() || count == 0 { return }
-  let a = line.asMutSlice()
+/// Pixels per column strip of [`gaussianBlur`].
+const STRIP: usize = 16
+
+fn fillLanes(d: &mut [u32], to: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
   let mut i: usize = 0
-  while i < count * 4 {
-    a[i] = u8.toU32(d[base + (i / 4) * step + i % 4])
+  while i < n {
+    target[i] = 0
     i = i + 1
   }
+}
+
+/// Copies `n` bytes of `s` from `from` into lanes of `d` from `to`.
+fn widenRow(d: &mut [u32], to: usize, s: &[u8], from: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let source = Slice.view(s, from, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = u8.toU32(source[i])
+    i = i + 1
+  }
+}
+
+/// Copies `n` lanes of `s` from `from`, each at most 255, into bytes of `d` from `to`.
+fn narrowRow(d: &mut [u8], to: usize, s: &[u32], from: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let source = Slice.view(s, from, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = u32.wrappingToU8(source[i])
+    i = i + 1
+  }
+}
+
+/// Runs `plan`'s passes over `count` steps of `unit` lanes (a multiple of 4) that start `pad`
+/// steps into `first`, alternating with `second`; returns whether the result ended in `first`.
+fn blurPasses(first: &mut [u32], second: &mut [u32], sums: &mut [u32], count: usize, unit: usize, pad: usize, plan: &BlurPlan) -> bool {
   let passes = plan.boxPasses()
-  if passes.length > 0 {
-    let mut p: usize = 0
-    while p < passes.length {
-      boxPass(line.asSlice(), scratch.asMutSlice(), count, passes[p], passes[p + 1])
-      // Swap by copying back (lines are short).
-      let src = scratch.asSlice()
-      let dst = line.asMutSlice()
-      let mut k: usize = 0
-      while k < count * 4 {
-        dst[k] = src[k]
-        k = k + 1
-      }
-      p = p + 2
-    }
-  } else {
-    kernelPass(line.asSlice(), scratch.asMutSlice(), count, plan.kernel())
-    let src = scratch.asSlice()
-    let dst = line.asMutSlice()
-    let mut k: usize = 0
-    while k < count * 4 {
-      dst[k] = src[k]
-      k = k + 1
-    }
+  if passes.length == 0 {
+    kernelSlide(&first, &mut second, &mut sums, count, unit, pad, plan.kernel())
+    return false
   }
-  let result = line.asSlice()
-  i = 0
-  while i < count * 4 {
-    d[base + (i / 4) * step + i % 4] = u32.toU8(result[i])
+  let mut inFirst = true
+  let mut p: usize = 0
+  while p < passes.length {
+    if inFirst {
+      boxSlide(&first, &mut second, &mut sums, count, unit, pad, passes[p], passes[p + 1])
+    } else {
+      boxSlide(&second, &mut first, &mut sums, count, unit, pad, passes[p], passes[p + 1])
+    }
+    inFirst = !inFirst
+    p = p + 2
+  }
+  return inFirst
+}
+
+/// One box blur: output step `i` averages input steps `i - left .. i - left + size`, rounded
+/// to nearest.
+fn boxSlide(input: &[u32], output: &mut [u32], sums: &mut [u32], count: usize, unit: usize, pad: usize, size: u32, left: u32) -> () {
+  let start = (pad - u32.toUsize(left)) * unit
+  let mut b: usize = 0
+  while b < unit {
+    u32x4.store(&mut sums, b, u32x4.splat(size / 2))
+    b = b + 4
+  }
+  let mut k: usize = 0
+  while k < u32.toUsize(size) {
+    let row = start + k * unit
+    b = 0
+    while b < unit {
+      let sum = u32x4.load(&sums, b)
+      u32x4.store(&mut sums, b, u32x4.wrappingAdd(sum, u32x4.load(input, row + b)))
+      b = b + 4
+    }
+    k = k + 1
+  }
+  // `floor(x / size)` for the sums x (which carry `size / 2` for rounding) in f32: the
+  // quotient `(x + 0.5) / size` is at least `0.5 / size` from an integer, and computed within
+  // 2^-15 of it while sizes are below 16384, so rounding it minus 0.5 to an integer (by adding
+  // 2^23 - 0.5 and reading the low mantissa bits) gives the floor. Wider boxes divide.
+  let fast = size < 16384
+  let inverse = f32x4.splat(1.0 / u32.toF32(size))
+  let halfLane = f32x4.splat(0.5)
+  let rounder = f32x4.splat(8388607.5)
+  let exponent = u32x4.splat(0x4B000000)
+  let mut i: usize = 0
+  while i < count {
+    let target = (pad + i) * unit
+    let leaving = start + i * unit
+    let entering = leaving + u32.toUsize(size) * unit
+    b = 0
+    while b < unit {
+      let sum = u32x4.load(&sums, b)
+      if fast {
+        let quotient = (i32x4.toF32x4(u32x4.bitcastToI32x4(sum)) + halfLane) * inverse + rounder
+        u32x4.store(&mut output, target + b, u32x4.wrappingSubtract(f32x4.bitcastToU32x4(quotient), exponent))
+      } else {
+        u32x4.store(&mut output, target + b, sum / u32x4.splat(size))
+      }
+      let moved = u32x4.wrappingAdd(sum, u32x4.load(input, entering + b))
+      u32x4.store(&mut sums, b, u32x4.wrappingSubtract(moved, u32x4.load(input, leaving + b)))
+      b = b + 4
+    }
     i = i + 1
   }
 }
 
-/// One box blur: output `i` averages inputs `i - left .. i - left + size` (missing inputs are
-/// transparent), rounded to nearest.
-pub fn boxPass(input: &[u32], output: &mut [u32], count: usize, size: u32, left: u32) -> () {
-  let n = usize.toI64(count)
-  let mut c: usize = 0
-  while c < 4 {
-    // Window sum for output 0, then slide it.
-    let mut sum: u32 = 0
-    let mut k: i64 = 0 - u32.toI64(left)
-    while k < u32.toI64(size) - u32.toI64(left) {
-      if k >= 0 && k < n { sum = sum + input[i64.toUsize(k) * 4 + c] }
+/// One kernel pass with fixed-point weights summing to 65536, centered on each step.
+fn kernelSlide(input: &[u32], output: &mut [u32], sums: &mut [u32], count: usize, unit: usize, pad: usize, weights: &[u32]) -> () {
+  let start = (pad - weights.length / 2) * unit
+  let shift = u32x4.splat(16)
+  let mut i: usize = 0
+  while i < count {
+    let mut b: usize = 0
+    while b < unit {
+      u32x4.store(&mut sums, b, u32x4.splat(32768))
+      b = b + 4
+    }
+    let mut k: usize = 0
+    while k < weights.length {
+      let w = u32x4.splat(weights[k])
+      let row = start + (i + k) * unit
+      b = 0
+      while b < unit {
+        let term = u32x4.wrappingMultiply(u32x4.load(input, row + b), w)
+        let sum = u32x4.load(&sums, b)
+        u32x4.store(&mut sums, b, u32x4.wrappingAdd(sum, term))
+        b = b + 4
+      }
       k = k + 1
     }
-    let mut i: i64 = 0
-    while i < n {
-      output[i64.toUsize(i) * 4 + c] = (sum + size / 2) / size
-      let leaving = i - u32.toI64(left)
-      let entering = leaving + u32.toI64(size)
-      if leaving >= 0 && leaving < n { sum = sum - input[i64.toUsize(leaving) * 4 + c] }
-      if entering >= 0 && entering < n { sum = sum + input[i64.toUsize(entering) * 4 + c] }
-      i = i + 1
+    let target = (pad + i) * unit
+    b = 0
+    while b < unit {
+      u32x4.store(&mut output, target + b, u32x4.shiftRight(u32x4.load(&sums, b), shift))
+      b = b + 4
     }
-    c = c + 1
-  }
-}
-
-/// One kernel pass with fixed-point weights summing to 65536.
-pub fn kernelPass(input: &[u32], output: &mut [u32], count: usize, weights: &[u32]) -> () {
-  let radius = usize.toI64(weights.length / 2)
-  let mut c: usize = 0
-  while c < 4 {
-    let mut i: usize = 0
-    while i < count {
-      let mut sum: u32 = 0
-      let mut k: i64 = 0
-      while k < usize.toI64(weights.length) {
-        let j = usize.toI64(i) + k - radius
-        if j >= 0 && j < usize.toI64(count) { sum = sum + input[i64.toUsize(j) * 4 + c] * weights[i64.toUsize(k)] }
-        k = k + 1
-      }
-      output[i * 4 + c] = u32.shiftRight(sum + 32768, 16)
-      i = i + 1
-    }
-    c = c + 1
+    i = i + 1
   }
 }
 
@@ -609,43 +719,120 @@ pub effect fn morphology(out: &mut Pixmap, input: &Pixmap, operator: u8, rx: u32
   copy(&mut out, input, region)
   if rx == 0 || ry == 0 { return }
   let r = region.clampTo(out.width(), out.height())
-  let stride = u32.toUsize(out.width()) * 4
-  let mut rows = run Pixmap.make(out.width(), out.height())
-  morphologyPass(rows.dataMut(), out.data(), stride, r, operator, rx, true)
-  morphologyPass(out.dataMut(), rows.data(), stride, r, operator, ry, false)
-}
-
-/// One axis of [`morphology`] from `s` into `d` inside `r`.
-fn morphologyPass(d: &mut [u8], s: &[u8], stride: usize, r: Region, operator: u8, radius: u32, horizontal: bool) -> () {
+  if r.x1 <= r.x0 || r.y1 <= r.y0 { return }
   let dilate = operator == MORPHOLOGY_DILATE
-  let mut y = r.y0
-  while y < r.y1 {
-    let mut x = r.x0
-    while x < r.x1 {
-      let p = if horizontal { x } else { y }
-      let lo = if horizontal { r.x0 } else { r.y0 }
-      let hi = if horizontal { r.x1 } else { r.y1 }
-      let mut c: usize = 0
-      while c < 4 {
-        let mut v: u32 = if dilate { 0 } else { 255 }
-        // Past the region is transparent: erode sees a zero there.
-        if !dilate && (p < lo + radius || p + radius >= hi) { v = 0 }
-        let start = if p < lo + radius { lo } else { p - radius }
-        let end = minU32(p + radius + 1, hi)
-        let mut q = start
-        while q < end {
-          let i = if horizontal { u32.toUsize(y) * stride + u32.toUsize(q) * 4 } else { u32.toUsize(q) * stride + u32.toUsize(x) * 4 }
-          let value = u8.toU32(s[i + c])
-          if dilate { if value > v { v = value } } else if value < v { v = value }
-          q = q + 1
-        }
-        d[u32.toUsize(y) * stride + u32.toUsize(x) * 4 + c] = u32.toU8(v)
-        c = c + 1
-      }
-      x = x + 1
-    }
+  let stride = u32.toUsize(out.width()) * 4
+  let width = u32.toUsize(r.x1 - r.x0)
+  let height = u32.toUsize(r.y1 - r.y0)
+  let rowBytes = width * 4
+  let left = u32.toUsize(r.x0) * 4
+  let top = u32.toUsize(r.y0)
+  // Each axis copies its lines into a buffer padded with `radius` transparent elements on
+  // both sides (a zero is what both operators see past the region), widens each element to
+  // the extreme of the largest power-of-two run that fits the window, then takes the extreme
+  // of two overlapping runs per output.
+  let padX = u32.toUsize(rx)
+  let windowX = 2 * padX + 1
+  let mut line = List<u8>.make()
+  run line.appendRepeated(0, (width + 2 * padX) * 4)
+  let d = out.dataMut()
+  let mut y: usize = 0
+  while y < height {
+    let row = (top + y) * stride + left
+    let buffer = line.asMutSlice()
+    // Widening clobbered the previous row's padding.
+    fillBytes(&mut buffer, 0, padX * 4)
+    fillBytes(&mut buffer, padX * 4 + rowBytes, padX * 4)
+    copyBytes(&mut buffer, padX * 4, &d, row, rowBytes)
+    let span = widenPrefix(&mut buffer, width + windowX - 1, 4, windowX, dilate)
+    combineBytes(&mut d, row, &buffer, 0, (windowX - span) * 4, rowBytes, dilate)
     y = y + 1
   }
+  // The vertical pass runs on whole rows of the region at once.
+  let padY = u32.toUsize(ry)
+  let windowY = 2 * padY + 1
+  let mut rows = List<u8>.make()
+  run rows.appendRepeated(0, (height + 2 * padY) * rowBytes)
+  let buffer = rows.asMutSlice()
+  y = 0
+  while y < height {
+    copyBytes(&mut buffer, (padY + y) * rowBytes, &d, (top + y) * stride + left, rowBytes)
+    y = y + 1
+  }
+  let span = widenPrefix(&mut buffer, height + windowY - 1, rowBytes, windowY, dilate)
+  y = 0
+  while y < height {
+    combineBytes(&mut d, (top + y) * stride + left, &buffer, y * rowBytes, (y + windowY - span) * rowBytes, rowBytes, dilate)
+    y = y + 1
+  }
+}
+
+fn maxU8(a: u8, b: u8) -> u8 with Intrinsic.inlineAlways() { return if a > b { a } else { b } }
+fn minU8(a: u8, b: u8) -> u8 with Intrinsic.inlineAlways() { return if a < b { a } else { b } }
+
+fn fillBytes(d: &mut [u8], to: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = 0
+    i = i + 1
+  }
+}
+
+/// Copies `n` bytes of `s` from `from` to `d` at `to`.
+fn copyBytes(d: &mut [u8], to: usize, s: &[u8], from: usize, n: usize) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let source = Slice.view(s, from, n)
+  let mut i: usize = 0
+  while i < n {
+    target[i] = source[i]
+    i = i + 1
+  }
+}
+
+/// `d[to + i]` = the extreme of `s[a + i]` and `s[b + i]` for `i < n`.
+fn combineBytes(d: &mut [u8], to: usize, s: &[u8], a: usize, b: usize, n: usize, dilate: bool) -> () {
+  let target = Slice.viewMut(&mut d, to, n)
+  let first = Slice.view(s, a, n)
+  let second = Slice.view(s, b, n)
+  let mut i: usize = 0
+  while i + 16 <= n {
+    let x = u8x16.load(first, i)
+    let y = u8x16.load(second, i)
+    u8x16.store(&mut target, i, if dilate { u8x16.maximum(x, y) } else { u8x16.minimum(x, y) })
+    i = i + 16
+  }
+  while i < n {
+    target[i] = if dilate { maxU8(first[i], second[i]) } else { minU8(first[i], second[i]) }
+    i = i + 1
+  }
+}
+
+/// Turns each of the `count` elements of `unit` bytes in `buffer` into the extreme of the
+/// largest power-of-two run of elements starting there that fits in `window`, and returns
+/// that run's length. Elements near the end keep shorter runs; callers read only those whose
+/// runs fit.
+fn widenPrefix(buffer: &mut [u8], count: usize, unit: usize, window: usize, dilate: bool) -> usize {
+  let mut span: usize = 1
+  while span * 2 <= window {
+    let shift = span * unit
+    let n = count * unit - shift
+    // Ascending, each step reads lanes at and past the ones it writes, which are not yet
+    // rewritten.
+    let mut i: usize = 0
+    while i + 16 <= n {
+      let x = u8x16.load(&buffer, i)
+      let y = u8x16.load(&buffer, i + shift)
+      u8x16.store(&mut buffer, i, if dilate { u8x16.maximum(x, y) } else { u8x16.minimum(x, y) })
+      i = i + 16
+    }
+    while i < n {
+      buffer[i] = if dilate { maxU8(buffer[i], buffer[i + shift]) } else { minU8(buffer[i], buffer[i + shift]) }
+      i = i + 1
+    }
+    span = span * 2
+  }
+  return span
 }
 
 /// `feComponentTransfer` lookup tables, one per channel, on unpremultiplied bytes.

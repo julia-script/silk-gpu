@@ -5,6 +5,8 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.i32
 import silk.num.usize
+import silk.num.i64
+import silk.collections.list { List }
 import pixmap { Pixmap, Rgba8 }
 import layer { BLEND_MULTIPLY }
 import geometry { Affine }
@@ -168,6 +170,183 @@ test effect fn morphologyGrowsAndShrinks() -> () ! AssertionError<'static> | Out
   run Testing.expect(out.pixel(5, 5).a == 255 && out.pixel(6, 6).a == 255 && out.pixel(4, 5).a == 0 && out.pixel(7, 6).a == 0, "erode by 1")
   run morphology(&mut out, &input, MORPHOLOGY_ERODE, 1, 1, Region.make(4, 4, 8, 8)) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(out.pixel(4, 4).a == 0 && out.pixel(5, 5).a == 255, "past the region is transparent")
+}
+
+/// One axis of a blur plan over `values`, straight from the definitions.
+effect fn blurReference(values: &List<u32>, plan: &BlurPlan) -> List<u32> ! OutOfMemoryError ? &mut Allocator {
+  let n = values.length()
+  let mut current = List<u32>.make()
+  let mut i: usize = 0
+  while i < n {
+    run current.append(values.asSlice()[i])
+    i = i + 1
+  }
+  let boxes = plan.boxPasses()
+  let weights = plan.kernel()
+  let mut p: usize = 0
+  while p < boxes.length || (p == 0 && weights.length > 0) {
+    let mut next = List<u32>.make()
+    i = 0
+    while i < n {
+      let mut sum: u32 = 0
+      if boxes.length > 0 {
+        let size = boxes[p]
+        let mut k: u32 = 0
+        while k < size {
+          let j = usize.toI64(i) + u32.toI64(k) - u32.toI64(boxes[p + 1])
+          if j >= 0 && j < usize.toI64(n) { sum = sum + current.asSlice()[i64.toUsize(j)] }
+          k = k + 1
+        }
+        run next.append((sum + size / 2) / size)
+      } else {
+        sum = 32768
+        let mut k: usize = 0
+        while k < weights.length {
+          let j = usize.toI64(i) + usize.toI64(k) - usize.toI64(weights.length / 2)
+          if j >= 0 && j < usize.toI64(n) { sum = sum + current.asSlice()[i64.toUsize(j)] * weights[k] }
+          k = k + 1
+        }
+        run next.append(u32.shiftRight(sum, 16))
+      }
+      i = i + 1
+    }
+    current = move next
+    p = p + 2
+  }
+  return move current
+}
+
+test effect fn blurMatchesTheDefinition() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let width: u32 = 37
+  let height: u32 = 23
+  let mut input = run Pixmap.make(width, height) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut seed: u32 = 777
+  let data = input.dataMut()
+  let mut k: usize = 0
+  while k < data.length {
+    seed = u32.wrappingAdd(u32.wrappingMultiply(seed, 1103515245), 12345)
+    data[k] = u32.toU8(u32.shiftRight(seed, 16) & 255)
+    k = k + 1
+  }
+  let mut out = run Pixmap.make(width, height) |> Effect.provideMut<Allocator>(&mut allocator)
+  let sigmas: [f64; 4] = [0.0, 0.7, 3.0, 5.5]
+  let mut a: usize = 0
+  while a < 4 {
+    let mut b: usize = 0
+    while b < 4 {
+      let horizontal = run BlurPlan.make(sigmas[a]) |> Effect.provideMut<Allocator>(&mut allocator)
+      let vertical = run BlurPlan.make(sigmas[b]) |> Effect.provideMut<Allocator>(&mut allocator)
+      let region = if (a + b) % 2 == 0 { Region.make(0, 0, width, height) } else { Region.make(3, 2, 33, 20) }
+      run gaussianBlur(&mut out, &input, &horizontal, &vertical, region) |> Effect.provideMut<Allocator>(&mut allocator)
+      let rw = u32.toUsize(region.x1 - region.x0)
+      let rh = u32.toUsize(region.y1 - region.y0)
+      // Rows, then columns, of each channel.
+      let mut c: usize = 0
+      while c < 4 {
+        let mut grid = List<u32>.make()
+        let mut y: usize = 0
+        while y < rh {
+          let mut line = List<u32>.make()
+          let mut x: usize = 0
+          while x < rw {
+            let at = ((u32.toUsize(region.y0) + y) * u32.toUsize(width) + u32.toUsize(region.x0) + x) * 4 + c
+            run line.append(u8.toU32(input.data()[at])) |> Effect.provideMut<Allocator>(&mut allocator)
+            x = x + 1
+          }
+          let blurred = run blurReference(&line, &horizontal) |> Effect.provideMut<Allocator>(&mut allocator)
+          x = 0
+          while x < rw {
+            run grid.append(blurred.asSlice()[x]) |> Effect.provideMut<Allocator>(&mut allocator)
+            x = x + 1
+          }
+          y = y + 1
+        }
+        let mut x: usize = 0
+        while x < rw {
+          let mut line = List<u32>.make()
+          y = 0
+          while y < rh {
+            run line.append(grid.asSlice()[y * rw + x]) |> Effect.provideMut<Allocator>(&mut allocator)
+            y = y + 1
+          }
+          let blurred = run blurReference(&line, &vertical) |> Effect.provideMut<Allocator>(&mut allocator)
+          y = 0
+          while y < rh {
+            let at = ((u32.toUsize(region.y0) + y) * u32.toUsize(width) + u32.toUsize(region.x0) + x) * 4 + c
+            run Testing.expect(u8.toU32(out.data()[at]) == blurred.asSlice()[y], "blur matches the definition")
+            y = y + 1
+          }
+          x = x + 1
+        }
+        c = c + 1
+      }
+      b = b + 1
+    }
+    a = a + 1
+  }
+}
+
+/// The spec's window, one pixel and channel at a time.
+fn morphologyReference(input: &Pixmap, dilate: bool, rx: u32, ry: u32, r: Region, x: u32, y: u32, c: usize) -> u8 {
+  let mut v: u32 = if dilate { 0 } else { 255 }
+  let mut j: i32 = 0 - u32.toI32(ry)
+  while j <= u32.toI32(ry) {
+    let mut i: i32 = 0 - u32.toI32(rx)
+    while i <= u32.toI32(rx) {
+      let px = u32.toI32(x) + i
+      let py = u32.toI32(y) + j
+      let inside = px >= u32.toI32(r.x0) && px < u32.toI32(r.x1) && py >= u32.toI32(r.y0) && py < u32.toI32(r.y1)
+      let value: u32 = if inside { u8.toU32(input.data()[(i32.toUsize(py) * u32.toUsize(input.width()) + i32.toUsize(px)) * 4 + c]) } else { 0 }
+      if dilate { if value > v { v = value } } else if value < v { v = value }
+      i = i + 1
+    }
+    j = j + 1
+  }
+  return u32.toU8(v)
+}
+
+test effect fn morphologyMatchesTheWindow() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(23, 17) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut seed: u32 = 12345
+  let data = input.dataMut()
+  let mut k: usize = 0
+  while k < data.length {
+    seed = u32.wrappingAdd(u32.wrappingMultiply(seed, 1103515245), 12345)
+    data[k] = u32.toU8(u32.shiftRight(seed, 16) & 255)
+    k = k + 1
+  }
+  let mut out = run Pixmap.make(23, 17) |> Effect.provideMut<Allocator>(&mut allocator)
+  let radii: [u32; 6] = [1, 2, 3, 5, 6, 13]
+  let mut a: usize = 0
+  while a < 6 {
+    let mut b: usize = 0
+    while b < 6 {
+      let mut op: u8 = 0
+      while op < 2 {
+        let region = if b % 2 == 0 { Region.make(0, 0, 23, 17) } else { Region.make(3, 2, 20, 13) }
+        run morphology(&mut out, &input, op, radii[a], radii[b], region) |> Effect.provideMut<Allocator>(&mut allocator)
+        let mut y = region.y0
+        while y < region.y1 {
+          let mut x = region.x0
+          while x < region.x1 {
+            let mut c: usize = 0
+            while c < 4 {
+              let want = morphologyReference(&input, op == MORPHOLOGY_DILATE, radii[a], radii[b], region, x, y, c)
+              run Testing.expect(out.data()[(u32.toUsize(y) * 23 + u32.toUsize(x)) * 4 + c] == want, "morphology window")
+              c = c + 1
+            }
+            x = x + 1
+          }
+          y = y + 1
+        }
+        op = op + 1
+      }
+      b = b + 1
+    }
+    a = a + 1
+  }
 }
 
 test effect fn componentTransferFunctions() -> () ! AssertionError<'static> {
