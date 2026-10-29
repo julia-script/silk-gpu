@@ -10,20 +10,26 @@ import silk.num.usize
 import geometry { Point, Rect, Affine }
 import path { Path, MOVE, LINE, QUAD, CUBIC, ARC, CLOSE }
 import stroke_curve { Curve, norm }
+import stroke_space_curve { StrokeCurve }
 import stroke_arcs
 import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
 import projective { Homography, strokeScale }
 import projective
 
 pub const JOIN_MITER: u8 = 0
+
 pub const JOIN_MITER_CLIP: u8 = 1
+
 pub const JOIN_ROUND: u8 = 2
+
 pub const JOIN_BEVEL: u8 = 3
 
 pub const JOIN_ARCS: u8 = 4
 
 pub const CAP_BUTT: u8 = 0
+
 pub const CAP_ROUND: u8 = 1
+
 pub const CAP_SQUARE: u8 = 2
 
 const MAX_POINTS: usize = 1048576
@@ -38,9 +44,17 @@ pub struct Stroke {
   pub dashOffset: f64,
   dashes: List<f64>,
 }
+
 impl Stroke {
   pub fn make(width: f64) -> Stroke {
-    return Stroke { width: width, join: JOIN_MITER, cap: CAP_BUTT, miterLimit: 4.0, dashOffset: 0.0, dashes: List<f64>.make() }
+    return Stroke {
+      width: width,
+      join: JOIN_MITER,
+      cap: CAP_BUTT,
+      miterLimit: 4.0,
+      dashOffset: 0.0,
+      dashes: List<f64>.make(),
+    }
   }
 
   pub fn dashArray(self: &Self) -> &[f64] {
@@ -65,7 +79,9 @@ impl Stroke {
       return
     }
     run self.dashes.appendSlice(values)
-    if values.length % 2 == 1 { run self.dashes.appendSlice(values) }
+    if values.length % 2 == 1 {
+      run self.dashes.appendSlice(values)
+    }
   }
 }
 
@@ -83,6 +99,7 @@ struct Subpath {
   count: usize,
   closed: bool
 }
+
 impl Copy for Subpath {}
 
 struct Vertex {
@@ -175,11 +192,20 @@ fn maxScale(m: &Affine) -> f64 {
 pub struct Stroker {
   vertices: List<Vertex>,
   subpaths: List<Subpath>,
-  curves: List<Curve>,
+  curves: List<StrokeCurve>,
   dashVertices: List<Vertex>,
   dashSubpaths: List<Subpath>,
   scratch: Path,
   dashMetric: f64,
+  inSpace: bool,
+  sourceToStroke: Homography,
+  strokeToDevice: Homography,
+  deviceClip: Rect,
+  deviceTolerance: f64,
+  clipSpace: bool,
+  spacePending: bool,
+  spaceBroken: bool,
+  spaceDashed: bool,
 }
 
 impl Stroker {
@@ -187,12 +213,103 @@ impl Stroker {
     return Stroker {
       vertices: List<Vertex>.make(),
       subpaths: List<Subpath>.make(),
-      curves: List<Curve>.make(),
+      curves: List<StrokeCurve>.make(),
       dashVertices: List<Vertex>.make(),
       dashSubpaths: List<Subpath>.make(),
       scratch: Path.make(),
       dashMetric: 1.0,
+      inSpace: false,
+      sourceToStroke: Homography.fromAffine(&Affine.identity()),
+      strokeToDevice: Homography.fromAffine(&Affine.identity()),
+      deviceClip: Rect.make(0.0, 0.0, 0.0, 0.0),
+      deviceTolerance: 1.0,
+      clipSpace: false,
+      spacePending: false,
+      spaceBroken: false,
+      spaceDashed: false,
     }
+  }
+
+  /// Stroke an analytic centerline in an independent stroke host. Width, dashes,
+  /// caps and joins use host coordinates. Appends a host-space outline whose
+  /// projection error is <= tolerance inside deviceClip. Errors invalidate
+  /// partial output. Reserve a separate tolerance for projective.fill.
+  pub effect fn strokeInSpace(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    sourceToStroke: &Homography,
+    strokeToDevice: &Homography,
+    deviceClip: Rect,
+    tolerance: f64,
+    out: &mut Path,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    run self.configureSpace(sourceToStroke, strokeToDevice, deviceClip, tolerance, true)
+    let scale = run spaceScale(strokeToDevice, deviceClip, tolerance)
+    let pen = run prepareScaled(path, style, scale, tolerance)
+    if style.width == 0.0 || deviceClip.x0 == deviceClip.x1 || deviceClip.y0 == deviceClip.y1
+      || (strokeToDevice.wx == 0.0 && strokeToDevice.wy == 0.0 && strokeToDevice.ww <= 0.0) {
+      return
+    }
+    run self.emit(path, style, pen, &mut out)
+    run validateOutput(&out.*, &Affine.identity(), pen.tolerance)
+  }
+
+  /// Unclipped device-space bounds of the host-space stroke. ignoreDashes
+  /// selects undashed reference-box geometry. Unbounded connected geometry fails.
+  pub effect fn boundsInSpace(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    sourceToStroke: &Homography,
+    strokeToDevice: &Homography,
+    tolerance: f64,
+    ignoreDashes: bool,
+  ) -> StrokeBounds
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    run self.configureSpace(
+      sourceToStroke,
+      strokeToDevice,
+      Rect.make(0.0, 0.0, 0.0, 0.0),
+      tolerance,
+      false,
+    )
+    if strokeToDevice.wx == 0.0 && strokeToDevice.wy == 0.0 {
+      if strokeToDevice.ww <= 0.0 {
+        drop run prepareScaled(path, style, 1.0, tolerance)
+        return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+      }
+      let affine = spaceAffine(strokeToDevice)
+      return run self.affineBounds(path, style, &affine, tolerance, ignoreDashes)
+    }
+    return run self.measureSpace(path, style, strokeToDevice, tolerance, ignoreDashes)
+  }
+
+  effect fn configureSpace(
+    self: &mut Self,
+    source: &Homography,
+    target: &Homography,
+    clip: Rect,
+    tolerance: f64,
+    clipped: bool,
+  ) -> ()
+    ! GeometryError {
+    if !source.isFinite() || !target.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance)
+      || !Point.make(clip.x0, clip.y0).isFinite()
+      || !Point.make(clip.x1, clip.y1).isFinite()
+      || clip.x0 > clip.x1
+      || clip.y0 > clip.y1 {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    self.inSpace = true
+    self.sourceToStroke = source.*
+    self.strokeToDevice = target.*
+    self.deviceClip = clip
+    self.deviceTolerance = tolerance
+    self.clipSpace = clipped
   }
 
   /// Appends a user-space outline, with target-space geometric error no greater than tolerance.
@@ -207,6 +324,7 @@ impl Stroker {
   ) -> ()
     ! OutOfMemoryError | GeometryError
     ? &mut Allocator {
+    self.inSpace = false
     let pen = run prepare(path, style, transform, tolerance)
     if style.width == 0.0 || maxScale(transform) == 0.0 {
       return
@@ -231,6 +349,7 @@ impl Stroker {
   ) -> ()
     ! OutOfMemoryError | GeometryError
     ? &mut Allocator {
+    self.inSpace = false
     if !transform.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance)
       || !Point.make(clip.x0, clip.y0).isFinite()
       || !Point.make(clip.x1, clip.y1).isFinite()
@@ -286,6 +405,7 @@ impl Stroker {
   ) -> StrokeBounds
     ! GeometryError | OutOfMemoryError
     ? &mut Allocator {
+    self.inSpace = false
     if !transform.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance) {
       fail GeometryError { code: INVALID_INPUT }
     }
@@ -310,6 +430,19 @@ impl Stroker {
       }
       return run self.bounds(path, style, &affine, tolerance, ignoreDashes)
     }
+    return run self.measureSpace(path, style, transform, tolerance, ignoreDashes)
+  }
+
+  effect fn measureSpace(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    transform: &Homography,
+    tolerance: f64,
+    ignoreDashes: bool,
+  ) -> StrokeBounds
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
     let mut sourceTolerance = tolerance
     let mut iteration: u32 = 0
     while iteration < 64 {
@@ -423,6 +556,20 @@ impl Stroker {
   ) -> StrokeBounds
     ! OutOfMemoryError | GeometryError
     ? &mut Allocator {
+    self.inSpace = false
+    return run self.affineBounds(path, style, transform, tolerance, ignoreDashes)
+  }
+
+  effect fn affineBounds(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    transform: &Affine,
+    tolerance: f64,
+    ignoreDashes: bool,
+  ) -> StrokeBounds
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
     let pen = run prepare(path, style, transform, tolerance)
     if style.width == 0.0 {
       return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
@@ -458,6 +605,215 @@ impl Stroker {
     return StrokeBounds { empty: false, bounds: box }
   }
 
+  effect fn beginSource(self: &mut Self, p: Point) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    self.spaceBroken = false
+    self.spacePending = false
+    if !self.inSpace {
+      run self.begin(p)
+      return
+    }
+    let h = &self.sourceToStroke
+    let w = h.wx * p.x + h.wy * p.y + h.ww
+    if !f64.isFinite(w) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    if w <= 0.0 {
+      self.spacePending = true
+      self.spaceBroken = true
+      return
+    }
+    let q = Point.make((h.xx * p.x + h.xy * p.y + h.xw) / w, (h.yx * p.x + h.yy * p.y + h.yw) / w)
+    if !q.isFinite() {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    run self.begin(q)
+  }
+
+  // Reject only intervals whose complete stroke envelope is outside a homogeneous
+  // device halfspace. The envelope includes square caps and limited/clipped joins.
+  fn spaceOutside(self: &Self, curve: &StrokeCurve, a: f64, b: f64, pen: Pen) -> bool {
+    let h = &self.strokeToDevice
+    let clip = self.deviceClip
+    let extent = pen.half * (pen.miterLimit + 2.0) + pen.tolerance
+    return self.spacePlane(curve, a, b, h.wx, h.wy, h.ww, extent)
+      || self.spacePlane(
+        curve,
+        a,
+        b,
+        h.xx - clip.x0 * h.wx,
+        h.xy - clip.x0 * h.wy,
+        h.xw - clip.x0 * h.ww,
+        extent,
+      )
+      || self.spacePlane(
+        curve,
+        a,
+        b,
+        clip.x1 * h.wx - h.xx,
+        clip.x1 * h.wy - h.xy,
+        clip.x1 * h.ww - h.xw,
+        extent,
+      )
+      || self.spacePlane(
+        curve,
+        a,
+        b,
+        h.yx - clip.y0 * h.wx,
+        h.yy - clip.y0 * h.wy,
+        h.yw - clip.y0 * h.ww,
+        extent,
+      )
+      || self.spacePlane(
+        curve,
+        a,
+        b,
+        clip.y1 * h.wx - h.yx,
+        clip.y1 * h.wy - h.yy,
+        clip.y1 * h.ww - h.yw,
+        extent,
+      )
+  }
+
+  fn spacePlane(
+    self: &Self,
+    curve: &StrokeCurve,
+    a: f64,
+    b: f64,
+    x: f64,
+    y: f64,
+    z: f64,
+    extent: f64,
+  ) -> bool {
+    let padded = z + extent * norm(x, y)
+    return self.spaceRange(curve, a, b, x, y, padded).y < 0.0
+  }
+
+  fn spaceRange(self: &Self, curve: &StrokeCurve, a: f64, b: f64, x: f64, y: f64, z: f64) -> Point {
+    let h = &self.sourceToStroke
+    let nx = curve.functional(a, b, h.xx, h.xy, h.xw)
+    let ny = curve.functional(a, b, h.yx, h.yy, h.yw)
+    let w = curve.functional(a, b, h.wx, h.wy, h.ww)
+    let low = f64.min(x * nx.x, x * nx.y) + f64.min(y * ny.x, y * ny.y) + f64.min(z * w.x, z * w.y)
+    let high = f64.max(x * nx.x, x * nx.y) + f64.max(y * ny.x, y * ny.y) + f64.max(z * w.x, z * w.y)
+    let work = f64.abs(x) * f64.max(f64.abs(nx.x), f64.abs(nx.y))
+      + f64.abs(y) * f64.max(f64.abs(ny.x), f64.abs(ny.y))
+      + f64.abs(z) * f64.max(f64.abs(w.x), f64.abs(w.y))
+    let guard = work * 2.8421709430404007e-14
+    return Point.make(low - guard, high + guard)
+  }
+
+  // A projective output can send infinite host geometry to a finite limit.
+  // Certify the diameter of the whole stroke envelope, including the new cap;
+  // omit a tail only when both it and that cap fit in a tolerance/8 device disk.
+  fn spaceTinyTail(self: &Self, curve: &StrokeCurve, a: f64, b: f64, pen: Pen) -> bool {
+    if !(curve.weightAt(a) > 0.0 && !self.spacePending) && !(b < 1.0 && curve.weightAt(b) > 0.0) {
+      return false
+    }
+    if self.spaceDashed {
+      return false
+    }
+    let h = &self.strokeToDevice
+    let extent = pen.half * (pen.miterLimit + 2.0) + pen.tolerance
+    let hostW = curve.weightRange(a, b).y
+    let centerW = self.spaceRange(curve, a, b, h.wx, h.wy, h.ww)
+    let padW = extent * norm(h.wx, h.wy) * hostW
+    let lowW = centerW.x - padW
+    let highW = centerW.y + padW
+    if !(lowW > 0.0) || !f64.isFinite(highW) {
+      return false
+    }
+    let x = self.spaceRange(curve, a, b, h.xx, h.xy, h.xw)
+    let y = self.spaceRange(curve, a, b, h.yx, h.yy, h.yw)
+    let padX = extent * norm(h.xx, h.xy) * hostW
+    let padY = extent * norm(h.yx, h.yy) * hostW
+    let rx = quotientRadius(x.x - padX, x.y + padX, lowW, highW)
+    let ry = quotientRadius(y.x - padY, y.y + padY, lowW, highW)
+    return 2.0 * norm(rx, ry) <= self.deviceTolerance * 0.125
+  }
+
+  effect fn appendSpace(
+    self: &mut Self,
+    index: usize,
+    a: f64,
+    b: f64,
+    depth: u32,
+    pen: Pen,
+    lengthBudget: f64,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    let curve = self.curves.asSlice()[index]
+    let w = curve.weightRange(a, b)
+    if !w.isFinite() {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    if w.y <= 0.0 {
+      self.spacePending = true
+      self.spaceBroken = true
+      return
+    }
+    if !(w.x > 0.0) {
+      if self.clipSpace
+        && (self.spaceOutside(&curve, a, b, pen) || self.spaceTinyTail(&curve, a, b, pen)) {
+        self.spacePending = true
+        self.spaceBroken = true
+        return
+      }
+      let middle = (a + b) * 0.5
+      if depth >= MAX_DEPTH || middle == a || middle == b {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+      run self.appendSpace(index, a, middle, depth + 1, pen, lengthBudget)
+      run self.appendSpace(index, middle, b, depth + 1, pen, lengthBudget)
+      return
+    }
+    let start = curve.point(a)
+    if !start.isFinite() {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    if self.spacePending {
+      // A dash origin beyond an infinite host arclength has no finite phase.
+      if self.spaceDashed {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+      run self.begin(start)
+      let last = self.vertices.length() - 1
+      let mut v = self.vertices.asSlice()[last]
+      v.curve = index
+      v.parameter = a
+      self.vertices.set(last, v)
+      self.spacePending = false
+    }
+    if curve.collapsed() {
+      if curve.precisionError(a, b) > pen.tolerance * 0.015625 {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+      return
+    }
+    let anchorError = curve.anchorError()
+    if !f64.isFinite(anchorError) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    if anchorError > pen.tolerance * 0.015625 {
+      fail GeometryError { code: ACCURACY_LIMIT }
+    }
+    let last = self.vertices.length() - 1
+    let mut v = self.vertices.asSlice()[last]
+    v.outgoing = curve.tangent(a)
+    v.curvatureOut = curve.curvature(a)
+    if !v.outgoing.isFinite() || !f64.isFinite(v.curvatureOut) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    self.vertices.set(last, v)
+    run self.subdivide(index, a, b, 0, pen, lengthBudget)
+    let end = self.vertices.length() - 1
+    let mut e = self.vertices.asSlice()[end]
+    e.corner = b == 1.0
+    self.vertices.set(end, e)
+  }
+
   effect fn begin(self: &mut Self, p: Point) -> ()
     ! OutOfMemoryError
     ? &mut Allocator {
@@ -479,8 +835,15 @@ impl Stroker {
   effect fn appendCurve(self: &mut Self, curve: Curve, pen: Pen, lengthBudget: f64) -> ()
     ! OutOfMemoryError | GeometryError
     ? &mut Allocator {
+    if self.inSpace {
+      let mapped = StrokeCurve.mapped(curve, &self.sourceToStroke)
+      let index = self.curves.length()
+      run self.curves.append(mapped)
+      run self.appendSpace(index, 0.0, 1.0, 0, pen, lengthBudget)
+      return
+    }
     let index = self.curves.length()
-    run self.curves.append(curve)
+    run self.curves.append(StrokeCurve.plain(curve))
     let a = curve.point(0.0)
     let b = curve.point(1.0)
     let anchorError = curve.anchorError()
@@ -528,7 +891,7 @@ impl Stroker {
     ! OutOfMemoryError | GeometryError
     ? &mut Allocator {
     let curve = self.curves.asSlice()[index]
-    let error = curve.offsetError(a, b, pen.half) + curve.anchorError()
+    let error = curve.offsetError(a, b, pen.half) + curve.anchorError() + curve.precisionError(a, b)
     let lengthError = if lengthBudget > 0.0 {
       curve.lengthError(a, b)
     } else {
@@ -590,6 +953,7 @@ impl Stroker {
   effect fn flatten(self: &mut Self, path: &Path, pen: Pen, dashed: bool) -> ()
     ! OutOfMemoryError | GeometryError
     ? &mut Allocator {
+    self.spaceDashed = dashed
     run self.flattenWithBudget(path, pen, 0.0)
     if !dashed || path.verbList().length == 0 {
       return
@@ -647,7 +1011,7 @@ impl Stroker {
       if verb == MOVE {
         current = points[p]
         start = current
-        run self.begin(current)
+        run self.beginSource(current)
         open = true
         p = p + 1
       } else if verb == CLOSE {
@@ -655,13 +1019,15 @@ impl Stroker {
           if !same(current, start) {
             run self.appendCurve(Curve.line(current, start), pen, lengthBudget)
           }
-          self.closeCurrent()
+          if !self.inSpace || !self.spaceBroken {
+            self.closeCurrent()
+          }
           open = false
           current = start
         }
       } else {
         if !open {
-          run self.begin(current)
+          run self.beginSource(current)
           start = current
           open = true
         }
@@ -935,6 +1301,39 @@ impl Stroker {
   }
 }
 
+fn quotientRadius(low: f64, high: f64, lowW: f64, highW: f64) -> f64 {
+  let center = (low * 0.5 + high * 0.5) / (lowW * 0.5 + highW * 0.5)
+  return ((high - low) * 0.5 + f64.abs(center) * (highW - lowW) * 0.5) / lowW
+    + f64.abs(center) * 2.8421709430404007e-14
+}
+
+fn spaceAffine(h: &Homography) -> Affine {
+  return Affine {
+    a: h.xx / h.ww,
+    b: h.yx / h.ww,
+    c: h.xy / h.ww,
+    d: h.yy / h.ww,
+    e: h.xw / h.ww,
+    f: h.yw / h.ww,
+  }
+}
+
+effect fn spaceScale(h: &Homography, clip: Rect, tolerance: f64) -> f64
+  ! GeometryError {
+  if h.wx == 0.0 && h.wy == 0.0 {
+    if h.ww <= 0.0 {
+      return 1.0
+    }
+    let affine = spaceAffine(h)
+    let scale = maxScale(&affine)
+    if !f64.isFinite(scale) || !f64.isFinite(affine.e) || !f64.isFinite(affine.f) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    return scale
+  }
+  return run strokeScale(h, clip, tolerance)
+}
+
 effect fn prepare(path: &Path, style: &Stroke, transform: &Affine, tolerance: f64) -> Pen
   ! GeometryError {
   if !f64.isFinite(transform.a) || !f64.isFinite(transform.b) || !f64.isFinite(transform.c)
@@ -1198,7 +1597,7 @@ effect fn cap(out: &mut Path, p: Point, d: Point, pen: Pen) -> ()
   run out.lineTo(end.x, end.y)
 }
 
-fn sourceLineLength(curves: &[Curve], a: Vertex, b: Vertex, backwards: bool) -> f64 {
+fn sourceLineLength(curves: &[StrokeCurve], a: Vertex, b: Vertex, backwards: bool) -> f64 {
   let index = if backwards {
     a.curve
   } else {
@@ -1215,7 +1614,7 @@ effect fn side(
   vertices: &[Vertex],
   sub: Subpath,
   backwards: bool,
-  curves: &[Curve],
+  curves: &[StrokeCurve],
   pen: Pen,
   out: &mut Path,
 ) -> ()
@@ -1265,7 +1664,7 @@ effect fn side(
 effect fn outlines(
   vertices: &[Vertex],
   subpaths: &[Subpath],
-  curves: &[Curve],
+  curves: &[StrokeCurve],
   pen: Pen,
   out: &mut Path,
 ) -> ()

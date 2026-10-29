@@ -183,7 +183,7 @@ impl Curve {
     return mul(lerp(lerp(a, b, t), lerp(b, sub(self.p3, self.p2), t), t), 3.0)
   }
 
-  fn second(self: &Self, t: f64) -> Point {
+  pub fn second(self: &Self, t: f64) -> Point {
     if self.kind == ARC {
       let angle = self.sweep * t
       let c = f64.cos(angle)
@@ -204,23 +204,40 @@ impl Curve {
     return mul(lerp(a, b, t), 6.0)
   }
 
-  fn secondBound(self: &Self) -> f64 {
+  pub fn secondBound(self: &Self) -> f64 {
     if self.kind == ARC {
       return (length(self.p1) + length(self.p2)) * f64.abs(self.sweep) * f64.abs(self.sweep)
     }
     return f64.max(length(self.second(0.0)), length(self.second(1.0)))
   }
 
-  fn thirdBound(self: &Self) -> f64 {
+  pub fn thirdBound(self: &Self) -> f64 {
     if self.kind == ARC {
       return self.secondBound() * f64.abs(self.sweep)
     }
     return length(sub(self.second(1.0), self.second(0.0)))
   }
 
+  pub fn firstBound(self: &Self) -> f64 {
+    if self.kind == ARC {
+      return (length(self.p1) + length(self.p2)) * f64.abs(self.sweep)
+    }
+    if self.kind == LINE {
+      return length(sub(self.p1, self.p0))
+    }
+    if self.kind == QUAD {
+      return 2.0 * f64.max(length(sub(self.p1, self.p0)), length(sub(self.p2, self.p1)))
+    }
+    return 3.0
+      * f64.max(
+        length(sub(self.p1, self.p0)),
+        f64.max(length(sub(self.p2, self.p1)), length(sub(self.p3, self.p2))),
+      )
+  }
+
   // Remove endpoint scalar zeros before normalizing the derivative. This preserves limiting
   // directions and avoids an artificial singular offset at repeated endpoint controls.
-  fn normalDerivative(self: &Self, t: f64) -> Point {
+  pub fn normalDerivative(self: &Self, t: f64) -> Point {
     if self.kind == QUAD {
       if same(self.p0, self.p1) {
         return sub(self.p2, self.p1)
@@ -249,7 +266,7 @@ impl Curve {
     return self.derivative(t)
   }
 
-  fn normalFirstBound(self: &Self) -> f64 {
+  pub fn normalFirstBound(self: &Self) -> f64 {
     if (self.kind == QUAD && (same(self.p0, self.p1) || same(self.p1, self.p2)))
       || (self.kind == CUBIC && (same(self.p0, self.p1) || same(self.p2, self.p3))) {
       return length(sub(self.normalDerivative(1.0), self.normalDerivative(0.0)))
@@ -257,7 +274,7 @@ impl Curve {
     return self.secondBound()
   }
 
-  fn normalSecondBound(self: &Self) -> f64 {
+  pub fn normalSecondBound(self: &Self) -> f64 {
     if (self.kind == QUAD && (same(self.p0, self.p1) || same(self.p1, self.p2)))
       || (self.kind == CUBIC && (same(self.p0, self.p1) || same(self.p2, self.p3))) {
       return 0.0

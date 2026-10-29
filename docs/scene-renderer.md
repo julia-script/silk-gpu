@@ -115,6 +115,49 @@ without Dawn.
    A source AABB crossing w = 0 does not by itself imply an unbounded stroke. The adaptive
    source-tolerance search has a 64-refinement refusal limit in addition to the stroker and
    projective subdivision limits.
+
+   `Stroker.strokeInSpace(path, style, sourceToStroke, strokeToDevice, deviceClip,
+   tolerance, out)` is the distinct **transformed-centerline** operation. It appends an
+   outline in the stroke host, not device coordinates. Both maps are homographies;
+   affine reflection, nonuniform scale, skew and singular collapse are supported.
+   Widths, dash lengths and dash offsets are host distances. This is the shared-vector
+   primitive needed by [SVG 2 CR vector effects](https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#VectorEffectProperty)
+   and the [stroke-host dash clarification](https://github.com/w3c/svgwg/issues/323).
+   Existing `stroke` and `strokeProjective` retain their source-space pen semantics.
+
+   Affine maps transform analytic Bézier controls and ellipse axes. Projective maps
+   retain the rational centerline, quotient-rule derivatives, limiting endpoint
+   tangents and signed curvature. Interval derivative bounds certify the width-dependent
+   offset interpolation error; accumulated arclength error is separately budgeted for
+   dashes. Caps and all joins, including arcs and miter-clip, use this analytic host
+   information, never flattened chord directions. The existing reusable curve, vertex,
+   dash and outline storage serves both operations; no intermediate centerline Path
+   or temporary stroker is allocated.
+
+   Only positive source-to-host homogeneous w contributes. An eye crossing is subdivided,
+   not clamped to an epsilon. Polynomial homogeneous weights use restricted Bernstein
+   hulls with outward-rounded interval arithmetic; error-free residuals preserve exact
+   zero endpoints, so a wholly nonpositive curve touching the eye plane stays invisible.
+   A complete host stroke envelope (including cap/join reach)
+   can be rejected against homogeneous device clip halfspaces, so truncation cannot
+   introduce a visible clipping cap. If a projective output sends host infinity into
+   the viewport, an undashed tail can instead be truncated when its complete projected
+   envelope and replacement cap have certified diameter at most one eighth of the
+   device tolerance. Uncertifiable tails fail `ACCURACY_LIMIT`; a dashed contour
+   re-entering from infinite host arclength has no finite dash phase and also fails
+   explicitly. Negative-w contours are omitted rather than connected across infinity.
+
+   `Stroker.boundsInSpace(path, style, sourceToStroke, strokeToDevice, tolerance,
+   ignoreDashes)` measures the actual host stroke in device coordinates without a
+   viewport. `ignoreDashes = true` gives undashed stroke-box reference geometry.
+   It does not substitute the finite drawing clip for an unbounded reference box.
+   As with the existing APIs, positive finite tolerance and finite inputs are required,
+   failure invalidates partial output, and the caller must budget subsequent
+   `projective.fill` separately. Guarded host-map evaluation, 40 subdivision levels,
+   1,048,576 vertices and the existing 64-step bounds refinement are refusal limits,
+   not successful-return clamps. `stroke_space_tests.silk` derives expected offsets,
+   caps, joins, host dash endpoints and projective limits independently of these APIs.
+
 4. **Coverage** (`vector.strips`): exact signed area per pixel cell, accumulated and prefix-summed
    along each row (the font-rs method). Nonzero coverage is `min(|a|, 1)`; even-odd is
    `|a - 2 round(a / 2)|`. Lines are split at x = 0 and x = width and then clamped, so geometry
