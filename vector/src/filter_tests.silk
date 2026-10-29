@@ -206,14 +206,14 @@ test effect fn convolveMatrixFollowsTheSpec() -> () ! AssertionError<'static> | 
   // The kernel is applied rotated by 180 degrees: weight on its last entry reads the pixel up-left.
   let shift: [f32; 9] = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
   let k = Convolution { kernel: &shift, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_NONE, preserveAlpha: false }
-  convolveMatrix(&mut out, &input, &k, Region.of(&input))
+  run convolveMatrix(&mut out, &input, &k, Region.of(&input)) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(exact(out.pixel(3, 3), 100, 50, 0, 128) && out.pixel(2, 2).a == 0, "shifts down-right")
   let box: [f32; 9] = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
   let blur = Convolution { kernel: &box, orderX: 3, orderY: 3, divisor: 9.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_DUPLICATE, preserveAlpha: true }
-  convolveMatrix(&mut out, &input, &blur, Region.of(&input))
+  run convolveMatrix(&mut out, &input, &blur, Region.of(&input)) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(same(out.pixel(2, 2), 11, 6, 0, 128) && out.pixel(3, 3).a == 0, "preserveAlpha keeps the source alpha")
   let wrapped = Convolution { kernel: &shift, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_WRAP, preserveAlpha: false }
-  convolveMatrix(&mut out, &input, &wrapped, Region.make(2, 2, 6, 6))
+  run convolveMatrix(&mut out, &input, &wrapped, Region.make(2, 2, 6, 6)) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(exact(out.pixel(2, 2), 0, 0, 0, 0) && exact(out.pixel(3, 3), 100, 50, 0, 128), "wrap stays inside the region")
 }
 

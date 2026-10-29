@@ -505,14 +505,14 @@ effect fn filters(device: &Device, queue: &Queue) -> bool ! GpuError | OutOfMemo
   let mut e: u8 = 0
   while e < 3 {
     let first = Convolution { kernel: &sharpen, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: e, preserveAlpha: false }
-    filtering.convolveMatrix(&mut out, &a, &first, region)
+    run filtering.convolveMatrix(&mut out, &a, &first, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.convolveMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, &first, region)
     run submit(queue, move encoder)
     let sharpened = run readImage(device, queue, &gpuOut)
     ok = compare("feConvolveMatrix", out.data(), sharpened.asSlice(), 1) && ok
     let second = Convolution { kernel: &emboss, orderX: 3, orderY: 2, divisor: 0.7, bias: 0.25, targetX: 2, targetY: 0, edgeMode: e, preserveAlpha: e == EDGE_WRAP }
-    filtering.convolveMatrix(&mut out, &a, &second, region)
+    run filtering.convolveMatrix(&mut out, &a, &second, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.convolveMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, &second, region)
     run submit(queue, move encoder)

@@ -21,7 +21,7 @@ import silk.num.usize
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import vector.pixmap { Pixmap, Rgba8, div255 }
-import vector.filter { Region, BlurPlan, ComponentTransfer, Convolution, Turbulence, TurbulenceSettings, Lighting, conversionTable, stitchOf, lightSetupOf }
+import vector.filter { Region, BlurPlan, ComponentTransfer, Convolution, Turbulence, TurbulenceSettings, Lighting, conversionTable, stitchOf, lightingSetupOf }
 import vector.geometry { Affine }
 import silk.num.i64
 import silk.num.f64
@@ -374,13 +374,9 @@ impl FilterRenderer {
   /// `feDiffuseLighting` or `feSpecularLighting` with `input`'s alpha as the bump map.
   pub effect fn lighting(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
     lighting: &Lighting, region: Region) -> () ! GpuError {
-    let setup = lightSetupOf(&lighting.light)
+    let setup = lightingSetupOf(lighting)
     let specular: u32 = if lighting.specular { 1 } else { 0 }
     let mut params = header(OP_LIGHTING, specular | u32.shiftLeft(u8.toU32(setup.kind), 8), 0, 0, clamped(region, out))
-    writeU32(&mut params, 32, u8.toU32(lighting.color.r))
-    writeU32(&mut params, 36, u8.toU32(lighting.color.g))
-    writeU32(&mut params, 40, u8.toU32(lighting.color.b))
-    writeU32(&mut params, 44, u8.toU32(lighting.color.a))
     writeF32(&mut params, 48, lighting.surfaceScale)
     writeF32(&mut params, 52, lighting.constant)
     writeF32(&mut params, 56, lighting.exponent)
@@ -390,6 +386,7 @@ impl FilterRenderer {
       writeF32(&mut params, 64 + i * 4, setup.direction[i])
       writeF32(&mut params, 80 + i * 4, setup.position[i])
       writeF32(&mut params, 96 + i * 4, setup.spot[i])
+      writeF32(&mut params, 112 + i * 4, setup.color[i])
       i = i + 1
     }
     writeF32(&mut params, 76, setup.spotExponent)
