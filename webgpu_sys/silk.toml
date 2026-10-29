@@ -1,6 +1,6 @@
 [package]
 name = "webgpu_sys"
 version = "0.1.0"
-silk-version = "0.1.0-dev.28+14bcdaa837f3"
+silk-version = "0.1.0-dev.29+94cf9559bf47"
 kind = "library"
 exports = ["generated_webgpu"]
