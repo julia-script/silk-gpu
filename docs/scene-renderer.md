@@ -204,5 +204,6 @@ and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the deta
   emits fewer alpha bytes than tile-aligned strips for thin shapes and keeps solid runs exact.
 - **f32 coverage, f64 geometry.** User-space math is f64 so large transforms keep precision;
   device-space lines, area accumulation and image sampling are f32 like the GPU.
-- **Antialiasing only by area.** No MSAA. `shape-rendering: crispEdges` can be served later by
-  snapping coverage to 0 or 255.
+- **Antialiasing by area.** No MSAA. `shape-rendering: crispEdges` uses
+  `Rasterizer.fillAliased`, which covers a pixel fully when its center is inside the path and
+  emits the same strips and fills, so paints, layers and the GPU take it unchanged.
