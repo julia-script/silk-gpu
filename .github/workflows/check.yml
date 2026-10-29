@@ -1,0 +1,31 @@
+name: Check
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    name: Ubuntu26 lavapipe
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/silk
+            .cache/webgpu
+            .cache/llvm
+            .cache/downloads
+            .cache/webgpu-headers
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains.lock.json', 'scripts/ci-lock.json', 'scripts/schema-lock.json') }}
+      - name: Pin lavapipe and validate preinstalled LLVM22
+        run: python3 scripts/setup-ci
+      - name: Verify pinned tools and upstream schema
+        run: python3 scripts/check

@@ -1,0 +1,140 @@
+{
+  "silk": {
+    "version": "0.1.0-dev.27+323ceb59e7ee",
+    "native_seed": {
+      "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/native-seed.json",
+      "sha256": "ddf974798825a867c2eae7c82164d69f74044b081edd9e2fb69e5458e3529d0c",
+      "bytes": 1200
+    },
+    "platforms": {
+      "aarch64-apple-darwin": {
+        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/silk-0.1.0-dev.27%2B323ceb59e7ee-aarch64-apple-darwin.tar.gz",
+        "sha256": "1e164ec44e69f416083f1d1da63030789142a6ac78764d8b1fc8cf3a1e37b02a",
+        "bytes": 6914850
+      },
+      "aarch64-unknown-linux-gnu": {
+        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/silk-0.1.0-dev.27%2B323ceb59e7ee-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "295b9264acf54a9c6a534dfe8455533d667007beef3a87309dd15879db7e4291",
+        "bytes": 7056889
+      },
+      "x86_64-unknown-linux-gnu": {
+        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/silk-0.1.0-dev.27%2B323ceb59e7ee-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "3b5160ed46dd482b09f4b8031275b1f8f50c7da7b6ca13f1278172936a0f8d0b",
+        "bytes": 7137447
+      }
+    }
+  },
+  "llvm": {
+    "version": "22.1.8",
+    "platforms": {
+      "aarch64-apple-darwin": {
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-macOS-ARM64.tar.xz",
+        "sha256": "f260f4f7c0d430828a81ae8a3826a1d63fc0963ec2459489308cc23b1f7eab4f",
+        "bytes": 1479903744
+      },
+      "aarch64-unknown-linux-gnu": {
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-ARM64.tar.xz",
+        "sha256": "805efad2bb91cb4967fa569e0881d10c0f69c04461cf671cccbae19f547acc34",
+        "bytes": 1771004928
+      },
+      "x86_64-unknown-linux-gnu": {
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-Linux-X64.tar.xz",
+        "sha256": "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384",
+        "bytes": 1938859476
+      },
+      "aarch64-pc-windows-msvc": {
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-aarch64-pc-windows-msvc.tar.xz",
+        "sha256": "de718c58ebbc5f61d58c17b90457fcf42983bc2c4a4aba3e010d108713bfd7f1",
+        "bytes": 737955068
+      },
+      "x86_64-pc-windows-msvc": {
+        "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang%2Bllvm-22.1.8-x86_64-pc-windows-msvc.tar.xz",
+        "sha256": "d96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234",
+        "bytes": 862053924
+      }
+    }
+  },
+  "webgpu": {
+    "implementation": "dawn",
+    "version": "v20261027.184652",
+    "commit": "106704a9ac3fc21b1580ea85aea302ac17d416f1",
+    "schema_revision": "a1dc77409bb2b8bd80540cbf4b8db219e123e909",
+    "platforms": {
+      "aarch64-apple-darwin": {
+        "url": "https://github.com/google/dawn/releases/download/v20261027.184652/Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-macos-latest-Release.tar.gz",
+        "sha256": "d4f419dcbe81de4b86e6fbf172b647f41c67820a925efca55dae3bd43248d8e2",
+        "bytes": 13802697,
+        "directory": "Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-macos-latest-Release",
+        "library": "lib/libwebgpu_dawn.a"
+      },
+      "x86_64-apple-darwin": {
+        "url": "https://github.com/google/dawn/releases/download/v20261027.184652/Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-macos-15-intel-Release.tar.gz",
+        "sha256": "164ac7094b8b453a704a727fcd1d77b461b1143f4f4dedb5daf04c5a53f075bd",
+        "bytes": 15028604,
+        "directory": "Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-macos-15-intel-Release",
+        "library": "lib/libwebgpu_dawn.a"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "url": "https://github.com/google/dawn/releases/download/v20261027.184652/Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-ubuntu-latest-Release.tar.gz",
+        "sha256": "24fb115dc55b1e5acc169e3d2558eeda5f1b0d149af4a46f10602b900103cbd3",
+        "bytes": 36369054,
+        "directory": "Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-ubuntu-latest-Release",
+        "library": "lib64/libwebgpu_dawn.a"
+      },
+      "x86_64-pc-windows-msvc": {
+        "url": "https://github.com/google/dawn/releases/download/v20261027.184652/Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-windows-latest-Release.tar.gz",
+        "sha256": "2b082c284f078b9f91a91a6b2cf805fa42c18f60b8dcaab70476a5e5e24b74ee",
+        "bytes": 118553953,
+        "directory": "Dawn-106704a9ac3fc21b1580ea85aea302ac17d416f1-windows-latest-Release",
+        "library": "lib/webgpu_dawn.lib"
+      }
+    }
+  },
+  "comparison": {
+    "implementation": "wgpu-native",
+    "version": "v29.0.1.1",
+    "schema_revision": "673658bc2bd70ec39fc55ebe6bb0173cf6d0a603",
+    "assets": {
+      "wgpu-linux-aarch64-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-aarch64-release.zip",
+        "sha256": "015fcdf1dbae82e614a783cc38017e5399ae0927a889fe9b69c9b664bc61b47a",
+        "bytes": 15755874
+      },
+      "wgpu-linux-x86_64-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-linux-x86_64-release.zip",
+        "sha256": "95a4d90c071005a98d03eab348beaa6b07e16eb00d1dcdb9f8348f75eb97ec5a",
+        "bytes": 15962605
+      },
+      "wgpu-macos-aarch64-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-aarch64-release.zip",
+        "sha256": "a5797a37b1adf720bcd5dcffb291edbbd5b7b14be0a3874c28e6393a655a7a3e",
+        "bytes": 13733288
+      },
+      "wgpu-macos-x86_64-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-macos-x86_64-release.zip",
+        "sha256": "8e2f7378548ddd0e2cf21e7d864dda46e953f0af724855a33778b85ead206d41",
+        "bytes": 13558527
+      },
+      "wgpu-windows-aarch64-msvc-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-aarch64-msvc-release.zip",
+        "sha256": "4a876421a8c1e5fe72f849b3722214280fe485cb1c56f77f8b0c82414be5b29f",
+        "bytes": 16475571
+      },
+      "wgpu-windows-i686-msvc-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-i686-msvc-release.zip",
+        "sha256": "ad59d4eadfcfe667999a37e096cc551ecf3f56c387b5a7fd5f61baebf105f54a",
+        "bytes": 15893005
+      },
+      "wgpu-windows-x86_64-gnu-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-x86_64-gnu-release.zip",
+        "sha256": "d471e3614733c1d4ddd61bfd19868356477d0d37bf531bf8c6cb64a7f579bd2a",
+        "bytes": 15532029
+      },
+      "wgpu-windows-x86_64-msvc-release.zip": {
+        "url": "https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.1.1/wgpu-windows-x86_64-msvc-release.zip",
+        "sha256": "7e67d7445c42aeb85e30f88930fd8d7d83ee769e3390aeb1ada75ebf3cf78132",
+        "bytes": 17062968
+      }
+    }
+  }
+}

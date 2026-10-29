@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Print an absolute LLVM 22 clang path, installing pinned LLVM when necessary."""
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+from _install import CACHE, LOCK, asset_for, fail, install
+
+
+def clang22(path):
+    if not path.is_file():
+        return False
+    result = subprocess.run([str(path), "--version"], capture_output=True, text=True)
+    return result.returncode == 0 and re.search(r"clang version 22\.", result.stdout) is not None
+
+
+configured = os.environ.get("SILK_CLANG")
+if configured:
+    candidate = Path(configured)
+    if not candidate.is_absolute() or not clang22(candidate):
+        fail("SILK_CLANG must be an absolute path to a working LLVM 22 clang")
+    print(candidate)
+else:
+    candidates = [Path("/opt/homebrew/opt/llvm/bin/clang"), Path("/usr/local/opt/llvm/bin/clang")]
+    system = shutil.which("clang-22")
+    if system:
+        candidates.append(Path(system).resolve())
+    found = next((path for path in candidates if clang22(path)), None)
+    if found is not None:
+        print(found)
+    else:
+        native, asset = asset_for("llvm")
+        executable = "bin/clang.exe" if "windows" in native else "bin/clang"
+        home = install("llvm", CACHE / "llvm" / LOCK["llvm"]["version"] / native, executable)
+        # Keep the complete published distribution, including wasm-ld and resource headers.
+        # The archive can be 1.9 GB; supplying LLVM 22 avoids this cold download.
+        compiler = home / executable
+        if not clang22(compiler):
+            fail(f"Downloaded compiler cannot run on this host: {compiler}")
+        print(compiler)
