@@ -115,7 +115,13 @@ fn lerpX(line: Line, x: f32) -> f32 {
 
 pub fn minU32(a: u32, b: u32) -> u32 { return if a < b { a } else { b } }
 
-fn clampX(value: f32, low: f32, high: f32) -> f32 { return f32.min(f32.max(value, low), high) }
+// LIMITATION-7 (silk-lang/silk#2566): `f32.min` and `f32.max` order NaNs and signed zeros with a
+// chain of branches. Lines here are finite, so plain selects (one `minss`/`maxss`) give the same
+// values.
+fn minF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() { return if a < b { a } else { b } }
+fn maxF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() { return if a > b { a } else { b } }
+
+fn clampX(value: f32, low: f32, high: f32) -> f32 { return minF32(maxF32(value, low), high) }
 
 impl Rasterizer {
   pub fn make() -> Rasterizer {
@@ -148,10 +154,10 @@ impl Rasterizer {
     ! OutOfMemoryError ? &mut Allocator {
     let clamped = Line { x0: clampX(line.x0, 0.0, width), y0: line.y0, x1: clampX(line.x1, 0.0, width), y1: line.y1 }
     if clamped.y0 == clamped.y1 { return }
-    bounds.x0 = f32.min(bounds.x0, f32.min(clamped.x0, clamped.x1))
-    bounds.x1 = f32.max(bounds.x1, f32.max(clamped.x0, clamped.x1))
-    bounds.y0 = f32.min(bounds.y0, f32.min(clamped.y0, clamped.y1))
-    bounds.y1 = f32.max(bounds.y1, f32.max(clamped.y0, clamped.y1))
+    bounds.x0 = minF32(bounds.x0, minF32(clamped.x0, clamped.x1))
+    bounds.x1 = maxF32(bounds.x1, maxF32(clamped.x0, clamped.x1))
+    bounds.y0 = minF32(bounds.y0, minF32(clamped.y0, clamped.y1))
+    bounds.y1 = maxF32(bounds.y1, maxF32(clamped.y0, clamped.y1))
     run self.clipped.append(clamped)
   }
 
@@ -188,7 +194,7 @@ impl Rasterizer {
     while i < self.lines.length() {
       let line = self.lines.asSlice()[i]
       // Lines entirely above or below the canvas cover no visible row.
-      if !(f32.max(line.y0, line.y1) <= 0.0 || f32.min(line.y0, line.y1) >= heightF) {
+      if !(maxF32(line.y0, line.y1) <= 0.0 || minF32(line.y0, line.y1) >= heightF) {
         run self.splitAt(line, 0.0, widthF, widthF, &mut bounds)
       }
       i = i + 1
@@ -196,8 +202,8 @@ impl Rasterizer {
     if self.clipped.length() == 0 { return }
     let bx0 = f32.toU32(f32.floor(bounds.x0))
     let bx1 = minU32(f32.toU32(f32.ceil(bounds.x1)), canvasWidth)
-    let by0 = f32.toU32(f32.floor(f32.max(bounds.y0, 0.0)))
-    let by1 = minU32(f32.toU32(f32.ceil(f32.min(bounds.y1, heightF))), canvasHeight)
+    let by0 = f32.toU32(f32.floor(maxF32(bounds.y0, 0.0)))
+    let by1 = minU32(f32.toU32(f32.ceil(minF32(bounds.y1, heightF))), canvasHeight)
     if bx0 >= bx1 || by0 >= by1 { return }
     let firstBand = by0 / BAND
     let bandCount = (by1 - 1) / BAND - firstBand + 1
@@ -259,29 +265,32 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
   let bottomF = u32.toF32(bottom)
   if by <= topF || ay >= bottomF { return }
   // Both are in top ..= bottom, so the conversions need no check.
-  let firstRow = Intrinsic.f32ToU32(f32.max(ay, topF))
-  let lastBottom = f32.min(by, bottomF)
+  let firstRow = Intrinsic.f32ToU32(maxF32(ay, topF))
+  let lastBottom = minF32(by, bottomF)
   let lastTruncated = Intrinsic.f32ToU32(lastBottom)
   let lastRow = if u32.toF32(lastTruncated) < lastBottom { lastTruncated + 1 } else { lastTruncated }
   let mut y = firstRow
   while y < lastRow {
-    let rowTop = f32.max(u32.toF32(y), ay)
-    let rowBottom = f32.min(u32.toF32(y + 1), by)
+    let rowTop = maxF32(u32.toF32(y), ay)
+    let rowBottom = minF32(u32.toF32(y + 1), by)
     let dy = rowBottom - rowTop
     let xa = clampX(ax + (rowTop - ay) * dxdy, 0.0, localWidth)
     let xb = clampX(ax + (rowBottom - ay) * dxdy, 0.0, localWidth)
     let d = dy * dir
     let line0 = u32.toUsize(y - top) * stride
     let flags = Slice.viewMut(&mut touched, u32.toUsize((y - top) / BAND) * stride, stride)
-    let x0 = f32.min(xa, xb)
-    let x1 = f32.max(xa, xb)
+    let x0 = minF32(xa, xb)
+    let x1 = maxF32(xa, xb)
     // x0 and x1 are in 0 ..= localWidth, so truncating is the floor, and converting back is
-    // exact (silk-lang/silk#2561: f32.floor and ceil are software).
-    let x0i = Intrinsic.f32ToUsize(x0)
-    let x0floor = usize.toF32(x0i)
-    let x1t = Intrinsic.f32ToUsize(x1)
-    let x1i = if usize.toF32(x1t) < x1 { x1t + 1 } else { x1t }
-    let x1ceil = usize.toF32(x1i)
+    // exact (silk-lang/silk#2561: f32.floor and ceil are software). Through u32, which converts
+    // in one instruction where usize needs the unsigned 64-bit sequence.
+    let x0u = Intrinsic.f32ToU32(x0)
+    let x0i = u32.toUsize(x0u)
+    let x0floor = u32.toF32(x0u)
+    let x1t = Intrinsic.f32ToU32(x1)
+    let x1u = if u32.toF32(x1t) < x1 { x1t + 1 } else { x1t }
+    let x1i = u32.toUsize(x1u)
+    let x1ceil = u32.toF32(x1u)
     if x1i <= x0i + 1 {
       flags[x0i] = 1
       flags[x0i + 1] = 1
@@ -310,7 +319,7 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
           area[line0 + xi] = area[line0 + xi] + d * s
           xi = xi + 1
         }
-        let a2 = a1 + usize.toF32(x1i - x0i - 3) * s
+        let a2 = a1 + u32.toF32(x1u - x0u - 3) * s
         area[line0 + x1i - 1] = area[line0 + x1i - 1] + d * (1.0 - a2 - am)
       }
       area[line0 + x1i] = area[line0 + x1i] + d * am
@@ -373,7 +382,7 @@ fn alphaOf(acc: f32, rule: u8) -> u32 {
   let mut coverage = f32.abs(acc)
   if rule == EVENODD { coverage = f32.abs(acc - 2.0 * f32.round(acc * 0.5)) }
   // In range by construction (0 <= coverage * 255 + 0.5 < 256).
-  return Intrinsic.f32ToU32(f32.min(coverage, 1.0) * 255.0 + 0.5)
+  return Intrinsic.f32ToU32(minF32(coverage, 1.0) * 255.0 + 0.5)
 }
 
 const EMPTY: u8 = 0

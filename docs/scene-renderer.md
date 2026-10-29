@@ -145,11 +145,11 @@ builds, 512 x 512):
 
 | Scene | vector ms | tiny-skia ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| fills (300 translucent circles) | 5.2 | 9.9 | 0.53x | 2.3% |
-| strokes (150 round-joined stars) | 4.2 | 7.9 | 0.53x | 3.2% |
-| gradients (100 linear and radial rects) | 3.0 | 4.8 | 0.64x | 0.0% |
-| polygon (4000 edges, even-odd) | 6.1 | 22.1 | 0.28x | 30% |
-| icons (4000 glyph-sized circles and stars) | 13.5 | 22.0 | 0.61x | 11% |
+| fills (300 translucent circles) | 4.8 | 9.9 | 0.48x | 2.3% |
+| strokes (150 round-joined stars) | 3.6 | 7.9 | 0.46x | 3.2% |
+| gradients (100 linear and radial rects) | 3.0 | 4.8 | 0.62x | 0.0% |
+| polygon (4000 edges, even-odd) | 5.9 | 22.9 | 0.26x | 30% |
+| icons (4000 glyph-sized circles and stars) | 12.6 | 22.2 | 0.57x | 11% |
 
 The first run, before the coverage and compositing work, was 2.20x, 1.33x, 3.75x and 0.54x.
 What made the difference: coverage accumulates every line once into one buffer for the whole
