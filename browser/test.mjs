@@ -103,6 +103,11 @@ try {
     '--enable-logging=stderr',
   ] });
   console.log(`Chromium ${browser.version()} (${process.platform}): compiled Silk WebGPU tests`);
+  // [DEBUG-linux-canvas] Distinguish device rendering from compositor capture.
+  const gpuSession = await browser.newBrowserCDPSession();
+  const gpuInfo = await gpuSession.send('SystemInfo.getInfo');
+  console.log('Chromium GPU configuration:', JSON.stringify({ devices: gpuInfo.gpu.devices, featureStatus: gpuInfo.gpu.featureStatus, auxAttributes: gpuInfo.gpu.auxAttributes }));
+  await gpuSession.detach();
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -141,6 +146,9 @@ try {
     return { frames: globalThis.canvasCheck.frames, rgba: globalThis.canvasCheck.expectedRGBA };
   });
   try {
+    const canvasSnapshot = await page.locator('#gpu-test').evaluate(canvas => canvas.toDataURL('image/png'));
+    const canvasPixels = png(Buffer.from(canvasSnapshot.split(',')[1], 'base64'));
+    console.log('Canvas intrinsic RGBA:', [...canvasPixels.rgba.subarray(0, 4)]);
     const screenshot = await page.locator('#gpu-test').screenshot();
     await mkdir(resolve(root, '.cache/pixels'), { recursive: true });
     await writeFile(resolve(root, '.cache/pixels/browser-canvas.png'), screenshot);
