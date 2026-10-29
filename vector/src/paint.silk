@@ -17,7 +17,10 @@ import silk.num.i64
 import silk.option { Option }
 import strips { Coverage, BAND, minU32 }
 import geometry { Affine, Point }
-import pixmap { Pixmap, Rgba8, div255, over, overPacked, overSpan, pack, scalePacked, storePacked, floorF64, truncateToI64, truncateF64ToU8 }
+import pixmap { Pixmap, Rgba8, div255, over, overPacked, overSpan, overMaskedFour, pack, scalePacked, storePacked, floorF64, truncateToI64, truncateF64ToU8 }
+import silk.simd.u8x16
+import silk.simd.u16x16
+import silk.simd.u32x4
 
 pub interface Shader {
   /// The premultiplied color at the center of device pixel `(x, y)`.
@@ -520,16 +523,35 @@ fn fillUniform(target: &mut Pixmap, coverage: &Coverage, word: u32, opacity: u8)
     }
   }
   if word == 0 { return }
-  // Column by column: each strip column's four alphas are adjacent.
+  // Each strip column's four alphas are adjacent. Blocks of four columns load their 16 alphas at
+  // once and composite each row's four pixels as one vector; the rest go column by column.
   let alphas = coverage.alphas()
   let strips = coverage.strips()
   let rows = u32.toUsize(BAND)
+  let lanes = u8x16.toU16x16(u32x4.bitcastToU8x16(u32x4.splat(word)))
+  let opacityLanes = u16x16.splat(u8.toU16(opacity))
+  let half = u16x16.splat(128)
+  let eight = u16x16.splat(8)
   let mut s: usize = 0
   while s < strips.length {
     let strip = strips[s]
     let right = minU32(strip.x + strip.width, width)
     let visible = u32.toUsize(minU32(BAND, height - minU32(strip.y, height)))
     let mut x = strip.x
+    while visible == rows && x + 4 <= right {
+      let block = u8x16.load(alphas, u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND))
+      let mut masks = u8x16.toU16x16(block)
+      if fullMask != 255 {
+        let m = u16x16.wrappingAdd(u16x16.wrappingMultiply(masks, opacityLanes), half)
+        masks = u16x16.shiftRight(u16x16.wrappingAdd(m, u16x16.shiftRight(m, eight)), eight)
+      }
+      let at = u32.toUsize(strip.y) * stride + u32.toUsize(x) * 4
+      overMaskedFour(&mut d, at, lanes, u16x16.shuffle(masks, masks, [0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12]))
+      overMaskedFour(&mut d, at + stride, lanes, u16x16.shuffle(masks, masks, [1, 1, 1, 1, 5, 5, 5, 5, 9, 9, 9, 9, 13, 13, 13, 13]))
+      overMaskedFour(&mut d, at + 2 * stride, lanes, u16x16.shuffle(masks, masks, [2, 2, 2, 2, 6, 6, 6, 6, 10, 10, 10, 10, 14, 14, 14, 14]))
+      overMaskedFour(&mut d, at + 3 * stride, lanes, u16x16.shuffle(masks, masks, [3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15]))
+      x = x + 4
+    }
     while x < right {
       let column = Slice.view(alphas, u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND), rows)
       let mut at = u32.toUsize(strip.y) * stride + u32.toUsize(x) * 4

@@ -197,6 +197,24 @@ pub fn overSpan(d: &mut [u8], at: usize, colors: &[u32], count: usize) -> () {
   }
 }
 
+/// `color` (four packed premultiplied pixels widened to u16 lanes) scaled per pixel by `masks`
+/// (0..=255, repeated over each pixel's four lanes), then composited source-over into the four
+/// pixels from byte `at`: [`overPacked`] of [`scalePacked`] per pixel, with the same rounding.
+pub fn overMaskedFour(d: &mut [u8], at: usize, color: simd<u16, 16>, masks: simd<u16, 16>) -> ()
+with Intrinsic.inlineAlways() {
+  let target = Slice.viewMut(&mut d, at, 16)
+  let full = u16x16.splat(255)
+  let half = u16x16.splat(128)
+  let eight = u16x16.splat(8)
+  let m = u16x16.wrappingAdd(u16x16.wrappingMultiply(color, masks), half)
+  let source = u16x16.shiftRight(u16x16.wrappingAdd(m, u16x16.shiftRight(m, eight)), eight)
+  let below = u8x16.toU16x16(u8x16.load(&target, 0))
+  let alpha = u16x16.shuffle(source, source, [3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15])
+  let t = u16x16.wrappingAdd(u16x16.wrappingMultiply(below, u16x16.wrappingSubtract(full, alpha)), half)
+  let scaled = u16x16.shiftRight(u16x16.wrappingAdd(t, u16x16.shiftRight(t, eight)), eight)
+  u8x16.store(&mut target, 0, u16x16.toU8x16(u16x16.wrappingAdd(scaled, source)))
+}
+
 /// [`over`] with a packed premultiplied source.
 pub fn overPacked(d: &mut [u8], i: usize, source: u32) -> ()
 with Intrinsic.inlineAlways() {
