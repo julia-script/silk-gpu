@@ -5,7 +5,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   import silk.mem.allocator { Allocator, OutOfMemoryError }
   import silk.core.effect { Effect }
   import webgpu.runtime {
-    Instance, Device, GpuError, RequestAdapterOptions, AdapterRequest,
+    Instance, Adapter, Device, GpuError, RequestAdapterOptions, AdapterRequest,
     DeviceRequest, StatusRequest, onSubmittedWorkDoneStart,
   }
   import webgpu.diagnostics { Diagnostics }
@@ -24,8 +24,8 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
   struct Root { storage: Box<State> }
   struct Failed {}
   struct FindingAdapter { request: AdapterRequest<'static> }
-  struct FindingDevice { request: DeviceRequest }
-  struct Ready { device: Device, surface: Surface<'static>, width: u32, height: u32 }
+  struct FindingDevice { adapter: Adapter, request: DeviceRequest }
+  struct Ready { device: Device, surface: Surface<'static>, format: u32, width: u32, height: u32 }
   struct Checking { ready: Ready, work: StatusRequest, validation: StatusRequest }
   struct State {
     instance: Instance,
@@ -67,7 +67,7 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
     if width == 0 || height == 0 { fail GpuError.status(flags.WGPUStatus_Error) }
     ready.device.pushErrorScope(flags.WGPUErrorFilter_Validation)
     if width != ready.width || height != ready.height {
-      let mut configuration = SurfaceConfiguration.make(&ready.device, flags.WGPUTextureFormat_RGBA8Unorm, width, height)
+      let mut configuration = SurfaceConfiguration.make(&ready.device, ready.format, width, height)
       ready.surface.resize(&mut configuration, width, height)
       ready.width = width
       ready.height = height
@@ -105,17 +105,20 @@ static if Intrinsic.targetArchitecture() == "wasm32" {
         if pending.poll() {
           let adapter = run pending.finish()
           let next = run adapter.requestDeviceStart(&DeviceDescriptor.default())
-          state.stage = FindingDevice { request: move next }
+          state.stage = FindingDevice { adapter: move adapter, request: move next }
         } else { state.stage = FindingAdapter { request: move pending } }
       }
-      FindingDevice { request } => {
+      FindingDevice { adapter, request } => {
         let mut pending = move request
         if pending.poll() {
           let device = run pending.finish()
           let target = SurfaceTarget.canvasId(b"gpu-test")
           let surface = run Surface.create(&state.instance, &target, b"canvas-test")
-          state.stage = Ready { device: move device, surface: move surface, width: 0, height: 0 }
-        } else { state.stage = FindingDevice { request: move pending } }
+          let capabilities = run surface.getCapabilities(&adapter)
+          let formats = capabilities.formats()
+          if formats.length == 0 { fail GpuError.status(flags.WGPUStatus_Error) }
+          state.stage = Ready { device: move device, surface: move surface, format: formats[0], width: 0, height: 0 }
+        } else { state.stage = FindingDevice { adapter: move adapter, request: move pending } }
       }
       Ready ready => {
         let mut active = move ready

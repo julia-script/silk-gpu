@@ -8,7 +8,7 @@ import sys
 from _build import ROOT, command_path
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("--skip-native", action="store_true", help="run freshness and workspace checks only")
+parser.add_argument("--skip-native", action="store_true", help="run freshness, CPU harness tests and workspace checks")
 parser.add_argument("--browser", action="store_true", help="also execute compiled wasm samples in existing Chromium")
 args = parser.parse_args()
 

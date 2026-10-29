@@ -82,12 +82,13 @@ Every native sample had zero differing pixels on that run.
 ### Reproducible checks and CI
 
 `python3 scripts/check` is the PR gate: raw bindings, browser glue and embedded
-WGSL freshness, `silkc check --workspace`, compiled C/Silk ABI comparison,
-native lifetime/readback/validation scenarios, and all six pixel samples.
+WGSL freshness, CPU pixel-harness regressions, `silkc check --workspace`, compiled
+C/Silk ABI comparison, native lifetime/readback/validation scenarios, and all six pixel samples.
 `scripts/test-abi` compares the size and alignment of every one of the 92 raw
 records against Dawn's C headers and links all 202 native functions.
-`--skip-native` runs only freshness and workspace checks; `--browser` adds compiled
-wasm sample and canvas execution. Native compiles run sequentially.
+`--skip-native` runs freshness, CPU harness tests and workspace checks; `--browser`
+adds host-contract regressions plus compiled wasm sample and canvas execution.
+Native compiles run sequentially.
 `scripts/test-browser` builds `examples` for `wasm32-unknown-unknown` and invokes
 the real browser harness.
 
@@ -100,9 +101,9 @@ and fails on an image change instead of silently downloading a 1.9 GB toolchain.
 Silk, Dawn, downloaded LLVM distributions, schema inputs, and download caches
 are keyed by platform and lockfile hashes. The preinstalled runner LLVM needs
 no separate cache. Every PR job has a **15-minute timeout**. The
-[complete phase-5 Linux gate](https://github.com/julia-script/silk-gpu/actions/runs/40795554783)
-passed in **76 seconds** of job time (**80 seconds** from run creation to completion),
-with an explicit cache miss. It checked all six packages, generated freshness,
+[complete phase-5 Linux gate](https://github.com/julia-script/silk-gpu/actions/runs/40798761399)
+passed in **40 seconds** of job time with an explicit cache miss.
+It checked all six packages, generated freshness, CPU pixel-harness regressions,
 92 C/Silk record layouts and 202 linked functions, native scenarios, and all six
 pixel samples on pinned lavapipe. This cold result uses preinstalled LLVM 22.1.2,
 not a download of the 1.9 GB LLVM distribution.
@@ -144,7 +145,7 @@ usable software driver. `CDPScreenshotNewSurface` preserves Playwright's default
 feature while enabling Vulkan. Linux headless Chromium 156.0.8078.0 produced
 correct intrinsic canvas pixels but a white compositor capture; headed Chromium
 on Xvfb passed the unchanged full pixel comparison. No rendering moves into JS.
-The [actual hosted browser run](https://github.com/julia-script/silk-gpu/actions/runs/40798507066/job/123200675877)
+The [clean hosted browser run](https://github.com/julia-script/silk-gpu/actions/runs/40798754915/job/123201496542)
 passed ten host-contract tests, six compiled Silk samples, and canvas
 configure/present/resize/compositor-pixel/cleanup checks with that browser version.
 
@@ -240,6 +241,20 @@ resize, minimize/restore, and Escape teardown with exit status zero. The compile
 wasm canvas scenario configures 64×64, resizes to 96×48, checks compositor pixels,
 then requires clean handle/allocation/future teardown. It was also opened and
 visually inspected in installed Chromium; no browser errors were recorded.
+It selects the browser's preferred format from surface capabilities instead of
+forcing RGBA8 and introducing a format-conversion copy on BGRA-preferring devices.
+
+On Linux, `python3 scripts/test-window` builds the real debug GLFW example and
+runs it under a private Xvfb display. Install GLFW 3.4+, `pkg-config`, `xvfb`,
+`xauth`, and `xdotool`; CI uses the pinned lavapipe setup. The
+[hosted X11 run](https://github.com/julia-script/silk-gpu/actions/runs/40798754915/job/123201496591)
+passed in 45 seconds: all 480,000 pixels at 800×600 and all 460,800 pixels after
+a real resize to 960×480 matched the independently calculated sRGB clear color
+`[80,118,153]` within two channel levels. A real Escape event exited zero with
+no live handles or failure reports. The
+[PNG/proof artifact](https://github.com/julia-script/silk-gpu/actions/runs/40798754915/artifacts/12864887689)
+contains both captures. This exercises X11, not Wayland; Xvfb without a window
+manager does not establish minimize behavior. macOS minimize/restore was exercised separately.
 
 ## Headless samples and pixel fixtures
 
