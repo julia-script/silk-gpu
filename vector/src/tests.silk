@@ -198,3 +198,4 @@ test effect fn pixmapCompositesSourceOver() -> () ! AssertionError<'static> | Ou
 import stroke_tests
 import paint_tests
 import layer_tests
+import filter_tests

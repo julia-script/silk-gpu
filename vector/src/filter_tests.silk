@@ -1,0 +1,154 @@
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.usize
+import pixmap { Pixmap, Rgba8 }
+import layer { BLEND_MULTIPLY }
+import filter {
+  Region, BlurPlan, flood, offset, mergeOver, copy, composite, compositePixel, blend, colorMatrix, colorMatrixOf, matrixPixel,
+  gaussianBlur, toLinear, toSrgb, COMPOSITE_OVER, COMPOSITE_IN, COMPOSITE_OUT, COMPOSITE_ATOP, COMPOSITE_XOR, COMPOSITE_LIGHTER,
+  COMPOSITE_ARITHMETIC, MATRIX, SATURATE, HUE_ROTATE, LUMINANCE_TO_ALPHA,
+}
+
+fn close(a: u8, b: u8) -> bool {
+  let d = u8.toI32(a) - u8.toI32(b)
+  return d <= 1 && 0 - d <= 1
+}
+
+fn same(c: Rgba8, r: u8, g: u8, b: u8, a: u8) -> bool { return close(c.r, r) && close(c.g, g) && close(c.b, b) && close(c.a, a) }
+
+fn exact(c: Rgba8, r: u8, g: u8, b: u8, a: u8) -> bool { return c.r == r && c.g == g && c.b == b && c.a == a }
+
+test effect fn floodFillsOnlyTheRegion() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut out = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut out, Rgba8.make(255, 0, 0, 255), 128, Region.make(2, 2, 6, 5))
+  run Testing.expect(exact(out.pixel(2, 2), 128, 0, 0, 128), "premultiplied flood at half opacity")
+  run Testing.expect(exact(out.pixel(5, 4), 128, 0, 0, 128), "last pixel of the region")
+  run Testing.expect(exact(out.pixel(6, 4), 0, 0, 0, 0), "right of the region is clear")
+  run Testing.expect(exact(out.pixel(1, 1), 0, 0, 0, 0), "outside is clear")
+}
+
+test effect fn offsetMovesAndClips() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(0, 255, 0, 255), 255, Region.make(1, 1, 2, 2))
+  let mut out = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  offset(&mut out, &input, 3, -1, Region.of(&input))
+  run Testing.expect(exact(out.pixel(4, 0), 0, 255, 0, 255), "moved by (3, -1)")
+  run Testing.expect(exact(out.pixel(1, 1), 0, 0, 0, 0), "origin is empty")
+  offset(&mut out, &input, 3, -1, Region.make(0, 1, 8, 8))
+  run Testing.expect(exact(out.pixel(4, 0), 0, 0, 0, 0), "clipped by the region")
+}
+
+test effect fn porterDuffOperators() -> () ! AssertionError<'static> {
+  let s = Rgba8.make(200, 0, 0, 200)
+  let b = Rgba8.make(0, 0, 100, 100)
+  let k: [f32; 4] = [0.0, 0.0, 0.0, 0.0]
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_OVER, k), 200, 0, 22, 222), "over")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_IN, k), 78, 0, 0, 78), "in: s * ab")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_OUT, k), 122, 0, 0, 122), "out: s * (1 - ab)")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_ATOP, k), 78, 0, 22, 100), "atop keeps backdrop alpha")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_XOR, k), 122, 0, 22, 144), "xor")
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_LIGHTER, k), 200, 0, 100, 255), "lighter saturates")
+  let identity: [f32; 4] = [0.0, 1.0, 0.0, 0.0]
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_ARITHMETIC, identity), 200, 0, 0, 200), "arithmetic k2 = 1 is in")
+  let sum: [f32; 4] = [0.0, 1.0, 1.0, 0.0]
+  run Testing.expect(same(compositePixel(s, b, COMPOSITE_ARITHMETIC, sum), 200, 0, 100, 255), "arithmetic clamps color to alpha")
+}
+
+test effect fn colorMatricesFollowTheSpec() -> () ! AssertionError<'static> {
+  let red = Rgba8.make(255, 0, 0, 255)
+  let none: [f32; 0] = []
+  run Testing.expect(exact(matrixPixel(red, colorMatrixOf(MATRIX, &none)), 255, 0, 0, 255), "identity")
+  let zero: [f32; 1] = [0.0]
+  run Testing.expect(same(matrixPixel(red, colorMatrixOf(SATURATE, &zero)), 54, 54, 54, 255), "saturate 0 gives luminance gray")
+  let full: [f32; 1] = [360.0]
+  run Testing.expect(same(matrixPixel(red, colorMatrixOf(HUE_ROTATE, &full)), 255, 0, 0, 255), "hue-rotate 360 is identity")
+  let white = Rgba8.make(255, 255, 255, 255)
+  run Testing.expect(same(matrixPixel(white, colorMatrixOf(LUMINANCE_TO_ALPHA, &none)), 0, 0, 0, 255), "luminanceToAlpha")
+  // Unpremultiplied first: a half-transparent red stays red.
+  run Testing.expect(same(matrixPixel(Rgba8.make(128, 0, 0, 128), colorMatrixOf(MATRIX, &none)), 128, 0, 0, 128), "premultiplied round trip")
+}
+
+test effect fn blurPlansFollowTheSpec() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  // sigma 3: d = floor(3 * 3 * sqrt(2 pi) / 4 + 0.5) = 6, even: boxes 6, 6 and 7.
+  let wide = run BlurPlan.make(3.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let boxes = wide.boxPasses()
+  run Testing.expect(boxes.length == 6 && boxes[0] == 6 && boxes[1] == 3 && boxes[2] == 6 && boxes[3] == 2 && boxes[4] == 7 && boxes[5] == 3, "even d box passes")
+  let odd = run BlurPlan.make(2.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(odd.boxPasses().length == 6 && odd.boxPasses()[0] == 4, "sigma 2 gives d = 4")
+  let small = run BlurPlan.make(1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let weights = small.kernel()
+  let mut total: u32 = 0
+  let mut i: usize = 0
+  while i < weights.length {
+    total = total + weights[i]
+    i = i + 1
+  }
+  run Testing.expect(weights.length == 7 && total == 65536, "kernel radius 3 sums to 65536")
+  run Testing.expect(weights[0] == weights[6] && weights[2] == weights[4] && weights[3] > weights[2], "symmetric bell")
+  // exp(-0.5) / sum: the tap next to the center is 0.2420 / 0.9987 of the mass.
+  run Testing.expect(weights[2] > 15800 && weights[2] < 16000, "gaussian weights")
+}
+
+test effect fn blurSpreadsAndKeepsMass() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(40, 40) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(255, 255, 255, 255), 255, Region.make(10, 10, 30, 30))
+  let mut out = run Pixmap.make(40, 40) |> Effect.provideMut<Allocator>(&mut allocator)
+  let plan = run BlurPlan.make(3.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run gaussianBlur(&mut out, &input, &plan, &plan, Region.of(&input)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(exact(out.pixel(20, 20), 255, 255, 255, 255), "interior stays opaque")
+  run Testing.expect(out.pixel(5, 20).a > 0 && out.pixel(5, 20).a < 40, "blur reaches past the edge")
+  let edge = out.pixel(10, 20).a
+  run Testing.expect(edge > 110 && edge < 150, "about half at the edge")
+  let mut before: u32 = 0
+  let mut after: u32 = 0
+  let mut y: u32 = 0
+  while y < 40 {
+    let mut x: u32 = 0
+    while x < 40 {
+      before = before + u8.toU32(input.pixel(x, y).a)
+      after = after + u8.toU32(out.pixel(x, y).a)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  let drift = if after > before { after - before } else { before - after }
+  run Testing.expect(drift * 100 < before, "mass kept within 1%")
+}
+
+test effect fn mergeAndBlendCompose() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut a = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut a, Rgba8.make(255, 0, 0, 255), 255, Region.make(0, 0, 4, 4))
+  let mut b = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut b, Rgba8.make(0, 0, 255, 128), 255, Region.make(0, 0, 2, 4))
+  let mut merged = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  copy(&mut merged, &a, Region.of(&a))
+  mergeOver(&mut merged, &b, Region.of(&a))
+  run Testing.expect(same(merged.pixel(0, 0), 127, 0, 128, 255), "merge composites in order")
+  run Testing.expect(exact(merged.pixel(3, 0), 255, 0, 0, 255), "merge keeps the first input elsewhere")
+  let mut gray = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut gray, Rgba8.make(128, 128, 128, 255), 255, Region.make(0, 0, 4, 4))
+  let mut out = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  blend(&mut out, &gray, &a, BLEND_MULTIPLY, Region.make(0, 0, 2, 2))
+  run Testing.expect(same(out.pixel(0, 0), 128, 0, 0, 255), "feBlend multiply")
+  run Testing.expect(exact(out.pixel(3, 3), 0, 0, 0, 0), "feBlend outside the region is clear")
+}
+
+test effect fn linearRgbRoundTrips() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  p.clear(Rgba8.make(128, 188, 255, 255))
+  toLinear(&mut p)
+  // sRGB 128 -> 0.2158 linear (55), 188 -> 0.5029 (128).
+  run Testing.expect(same(p.pixel(0, 0), 55, 128, 255, 255), "to linear")
+  toSrgb(&mut p)
+  run Testing.expect(same(p.pixel(0, 0), 128, 188, 255, 255), "and back")
+}

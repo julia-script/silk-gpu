@@ -7,3 +7,4 @@ import pixmap
 import stroke
 import paint
 import layer
+import filter
