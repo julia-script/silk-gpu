@@ -582,3 +582,359 @@ fn ln(x: f64) -> f64 {
   }
   return 2.0 * sum + shift
 }
+
+/// A premultiplied channel `c` of a pixel with alpha `a`, unpremultiplied to the nearest byte.
+pub fn unpremultiplyByte(c: u8, a: u8) -> u8 {
+  if a == 0 { return 0 }
+  return u32.toU8(minU32((u8.toU32(c) * 255 + u8.toU32(a) / 2) / u8.toU32(a), 255))
+}
+
+pub const MORPHOLOGY_ERODE: u8 = 0
+pub const MORPHOLOGY_DILATE: u8 = 1
+
+/// `feMorphology`: the per-channel minimum (erode) or maximum (dilate) over a
+/// `(2 rx + 1) x (2 ry + 1)` window. Pixels past the region read as transparent. A zero radius
+/// disables the primitive, which then copies its input.
+pub effect fn morphology(out: &mut Pixmap, input: &Pixmap, operator: u8, rx: u32, ry: u32, region: Region) -> () ! OutOfMemoryError ? &mut Allocator {
+  copy(&mut out, input, region)
+  if rx == 0 || ry == 0 { return }
+  let r = region.clampTo(out.width(), out.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let mut rows = run Pixmap.make(out.width(), out.height())
+  morphologyPass(rows.dataMut(), out.data(), stride, r, operator, rx, true)
+  morphologyPass(out.dataMut(), rows.data(), stride, r, operator, ry, false)
+}
+
+/// One axis of [`morphology`] from `s` into `d` inside `r`.
+fn morphologyPass(d: &mut [u8], s: &[u8], stride: usize, r: Region, operator: u8, radius: u32, horizontal: bool) -> () {
+  let dilate = operator == MORPHOLOGY_DILATE
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let p = if horizontal { x } else { y }
+      let lo = if horizontal { r.x0 } else { r.y0 }
+      let hi = if horizontal { r.x1 } else { r.y1 }
+      let mut c: usize = 0
+      while c < 4 {
+        let mut v: u32 = if dilate { 0 } else { 255 }
+        // Past the region is transparent: erode sees a zero there.
+        if !dilate && (p < lo + radius || p + radius >= hi) { v = 0 }
+        let start = if p < lo + radius { lo } else { p - radius }
+        let end = minU32(p + radius + 1, hi)
+        let mut q = start
+        while q < end {
+          let i = if horizontal { u32.toUsize(y) * stride + u32.toUsize(q) * 4 } else { u32.toUsize(q) * stride + u32.toUsize(x) * 4 }
+          let value = u8.toU32(s[i + c])
+          if dilate { if value > v { v = value } } else if value < v { v = value }
+          q = q + 1
+        }
+        d[u32.toUsize(y) * stride + u32.toUsize(x) * 4 + c] = u32.toU8(v)
+        c = c + 1
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `feComponentTransfer` lookup tables, one per channel, on unpremultiplied bytes.
+pub struct ComponentTransfer {
+  pub r: [u8; 256],
+  pub g: [u8; 256],
+  pub b: [u8; 256],
+  pub a: [u8; 256],
+}
+impl ComponentTransfer {
+  pub fn identity() -> ComponentTransfer {
+    return ComponentTransfer { r: transferIdentity(), g: transferIdentity(), b: transferIdentity(), a: transferIdentity() }
+  }
+}
+
+fn transferByte(v: f64) -> u8 { return f64.toU8(f64.floor(f64.min(f64.max(v, 0.0), 1.0) * 255.0 + 0.5)) }
+
+/// `type="identity"`.
+pub fn transferIdentity() -> [u8; 256] {
+  let mut t: [u8; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    t[u32.toUsize(i)] = u32.toU8(i)
+    i = i + 1
+  }
+  return t
+}
+
+/// `type="table"` with `tableValues`; an empty list is the identity.
+pub fn transferTable(values: &[f32]) -> [u8; 256] {
+  if values.length == 0 { return transferIdentity() }
+  let mut t: [u8; 256] = [0; 256]
+  let n = values.length - 1
+  let mut i: u32 = 0
+  while i < 256 {
+    let c = u32.toF64(i) / 255.0
+    if n == 0 || i == 255 {
+      t[u32.toUsize(i)] = transferByte(f32.toF64(values[n]))
+    } else {
+      let k = minUsize(f64.toUsize(f64.floor(c * usize.toF64(n))), n - 1)
+      let v0 = f32.toF64(values[k])
+      let v1 = f32.toF64(values[k + 1])
+      t[u32.toUsize(i)] = transferByte(v0 + (c - usize.toF64(k) / usize.toF64(n)) * usize.toF64(n) * (v1 - v0))
+    }
+    i = i + 1
+  }
+  return t
+}
+
+fn minUsize(a: usize, b: usize) -> usize { return if a < b { a } else { b } }
+
+/// `type="discrete"` with `tableValues`; an empty list is the identity.
+pub fn transferDiscrete(values: &[f32]) -> [u8; 256] {
+  if values.length == 0 { return transferIdentity() }
+  let mut t: [u8; 256] = [0; 256]
+  let n = values.length
+  let mut i: u32 = 0
+  while i < 256 {
+    let k = minUsize(f64.toUsize(f64.floor(u32.toF64(i) / 255.0 * usize.toF64(n))), n - 1)
+    t[u32.toUsize(i)] = transferByte(f32.toF64(values[k]))
+    i = i + 1
+  }
+  return t
+}
+
+/// `type="linear"`: `slope C + intercept`.
+pub fn transferLinear(slope: f32, intercept: f32) -> [u8; 256] {
+  let mut t: [u8; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    t[u32.toUsize(i)] = transferByte(f32.toF64(slope) * u32.toF64(i) / 255.0 + f32.toF64(intercept))
+    i = i + 1
+  }
+  return t
+}
+
+/// `type="gamma"`: `amplitude C^exponent + offset`.
+pub fn transferGamma(amplitude: f32, exponent: f32, offset: f32) -> [u8; 256] {
+  let mut t: [u8; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    let c = u32.toF64(i) / 255.0
+    let e = f32.toF64(exponent)
+    let p = if e == 0.0 { 1.0 } else if i == 0 { 0.0 } else { pow(c, e) }
+    t[u32.toUsize(i)] = transferByte(f32.toF64(amplitude) * p + f32.toF64(offset))
+    i = i + 1
+  }
+  return t
+}
+
+/// `feComponentTransfer` with `transfer`'s tables.
+pub fn componentTransfer(out: &mut Pixmap, input: &Pixmap, transfer: &ComponentTransfer, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      store(&mut d, i, transferPixel(load(s, i), transfer))
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+pub fn transferPixel(c: Rgba8, transfer: &ComponentTransfer) -> Rgba8 {
+  let a = transfer.a[u8.toUsize(c.a)]
+  let level = u8.toU32(a)
+  return Rgba8 {
+    r: u32.toU8(div255(u8.toU32(transfer.r[u8.toUsize(unpremultiplyByte(c.r, c.a))]) * level)),
+    g: u32.toU8(div255(u8.toU32(transfer.g[u8.toUsize(unpremultiplyByte(c.g, c.a))]) * level)),
+    b: u32.toU8(div255(u8.toU32(transfer.b[u8.toUsize(unpremultiplyByte(c.b, c.a))]) * level)),
+    a: a,
+  }
+}
+
+/// `feTile`: repeats the `source` rectangle of `input` (its primitive subregion) across the region.
+pub fn tile(out: &mut Pixmap, input: &Pixmap, source: Region, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let t = source.clampTo(input.width(), input.height())
+  if t.x1 == t.x0 || t.y1 == t.y0 { return }
+  let w = t.x1 - t.x0
+  let h = t.y1 - t.y0
+  let stride = u32.toUsize(out.width()) * 4
+  let inStride = u32.toUsize(input.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let sy = t.y0 + wrap(y, t.y0, h)
+    let mut x = r.x0
+    while x < r.x1 {
+      let sx = t.x0 + wrap(x, t.x0, w)
+      store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, load(s, u32.toUsize(sy) * inStride + u32.toUsize(sx) * 4))
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// `(p - origin) mod size`, non-negative.
+fn wrap(p: u32, origin: u32, size: u32) -> u32 {
+  if p >= origin { return (p - origin) % size }
+  let m = (origin - p) % size
+  return if m == 0 { 0 } else { size - m }
+}
+
+pub const EDGE_DUPLICATE: u8 = 0
+pub const EDGE_WRAP: u8 = 1
+pub const EDGE_NONE: u8 = 2
+
+/// The `feConvolveMatrix` parameters: `kernel` holds `orderX * orderY` values in SVG's
+/// row-major order, and `divisor` must be nonzero (SVG's default is the kernel sum, or 1).
+pub struct Convolution<'a> {
+  pub kernel: &'a [f32],
+  pub orderX: u32,
+  pub orderY: u32,
+  pub divisor: f32,
+  pub bias: f32,
+  pub targetX: u32,
+  pub targetY: u32,
+  pub edgeMode: u8,
+  pub preserveAlpha: bool,
+}
+
+/// The pixel at `(x, y)` of the region `r` of `s`, extended past `r` by `edgeMode`.
+fn edgePixel(s: &[u8], stride: usize, r: Region, x: i64, y: i64, edgeMode: u8) -> Rgba8 {
+  let x0 = u32.toI64(r.x0)
+  let y0 = u32.toI64(r.y0)
+  let w = u32.toI64(r.x1 - r.x0)
+  let h = u32.toI64(r.y1 - r.y0)
+  let mut px = x - x0
+  let mut py = y - y0
+  if px < 0 || py < 0 || px >= w || py >= h {
+    if edgeMode == EDGE_NONE { return Rgba8.make(0, 0, 0, 0) }
+    if edgeMode == EDGE_DUPLICATE {
+      px = if px < 0 { 0 } else if px >= w { w - 1 } else { px }
+      py = if py < 0 { 0 } else if py >= h { h - 1 } else { py }
+    } else {
+      px = ((px % w) + w) % w
+      py = ((py % h) + h) % h
+    }
+  }
+  return load(s, i64.toUsize(y0 + py) * stride + i64.toUsize(x0 + px) * 4)
+}
+
+/// `feConvolveMatrix` over the region, which is also the input image's extent for `edgeMode`.
+/// Computes in f32: `sum / divisor + bias` on premultiplied values (bias scaled by the result
+/// alpha), or on unpremultiplied color with the source alpha kept when `preserveAlpha` is set.
+pub fn convolveMatrix(out: &mut Pixmap, input: &Pixmap, convolution: &Convolution, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  if r.x1 == r.x0 || r.y1 == r.y0 { return }
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, convolvePixel(s, stride, r, x, y, convolution))
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+fn convolvePixel(s: &[u8], stride: usize, r: Region, x: u32, y: u32, k: &Convolution) -> Rgba8 {
+  let mut sr: f32 = 0.0
+  let mut sg: f32 = 0.0
+  let mut sb: f32 = 0.0
+  let mut sa: f32 = 0.0
+  let mut i: u32 = 0
+  while i < k.orderY {
+    let mut j: u32 = 0
+    while j < k.orderX {
+      let c = edgePixel(s, stride, r, u32.toI64(x) - u32.toI64(k.targetX) + u32.toI64(j), u32.toI64(y) - u32.toI64(k.targetY) + u32.toI64(i), k.edgeMode)
+      let w = k.kernel[u32.toUsize((k.orderY - i - 1) * k.orderX + (k.orderX - j - 1))]
+      if k.preserveAlpha {
+        sr = sr + w * u8.toF32(unpremultiplyByte(c.r, c.a)) / 255.0
+        sg = sg + w * u8.toF32(unpremultiplyByte(c.g, c.a)) / 255.0
+        sb = sb + w * u8.toF32(unpremultiplyByte(c.b, c.a)) / 255.0
+      } else {
+        sr = sr + w * u8.toF32(c.r) / 255.0
+        sg = sg + w * u8.toF32(c.g) / 255.0
+        sb = sb + w * u8.toF32(c.b) / 255.0
+        sa = sa + w * u8.toF32(c.a) / 255.0
+      }
+      j = j + 1
+    }
+    i = i + 1
+  }
+  if k.preserveAlpha {
+    let a = load(s, u32.toUsize(y) * stride + u32.toUsize(x) * 4).a
+    let level = u8.toU32(a)
+    return Rgba8 {
+      r: u32.toU8(div255(u8.toU32(byte(clamp01(sr / k.divisor + k.bias))) * level)),
+      g: u32.toU8(div255(u8.toU32(byte(clamp01(sg / k.divisor + k.bias))) * level)),
+      b: u32.toU8(div255(u8.toU32(byte(clamp01(sb / k.divisor + k.bias))) * level)),
+      a: a,
+    }
+  }
+  let alpha = clamp01(sa / k.divisor + k.bias)
+  return Rgba8 {
+    r: byte(f32.min(clamp01(sr / k.divisor + k.bias * alpha), alpha)), g: byte(f32.min(clamp01(sg / k.divisor + k.bias * alpha), alpha)),
+    b: byte(f32.min(clamp01(sb / k.divisor + k.bias * alpha), alpha)), a: byte(alpha),
+  }
+}
+
+pub const CHANNEL_R: u8 = 0
+pub const CHANNEL_G: u8 = 1
+pub const CHANNEL_B: u8 = 2
+pub const CHANNEL_A: u8 = 3
+
+/// The displacement in whole pixels for each map byte: `round(scale (C - 0.5))`.
+pub fn displacementTable(scale: f32) -> [i32; 256] {
+  let mut t: [i32; 256] = [0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    t[u32.toUsize(i)] = f64.toI32(f64.floor(f32.toF64(scale) * (u32.toF64(i) / 255.0 - 0.5) + 0.5))
+    i = i + 1
+  }
+  return t
+}
+
+fn channelOf(c: Rgba8, channel: u8) -> u8 {
+  if channel == CHANNEL_A { return c.a }
+  let v = if channel == CHANNEL_R { c.r } else if channel == CHANNEL_G { c.g } else { c.b }
+  return unpremultiplyByte(v, c.a)
+}
+
+/// `feDisplacementMap`: each pixel takes the `input` pixel displaced by `table` (from
+/// [`displacementTable`]) of the map's `xChannel` and `yChannel` (unpremultiplied), nearest
+/// neighbor; samples past the canvas are transparent.
+pub fn displacementMap(out: &mut Pixmap, input: &Pixmap, map: &Pixmap, table: &[i32; 256], xChannel: u8, yChannel: u8, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let w = u32.toI64(input.width())
+  let h = u32.toI64(input.height())
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let m = map.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let i = u32.toUsize(y) * stride + u32.toUsize(x) * 4
+      let c = load(m, i)
+      let sx = u32.toI64(x) + i32.toI64(table[u8.toUsize(channelOf(c, xChannel))])
+      let sy = u32.toI64(y) + i32.toI64(table[u8.toUsize(channelOf(c, yChannel))])
+      if sx >= 0 && sy >= 0 && sx < w && sy < h { store(&mut d, i, load(s, i64.toUsize(sy) * stride + i64.toUsize(sx) * 4)) }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}

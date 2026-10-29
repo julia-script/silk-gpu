@@ -33,7 +33,11 @@ import gpu_scene.scene { Scene, NO_MASK, MASK_ALPHA, MASK_LUMINANCE }
 import gpu_scene.renderer { SceneRenderer, FORMAT }
 import gpu_scene.filter { FilterRenderer, FilterImage }
 import vector.filter as filtering
-import vector.filter { Region, BlurPlan, colorMatrixOf, MATRIX, SATURATE, HUE_ROTATE, LUMINANCE_TO_ALPHA }
+import vector.filter {
+  Region, BlurPlan, colorMatrixOf, MATRIX, SATURATE, HUE_ROTATE, LUMINANCE_TO_ALPHA, ComponentTransfer, Convolution, transferTable,
+  transferDiscrete, transferLinear, transferGamma, displacementTable, MORPHOLOGY_ERODE, MORPHOLOGY_DILATE, EDGE_DUPLICATE, EDGE_WRAP, EDGE_NONE,
+  CHANNEL_R, CHANNEL_G, CHANNEL_A,
+}
 
 const WIDTH: u32 = 128
 const HEIGHT: u32 = 96
@@ -462,6 +466,74 @@ effect fn filters(device: &Device, queue: &Queue) -> bool ! GpuError | OutOfMemo
     ok = compare("feGaussianBlur", out.data(), blurred.asSlice(), 0) && ok
     s = s + 2
   }
+
+  let radii: [u32; 6] = [1, 1, 3, 0, 2, 5]
+  let mut q: usize = 0
+  while q < 6 {
+    let operator = if q == 2 { MORPHOLOGY_DILATE } else if q == 4 { MORPHOLOGY_DILATE } else { MORPHOLOGY_ERODE }
+    run filtering.morphology(&mut out, &a, operator, radii[q], radii[q + 1], region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.morphology(device, queue, &mut encoder, &gpuOut, &gpuA, &scratch, operator, radii[q], radii[q + 1], region)
+    run submit(queue, move encoder)
+    let morphed = run readImage(device, queue, &gpuOut)
+    ok = compare("feMorphology", out.data(), morphed.asSlice(), 0) && ok
+    q = q + 2
+  }
+
+  let mut transfer = ComponentTransfer.identity()
+  let values: [f32; 4] = [0.1, 0.9, 0.3, 1.0]
+  transfer.r = transferTable(&values)
+  transfer.g = transferDiscrete(&values)
+  transfer.b = transferGamma(1.2, 0.6, -0.05)
+  transfer.a = transferLinear(0.8, 0.1)
+  filtering.componentTransfer(&mut out, &a, &transfer, region)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.componentTransfer(device, queue, &mut encoder, &gpuOut, &gpuA, &transfer, region)
+  run submit(queue, move encoder)
+  let transferred = run readImage(device, queue, &gpuOut)
+  ok = compare("feComponentTransfer", out.data(), transferred.asSlice(), 0) && ok
+
+  filtering.tile(&mut out, &a, Region.make(30, 20, 61, 47), region)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.tile(device, queue, &mut encoder, &gpuOut, &gpuA, Region.make(30, 20, 61, 47), region)
+  run submit(queue, move encoder)
+  let tiled = run readImage(device, queue, &gpuOut)
+  ok = compare("feTile", out.data(), tiled.asSlice(), 0) && ok
+
+  let sharpen: [f32; 9] = [0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0]
+  let emboss: [f32; 6] = [-2.0, -1.0, 0.0, -1.0, 1.0, 1.5]
+  let mut e: u8 = 0
+  while e < 3 {
+    let first = Convolution { kernel: &sharpen, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: e, preserveAlpha: false }
+    filtering.convolveMatrix(&mut out, &a, &first, region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.convolveMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, &first, region)
+    run submit(queue, move encoder)
+    let sharpened = run readImage(device, queue, &gpuOut)
+    ok = compare("feConvolveMatrix", out.data(), sharpened.asSlice(), 1) && ok
+    let second = Convolution { kernel: &emboss, orderX: 3, orderY: 2, divisor: 0.7, bias: 0.25, targetX: 2, targetY: 0, edgeMode: e, preserveAlpha: e == EDGE_WRAP }
+    filtering.convolveMatrix(&mut out, &a, &second, region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.convolveMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, &second, region)
+    run submit(queue, move encoder)
+    let embossed = run readImage(device, queue, &gpuOut)
+    ok = compare("feConvolveMatrix", out.data(), embossed.asSlice(), 1) && ok
+    e = e + 1
+  }
+
+  let displacement = displacementTable(23.5)
+  filtering.displacementMap(&mut out, &a, &b, &displacement, CHANNEL_R, CHANNEL_G, region)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.displacementMap(device, queue, &mut encoder, &gpuOut, &gpuA, &gpuB, &displacement, CHANNEL_R, CHANNEL_G, region)
+  run submit(queue, move encoder)
+  let displaced = run readImage(device, queue, &gpuOut)
+  ok = compare("feDisplacementMap", out.data(), displaced.asSlice(), 0) && ok
+  filtering.displacementMap(&mut out, &b, &a, &displacement, CHANNEL_A, CHANNEL_R, region)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.displacementMap(device, queue, &mut encoder, &gpuOut, &gpuB, &gpuA, &displacement, CHANNEL_A, CHANNEL_R, region)
+  run submit(queue, move encoder)
+  let displacedAlpha = run readImage(device, queue, &gpuOut)
+  ok = compare("feDisplacementMap", out.data(), displacedAlpha.asSlice(), 0) && ok
 
   filtering.copy(&mut out, &a, Region.of(&a))
   filtering.toLinear(&mut out)

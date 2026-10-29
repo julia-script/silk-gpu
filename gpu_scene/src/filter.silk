@@ -21,7 +21,7 @@ import silk.num.usize
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import vector.pixmap { Pixmap, Rgba8, div255 }
-import vector.filter { Region, BlurPlan, conversionTable }
+import vector.filter { Region, BlurPlan, ComponentTransfer, Convolution, conversionTable }
 import renderer { FORMAT, extent, storage, entry, textureEntry, writeU32 }
 import generated_shaders as shaders
 
@@ -34,6 +34,11 @@ const OP_MATRIX: u32 = 5
 const OP_BOX: u32 = 6
 const OP_KERNEL: u32 = 7
 const OP_CONVERT: u32 = 8
+const OP_MORPHOLOGY: u32 = 9
+const OP_TRANSFER: u32 = 10
+const OP_TILE: u32 = 11
+const OP_CONVOLVE: u32 = 12
+const OP_DISPLACE: u32 = 13
 
 /// Bytes of the shader's `Params` uniform.
 const PARAMS_BYTES: usize = 144
@@ -235,6 +240,91 @@ impl FilterRenderer {
     let from = if source == 0 { input } else { scratch }
     run self.pass(device, queue, &mut encoder, out, params, from, from, data)
     return 1
+  }
+
+  /// `feMorphology` (`vector.filter` MORPHOLOGY_ operator) with radii in device pixels: a row
+  /// pass into `scratch`, then a column pass.
+  pub effect fn morphology(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+    operator: u8, rx: u32, ry: u32, region: Region) -> () ! GpuError {
+    let r = clamped(region, out)
+    if rx == 0 || ry == 0 {
+      run self.copy(device, queue, &mut encoder, out, input, r)
+      return
+    }
+    let rows = header(OP_MORPHOLOGY, 1, rx, u8.toU32(operator), r)
+    run self.pass(device, queue, &mut encoder, scratch, &rows, input, input, &self.empty)
+    let columns = header(OP_MORPHOLOGY, 0, ry, u8.toU32(operator), r)
+    run self.pass(device, queue, &mut encoder, out, &columns, scratch, scratch, &self.empty)
+  }
+
+  /// `feComponentTransfer` with `transfer`'s tables.
+  pub effect fn componentTransfer(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
+    transfer: &ComponentTransfer, region: Region) -> () ! GpuError {
+    let mut tables: [u8; 1024] = [0; 1024]
+    let mut i: usize = 0
+    while i < 256 {
+      tables[i] = transfer.r[i]
+      tables[256 + i] = transfer.g[i]
+      tables[512 + i] = transfer.b[i]
+      tables[768 + i] = transfer.a[i]
+      i = i + 1
+    }
+    let buffer = run storage(device, queue, b"filter transfer", &tables, flags.WGPUBufferUsage_Storage)
+    let params = header(OP_TRANSFER, 0, 0, 0, clamped(region, out))
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &buffer)
+  }
+
+  /// `feTile`: repeats the `source` rectangle of `input` across the region.
+  pub effect fn tile(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, source: Region, region: Region) -> () ! GpuError {
+    let t = source.clampTo(input.width, input.height)
+    let mut params = header(OP_TILE, 0, 0, 0, clamped(region, out))
+    writeU32(&mut params, 32, t.x0)
+    writeU32(&mut params, 36, t.y0)
+    writeU32(&mut params, 40, t.x1)
+    writeU32(&mut params, 44, t.y1)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+  }
+
+  /// `feConvolveMatrix`; the region is also the input's extent for the edge mode.
+  pub effect fn convolveMatrix(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
+    convolution: &Convolution, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let r = clamped(region, out)
+    let count = u32.toUsize(convolution.orderX * convolution.orderY)
+    if r.x1 == r.x0 || r.y1 == r.y0 || count == 0 {
+      run self.flood(device, queue, &mut encoder, out, Rgba8.make(0, 0, 0, 0), 0, r)
+      return
+    }
+    let mut packed = List<u8>.make()
+    run packed.appendRepeated(0, count * 4)
+    let bytes = packed.asMutSlice()
+    let mut i: usize = 0
+    while i < count {
+      writeF32(&mut bytes, i * 4, convolution.kernel[i])
+      i = i + 1
+    }
+    let buffer = run storage(device, queue, b"filter kernel", packed.asSlice(), flags.WGPUBufferUsage_Storage)
+    let preserve: u32 = if convolution.preserveAlpha { 256 } else { 0 }
+    let mut params = header(OP_CONVOLVE, convolution.orderX, convolution.orderY, u8.toU32(convolution.edgeMode) | preserve, r)
+    writeU32(&mut params, 32, convolution.targetX)
+    writeU32(&mut params, 36, convolution.targetY)
+    writeF32(&mut params, 48, convolution.divisor)
+    writeF32(&mut params, 52, convolution.bias)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &buffer)
+  }
+
+  /// `feDisplacementMap` with a table from `vector.filter.displacementTable` and CHANNEL_
+  /// selectors.
+  pub effect fn displacementMap(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, map: &FilterImage,
+    table: &[i32; 256], xChannel: u8, yChannel: u8, region: Region) -> () ! GpuError {
+    let mut packed: [u8; 1024] = [0; 1024]
+    let mut i: usize = 0
+    while i < 256 {
+      writeU32(&mut packed, i * 4, i32.wrappingToU32(table[i]))
+      i = i + 1
+    }
+    let buffer = run storage(device, queue, b"filter displacement", &packed, flags.WGPUBufferUsage_Storage)
+    let params = header(OP_DISPLACE, u8.toU32(xChannel), u8.toU32(yChannel), 0, clamped(region, out))
+    run self.pass(device, queue, &mut encoder, out, &params, input, map, &buffer)
   }
 
   /// Converts the whole of `input` to linear light (`color-interpolation-filters: linearRGB`).
