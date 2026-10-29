@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Compare every raw Silk record layout with the pinned implementation's C ABI."""
+import platform
+import subprocess
+import tomllib
+from _build import ROOT, build, command_path, quoted
+
+
+def main():
+    clang = command_path("install-llvm")
+    dawn = command_path("install-webgpu")
+    stage = ROOT / ".cache" / "abi-probe"
+    source = stage / "src"
+    source.mkdir(parents=True, exist_ok=True)
+    generated = ROOT / "webgpu_sys" / "abi"
+    entry = source / "main.silk"
+    if not entry.exists():
+        entry.symlink_to(generated / "generated_main.silk")
+    elif entry.resolve() != (generated / "generated_main.silk").resolve():
+        raise RuntimeError(f"Conflicting ABI probe source: {entry}")
+    raw_manifest = tomllib.loads((ROOT / "webgpu_sys" / "silk.toml").read_text())
+    version = raw_manifest["package"]["silk-version"]
+    (stage / "silk.toml").write_text(
+        '[package]\nname = "gpu_abi_probe"\nversion = "0.1.0"\n'
+        + f"silk-version = {quoted(version)}\n\n[dependencies]\n"
+        + f"webgpu_sys = {{ path = {quoted(ROOT / 'webgpu_sys')} }}\n"
+    )
+    object_path = stage / "abi.o"
+    archive = stage / "libgpu_abi.a"
+    command = [str(clang), "-std=c11", "-DSILK_GPU_ABI_LIBRARY", "-c",
+               str(generated / "generated_layout.c"), "-o", str(object_path),
+               "-I", str(dawn / "include"), "-I", str(dawn / "include" / "dawn")]
+    if platform.system() == "Darwin":
+        sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        command += ["-isysroot", sdk, "-mmacosx-version-min=26.0"]
+    subprocess.run(command, check=True, cwd=ROOT)
+    subprocess.run([str(clang.parent / "llvm-ar"), "rcs", str(archive), str(object_path)], check=True, cwd=ROOT)
+    binary = build(stage, extra_links=[{"static-archive": archive}])
+    subprocess.run([str(binary)], check=True, timeout=60, cwd=ROOT)
+
+
+if __name__ == "__main__":
+    main()

@@ -9,4 +9,5 @@ subprocess.run([sys.executable, ROOT / "scripts/generate", "--check"], cwd=ROOT,
 compiler_bin = command_path("install-silk")
 os.environ["SILK_CLANG"] = str(command_path("install-llvm"))
 subprocess.run([compiler_bin / "silkc", "check", "--workspace", "--stdlib", compiler_bin.parent / "lib/silk/stdlib"], cwd=ROOT, check=True)
+subprocess.run([sys.executable, ROOT / "scripts/test-abi"], cwd=ROOT, check=True)
 subprocess.run([sys.executable, ROOT / "scripts/test-native"], cwd=ROOT, check=True)

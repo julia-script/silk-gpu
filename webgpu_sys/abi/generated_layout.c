@@ -206,6 +206,119 @@ static WGPUProc volatile generated_symbols[] = {
   (WGPUProc)&wgpuSurfaceCapabilitiesFreeMembers,
   (WGPUProc)&wgpuGetProcAddress,
 };
+typedef struct { const char *name; size_t bytes; size_t alignment; } SilkGpuAbiLayout;
+static const SilkGpuAbiLayout generated_layouts[] = {
+  {"WGPUStringView", sizeof(WGPUStringView), _Alignof(WGPUStringView)},
+  {"WGPUChainedStruct", sizeof(WGPUChainedStruct), _Alignof(WGPUChainedStruct)},
+  {"WGPUBufferMapCallbackInfo", sizeof(WGPUBufferMapCallbackInfo), _Alignof(WGPUBufferMapCallbackInfo)},
+  {"WGPUCompilationInfoCallbackInfo", sizeof(WGPUCompilationInfoCallbackInfo), _Alignof(WGPUCompilationInfoCallbackInfo)},
+  {"WGPUCreateComputePipelineAsyncCallbackInfo", sizeof(WGPUCreateComputePipelineAsyncCallbackInfo), _Alignof(WGPUCreateComputePipelineAsyncCallbackInfo)},
+  {"WGPUCreateRenderPipelineAsyncCallbackInfo", sizeof(WGPUCreateRenderPipelineAsyncCallbackInfo), _Alignof(WGPUCreateRenderPipelineAsyncCallbackInfo)},
+  {"WGPUDeviceLostCallbackInfo", sizeof(WGPUDeviceLostCallbackInfo), _Alignof(WGPUDeviceLostCallbackInfo)},
+  {"WGPUPopErrorScopeCallbackInfo", sizeof(WGPUPopErrorScopeCallbackInfo), _Alignof(WGPUPopErrorScopeCallbackInfo)},
+  {"WGPUQueueWorkDoneCallbackInfo", sizeof(WGPUQueueWorkDoneCallbackInfo), _Alignof(WGPUQueueWorkDoneCallbackInfo)},
+  {"WGPURequestAdapterCallbackInfo", sizeof(WGPURequestAdapterCallbackInfo), _Alignof(WGPURequestAdapterCallbackInfo)},
+  {"WGPURequestDeviceCallbackInfo", sizeof(WGPURequestDeviceCallbackInfo), _Alignof(WGPURequestDeviceCallbackInfo)},
+  {"WGPUUncapturedErrorCallbackInfo", sizeof(WGPUUncapturedErrorCallbackInfo), _Alignof(WGPUUncapturedErrorCallbackInfo)},
+  {"WGPUAdapterInfo", sizeof(WGPUAdapterInfo), _Alignof(WGPUAdapterInfo)},
+  {"WGPUBindGroupDescriptor", sizeof(WGPUBindGroupDescriptor), _Alignof(WGPUBindGroupDescriptor)},
+  {"WGPUBindGroupEntry", sizeof(WGPUBindGroupEntry), _Alignof(WGPUBindGroupEntry)},
+  {"WGPUBindGroupLayoutDescriptor", sizeof(WGPUBindGroupLayoutDescriptor), _Alignof(WGPUBindGroupLayoutDescriptor)},
+  {"WGPUBindGroupLayoutEntry", sizeof(WGPUBindGroupLayoutEntry), _Alignof(WGPUBindGroupLayoutEntry)},
+  {"WGPUBlendComponent", sizeof(WGPUBlendComponent), _Alignof(WGPUBlendComponent)},
+  {"WGPUBlendState", sizeof(WGPUBlendState), _Alignof(WGPUBlendState)},
+  {"WGPUBufferBindingLayout", sizeof(WGPUBufferBindingLayout), _Alignof(WGPUBufferBindingLayout)},
+  {"WGPUBufferDescriptor", sizeof(WGPUBufferDescriptor), _Alignof(WGPUBufferDescriptor)},
+  {"WGPUColor", sizeof(WGPUColor), _Alignof(WGPUColor)},
+  {"WGPUColorTargetState", sizeof(WGPUColorTargetState), _Alignof(WGPUColorTargetState)},
+  {"WGPUCommandBufferDescriptor", sizeof(WGPUCommandBufferDescriptor), _Alignof(WGPUCommandBufferDescriptor)},
+  {"WGPUCommandEncoderDescriptor", sizeof(WGPUCommandEncoderDescriptor), _Alignof(WGPUCommandEncoderDescriptor)},
+  {"WGPUCompatibilityModeLimits", sizeof(WGPUCompatibilityModeLimits), _Alignof(WGPUCompatibilityModeLimits)},
+  {"WGPUCompilationInfo", sizeof(WGPUCompilationInfo), _Alignof(WGPUCompilationInfo)},
+  {"WGPUCompilationMessage", sizeof(WGPUCompilationMessage), _Alignof(WGPUCompilationMessage)},
+  {"WGPUComputePassDescriptor", sizeof(WGPUComputePassDescriptor), _Alignof(WGPUComputePassDescriptor)},
+  {"WGPUComputePipelineDescriptor", sizeof(WGPUComputePipelineDescriptor), _Alignof(WGPUComputePipelineDescriptor)},
+  {"WGPUComputeState", sizeof(WGPUComputeState), _Alignof(WGPUComputeState)},
+  {"WGPUConstantEntry", sizeof(WGPUConstantEntry), _Alignof(WGPUConstantEntry)},
+  {"WGPUDepthStencilState", sizeof(WGPUDepthStencilState), _Alignof(WGPUDepthStencilState)},
+  {"WGPUDeviceDescriptor", sizeof(WGPUDeviceDescriptor), _Alignof(WGPUDeviceDescriptor)},
+  {"WGPUExtent3D", sizeof(WGPUExtent3D), _Alignof(WGPUExtent3D)},
+  {"WGPUExternalTextureBindingEntry", sizeof(WGPUExternalTextureBindingEntry), _Alignof(WGPUExternalTextureBindingEntry)},
+  {"WGPUExternalTextureBindingLayout", sizeof(WGPUExternalTextureBindingLayout), _Alignof(WGPUExternalTextureBindingLayout)},
+  {"WGPUFragmentState", sizeof(WGPUFragmentState), _Alignof(WGPUFragmentState)},
+  {"WGPUFuture", sizeof(WGPUFuture), _Alignof(WGPUFuture)},
+  {"WGPUFutureWaitInfo", sizeof(WGPUFutureWaitInfo), _Alignof(WGPUFutureWaitInfo)},
+  {"WGPUInstanceDescriptor", sizeof(WGPUInstanceDescriptor), _Alignof(WGPUInstanceDescriptor)},
+  {"WGPUInstanceLimits", sizeof(WGPUInstanceLimits), _Alignof(WGPUInstanceLimits)},
+  {"WGPULimits", sizeof(WGPULimits), _Alignof(WGPULimits)},
+  {"WGPUMultisampleState", sizeof(WGPUMultisampleState), _Alignof(WGPUMultisampleState)},
+  {"WGPUOrigin3D", sizeof(WGPUOrigin3D), _Alignof(WGPUOrigin3D)},
+  {"WGPUPassTimestampWrites", sizeof(WGPUPassTimestampWrites), _Alignof(WGPUPassTimestampWrites)},
+  {"WGPUPipelineLayoutDescriptor", sizeof(WGPUPipelineLayoutDescriptor), _Alignof(WGPUPipelineLayoutDescriptor)},
+  {"WGPUPrimitiveState", sizeof(WGPUPrimitiveState), _Alignof(WGPUPrimitiveState)},
+  {"WGPUQuerySetDescriptor", sizeof(WGPUQuerySetDescriptor), _Alignof(WGPUQuerySetDescriptor)},
+  {"WGPUQueueDescriptor", sizeof(WGPUQueueDescriptor), _Alignof(WGPUQueueDescriptor)},
+  {"WGPURenderBundleDescriptor", sizeof(WGPURenderBundleDescriptor), _Alignof(WGPURenderBundleDescriptor)},
+  {"WGPURenderBundleEncoderDescriptor", sizeof(WGPURenderBundleEncoderDescriptor), _Alignof(WGPURenderBundleEncoderDescriptor)},
+  {"WGPURenderPassColorAttachment", sizeof(WGPURenderPassColorAttachment), _Alignof(WGPURenderPassColorAttachment)},
+  {"WGPURenderPassDepthStencilAttachment", sizeof(WGPURenderPassDepthStencilAttachment), _Alignof(WGPURenderPassDepthStencilAttachment)},
+  {"WGPURenderPassDescriptor", sizeof(WGPURenderPassDescriptor), _Alignof(WGPURenderPassDescriptor)},
+  {"WGPURenderPassMaxDrawCount", sizeof(WGPURenderPassMaxDrawCount), _Alignof(WGPURenderPassMaxDrawCount)},
+  {"WGPURenderPipelineDescriptor", sizeof(WGPURenderPipelineDescriptor), _Alignof(WGPURenderPipelineDescriptor)},
+  {"WGPURequestAdapterOptions", sizeof(WGPURequestAdapterOptions), _Alignof(WGPURequestAdapterOptions)},
+  {"WGPURequestAdapterWebXROptions", sizeof(WGPURequestAdapterWebXROptions), _Alignof(WGPURequestAdapterWebXROptions)},
+  {"WGPUSamplerBindingLayout", sizeof(WGPUSamplerBindingLayout), _Alignof(WGPUSamplerBindingLayout)},
+  {"WGPUSamplerDescriptor", sizeof(WGPUSamplerDescriptor), _Alignof(WGPUSamplerDescriptor)},
+  {"WGPUShaderModuleDescriptor", sizeof(WGPUShaderModuleDescriptor), _Alignof(WGPUShaderModuleDescriptor)},
+  {"WGPUShaderSourceSPIRV", sizeof(WGPUShaderSourceSPIRV), _Alignof(WGPUShaderSourceSPIRV)},
+  {"WGPUShaderSourceWGSL", sizeof(WGPUShaderSourceWGSL), _Alignof(WGPUShaderSourceWGSL)},
+  {"WGPUStencilFaceState", sizeof(WGPUStencilFaceState), _Alignof(WGPUStencilFaceState)},
+  {"WGPUStorageTextureBindingLayout", sizeof(WGPUStorageTextureBindingLayout), _Alignof(WGPUStorageTextureBindingLayout)},
+  {"WGPUSupportedFeatures", sizeof(WGPUSupportedFeatures), _Alignof(WGPUSupportedFeatures)},
+  {"WGPUSupportedInstanceFeatures", sizeof(WGPUSupportedInstanceFeatures), _Alignof(WGPUSupportedInstanceFeatures)},
+  {"WGPUSupportedWGSLLanguageFeatures", sizeof(WGPUSupportedWGSLLanguageFeatures), _Alignof(WGPUSupportedWGSLLanguageFeatures)},
+  {"WGPUSurfaceCapabilities", sizeof(WGPUSurfaceCapabilities), _Alignof(WGPUSurfaceCapabilities)},
+  {"WGPUSurfaceColorManagement", sizeof(WGPUSurfaceColorManagement), _Alignof(WGPUSurfaceColorManagement)},
+  {"WGPUSurfaceConfiguration", sizeof(WGPUSurfaceConfiguration), _Alignof(WGPUSurfaceConfiguration)},
+  {"WGPUSurfaceDescriptor", sizeof(WGPUSurfaceDescriptor), _Alignof(WGPUSurfaceDescriptor)},
+  {"WGPUSurfaceSourceAndroidNativeWindow", sizeof(WGPUSurfaceSourceAndroidNativeWindow), _Alignof(WGPUSurfaceSourceAndroidNativeWindow)},
+  {"WGPUSurfaceSourceMetalLayer", sizeof(WGPUSurfaceSourceMetalLayer), _Alignof(WGPUSurfaceSourceMetalLayer)},
+  {"WGPUSurfaceSourceWaylandSurface", sizeof(WGPUSurfaceSourceWaylandSurface), _Alignof(WGPUSurfaceSourceWaylandSurface)},
+  {"WGPUSurfaceSourceWindowsHWND", sizeof(WGPUSurfaceSourceWindowsHWND), _Alignof(WGPUSurfaceSourceWindowsHWND)},
+  {"WGPUSurfaceSourceXCBWindow", sizeof(WGPUSurfaceSourceXCBWindow), _Alignof(WGPUSurfaceSourceXCBWindow)},
+  {"WGPUSurfaceSourceXlibWindow", sizeof(WGPUSurfaceSourceXlibWindow), _Alignof(WGPUSurfaceSourceXlibWindow)},
+  {"WGPUSurfaceTexture", sizeof(WGPUSurfaceTexture), _Alignof(WGPUSurfaceTexture)},
+  {"WGPUTexelCopyBufferInfo", sizeof(WGPUTexelCopyBufferInfo), _Alignof(WGPUTexelCopyBufferInfo)},
+  {"WGPUTexelCopyBufferLayout", sizeof(WGPUTexelCopyBufferLayout), _Alignof(WGPUTexelCopyBufferLayout)},
+  {"WGPUTexelCopyTextureInfo", sizeof(WGPUTexelCopyTextureInfo), _Alignof(WGPUTexelCopyTextureInfo)},
+  {"WGPUTextureBindingLayout", sizeof(WGPUTextureBindingLayout), _Alignof(WGPUTextureBindingLayout)},
+  {"WGPUTextureBindingViewDimension", sizeof(WGPUTextureBindingViewDimension), _Alignof(WGPUTextureBindingViewDimension)},
+  {"WGPUTextureComponentSwizzle", sizeof(WGPUTextureComponentSwizzle), _Alignof(WGPUTextureComponentSwizzle)},
+  {"WGPUTextureComponentSwizzleDescriptor", sizeof(WGPUTextureComponentSwizzleDescriptor), _Alignof(WGPUTextureComponentSwizzleDescriptor)},
+  {"WGPUTextureDescriptor", sizeof(WGPUTextureDescriptor), _Alignof(WGPUTextureDescriptor)},
+  {"WGPUTextureViewDescriptor", sizeof(WGPUTextureViewDescriptor), _Alignof(WGPUTextureViewDescriptor)},
+  {"WGPUVertexAttribute", sizeof(WGPUVertexAttribute), _Alignof(WGPUVertexAttribute)},
+  {"WGPUVertexBufferLayout", sizeof(WGPUVertexBufferLayout), _Alignof(WGPUVertexBufferLayout)},
+  {"WGPUVertexState", sizeof(WGPUVertexState), _Alignof(WGPUVertexState)},
+};
+int32_t silk_gpu_abi_check(size_t index, size_t bytes, size_t alignment) {
+  if (index >= sizeof(generated_layouts) / sizeof(generated_layouts[0])) return 1;
+  const SilkGpuAbiLayout *expected = &generated_layouts[index];
+  if (bytes == expected->bytes && alignment == expected->alignment) return 0;
+  fprintf(stderr, "%s ABI mismatch: Silk size=%zu align=%zu; C size=%zu align=%zu\n",
+          expected->name, bytes, alignment, expected->bytes, expected->alignment);
+  return 1;
+}
+int32_t silk_gpu_abi_finish(size_t checked) {
+  size_t records = sizeof(generated_layouts) / sizeof(generated_layouts[0]);
+  if (checked != records) return 1;
+  size_t symbols = sizeof(generated_symbols) / sizeof(generated_symbols[0]);
+  for (size_t i = 0; i < symbols; ++i)
+    if (generated_symbols[i] == NULL) return 1;
+  printf("WebGPU ABI: %zu C/Silk record sizes and alignments match; %zu native symbols linked\n", records, symbols);
+  return 0;
+}
+#ifndef SILK_GPU_ABI_LIBRARY
 int main(void) {
   printf("WGPUStringView sizeof %zu alignof %zu\n", sizeof(WGPUStringView), _Alignof(WGPUStringView));
   printf("WGPUStringView.data %zu\n", offsetof(WGPUStringView, data));
@@ -1182,3 +1295,4 @@ int main(void) {
     if (generated_symbols[i] == NULL) return 1;
   return 0;
 }
+#endif

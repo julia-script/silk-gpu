@@ -65,3 +65,4 @@ Dawn is a C++ static archive. Its release CMake metadata specifies Threads on al
 Run `python3 scripts/check` to install and verify the pinned Silk, LLVM and Dawn binaries and fetch checksum-verified upstream schema inputs. The workspace contains the generated `webgpu_sys` package and the `native_tests` executable. The Ubuntu26 PR job provisions pinned lavapipe and validates its existing LLVM22 installation before running this gate, with a 15-minute timeout. Hosted timing evidence is recorded in the pull request after execution.
 
 The gate also checks generated binding freshness, checks the workspace, and creates, processes events on, and releases a native Dawn instance. `scripts/generate --check` validates generated declarations and ABI metadata against the pinned schema.
+The native gate also compiles an independent C ABI probe, compares all 92 generated record sizes and alignments with Silk `Layout.of`, and links addresses for all 202 WebGPU functions.
