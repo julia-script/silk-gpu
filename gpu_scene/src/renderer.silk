@@ -27,6 +27,10 @@ pub const FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
 pub struct SceneRenderer {
   pipeline: RenderPipeline,
   compose: RenderPipeline,
+  /// Layer textures kept between renders, all `layerWidth` x `layerHeight`; see [`Layers`].
+  layers: List<Layer>,
+  layerWidth: u32,
+  layerHeight: u32,
 }
 
 const COMPOSE_LAYER: u32 = 0
@@ -39,12 +43,6 @@ const LUMINANCE: u32 = 2
 struct Layer {
   texture: Texture,
   view: TextureView,
-}
-
-/// The textures of one render: 0 is the root, 1 the copy of a parent being composited onto,
-/// then one per pushed layer in push order, then one per mask.
-struct Layers {
-  list: List<Layer>,
 }
 
 fn readU32(bytes: &[u8], offset: usize) -> u32 {
@@ -163,12 +161,12 @@ impl SceneRenderer {
     composeDescriptor.setPrimitive(primitive)
     composeDescriptor.setMultisample(multisample)
     let compose = run gpu.createRenderPipeline(device, &composeDescriptor)
-    return SceneRenderer { pipeline: move pipeline, compose: move compose }
+    return SceneRenderer { pipeline: move pipeline, compose: move compose, layers: List<Layer>.make(), layerWidth: 0, layerHeight: 0 }
   }
 
   /// Clears `target` to the premultiplied form of `background` and draws `scene` on it, then
   /// submits. `target` must be `scene.width()` x `scene.height()` and RGBA8Unorm.
-  pub effect fn render(self: &Self, device: &Device, queue: &Queue, scene: &Scene, target: &TextureView, background: Rgba8)
+  pub effect fn render(self: &mut Self, device: &Device, queue: &Queue, scene: &Scene, target: &TextureView, background: Rgba8)
     -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let mut header: [u8; 16] = [0; 16]
     writeU32(&mut header, 0, scene.width())
@@ -189,10 +187,37 @@ impl SceneRenderer {
     if commands.length == 0 {
       run drawRuns(&mut encoder, target, &self.pipeline, &group, false, colorOf(background), 0, scene.runCount())
     } else {
+      run self.reserveLayers(device, scene)
       run self.renderLayers(device, queue, &mut encoder, scene, &group, target, background)
     }
     let finished = run encoder.finish(b"vector scene")
     queue.submit(&[finished.reference()])
+  }
+
+  /// Grows the pooled layers to what `scene` uses: 0 is the root, 1 the copy of a parent being
+  /// composited onto, then one per pushed layer in push order, then one per mask. Every pass
+  /// clears or overwrites a layer before reading it, so reused textures need no clearing.
+  effect fn reserveLayers(self: &mut Self, device: &Device, scene: &Scene) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let width = scene.width()
+    let height = scene.height()
+    if width != self.layerWidth || height != self.layerHeight {
+      self.layers.clear()
+      self.layerWidth = width
+      self.layerHeight = height
+    }
+    let commands = scene.commands()
+    let count = commands.length / COMMAND_BYTES
+    let mut pushes: u32 = 0
+    let mut c: usize = 0
+    while c < count {
+      if readU32(commands, c * COMMAND_BYTES) == OP_PUSH { pushes = pushes + 1 }
+      c = c + 1
+    }
+    let total = u32.toUsize(2 + pushes + scene.maskCount())
+    while self.layers.length() < total {
+      let layer = run makeLayer(device, width, height)
+      run self.layers.append(move layer)
+    }
   }
 
   effect fn renderLayers(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, scene: &Scene, group: &gpu.BindGroup, target: &TextureView, background: Rgba8)
@@ -207,14 +232,7 @@ impl SceneRenderer {
     }
     let width = scene.width()
     let height = scene.height()
-    let mut layers = List<Layer>.make()
-    let total = 2 + pushes + scene.maskCount()
-    let mut t: u32 = 0
-    while t < total {
-      let layer = run makeLayer(device, width, height)
-      run layers.append(move layer)
-      t = t + 1
-    }
+    let layers = &self.layers
     let maskBase = 2 + pushes
     let transparent = colorOf(Rgba8.make(0, 0, 0, 0))
     run drawRuns(&mut encoder, &layers.asSlice()[0].view, &self.pipeline, group, false, colorOf(background), 0, 0)

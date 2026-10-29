@@ -97,8 +97,10 @@ without Dawn.
    full-target pass of `shaders/compose.wgsl` that computes `vector.layer`'s compositing on the
    bytes (integer source-over for `normal`, the same f32 formulas for the other modes), and the
    root is copied to the target at the end. The scene test renders all 16 blend modes, a
-   luminance mask through a clip, and image patterns, and matches the CPU byte for byte on lavapipe. Textures are
-   allocated per render; pooling them is future work.
+   luminance mask through a clip, and image patterns, and matches the CPU byte for byte on lavapipe. The renderer
+   keeps its layer textures between renders, growing the pool as scenes need more and dropping
+   it when the canvas size changes; the scene test renders the layered scene a second time on
+   reused textures.
 
 10. **Filters** (`vector.filter`, `gpu_scene.filter`): the Filter Effects primitives on
    canvas-sized premultiplied images, each writing the result inside its primitive subregion and
