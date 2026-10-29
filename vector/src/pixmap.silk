@@ -196,3 +196,19 @@ with Intrinsic.inlineAlways() {
   pixel[2] = u32.wrappingToU8(u32.shiftRight(word, 16))
   pixel[3] = u32.wrappingToU8(u32.shiftRight(word, 24))
 }
+
+// LIMITATION (silk-lang/silk#2561): the stdlib's float-to-integer conversions run a software
+// trunc before their range check. These convert the same way, trap on the same inputs, and
+// range-check the raw value instead.
+pub fn truncateToU8(v: f32) -> u8 with Intrinsic.inlineAlways() {
+  if v > -1.0 && v < 256.0 { return Intrinsic.f32ToU8(v) }
+  return Intrinsic.trap("truncateToU8: the value is NaN, infinite, or outside the u8 range")
+}
+pub fn truncateF64ToU8(v: f64) -> u8 with Intrinsic.inlineAlways() {
+  if v > -1.0 && v < 256.0 { return Intrinsic.f64ToU8(v) }
+  return Intrinsic.trap("truncateF64ToU8: the value is NaN, infinite, or outside the u8 range")
+}
+pub fn truncateToI64(v: f64) -> i64 with Intrinsic.inlineAlways() {
+  if v >= -9223372036854775808.0 && v < 9223372036854775808.0 { return Intrinsic.f64ToI64(v) }
+  return Intrinsic.trap("truncateToI64: the value is NaN, infinite, or outside the i64 range")
+}
