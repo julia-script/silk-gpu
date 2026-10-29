@@ -434,28 +434,30 @@ impl<'a> ImagePattern<'a> {
     let one = f32x4.splat(1.0)
     let w = f32x4.splat(u32.toF32(self.image.width()))
     let h = f32x4.splat(u32.toF32(self.image.height()))
+    let stride = u32x4.splat(self.image.width())
     let left = self.wrapLanes(x0, w)
     let right = self.wrapLanes(x0 + one, w)
-    let top = self.wrapLanes(y0, h)
-    let bottom = self.wrapLanes(y0 + one, h)
-    let mut k: usize = 0
-    while k < 4 {
-      let l = i32.toUsize(i32x4.extract(left, k))
-      let r = i32.toUsize(i32x4.extract(right, k))
-      let t = i32.toUsize(i32x4.extract(top, k))
-      let b = i32.toUsize(i32x4.extract(bottom, k))
-      out[at + k] = bilerpWords(self.word(l, t), self.word(r, t), self.word(l, b), self.word(r, b), f32x4.extract(wx, k), f32x4.extract(wy, k))
-      k = k + 1
-    }
+    let top = u32x4.wrappingMultiply(self.wrapLanes(y0, h), stride)
+    let bottom = u32x4.wrappingMultiply(self.wrapLanes(y0 + one, h), stride)
+    // Texel indices of the four corners of each pixel (inside the image, so no wrap-around).
+    let a = u32x4.wrappingAdd(top, left)
+    let b = u32x4.wrappingAdd(top, right)
+    let c = u32x4.wrappingAdd(bottom, left)
+    let d = u32x4.wrappingAdd(bottom, right)
+    let data = self.image.data()
+    out[at] = bilerpWords(texelAt(data, a, 0), texelAt(data, b, 0), texelAt(data, c, 0), texelAt(data, d, 0), f32x4.extract(wx, 0), f32x4.extract(wy, 0))
+    out[at + 1] = bilerpWords(texelAt(data, a, 1), texelAt(data, b, 1), texelAt(data, c, 1), texelAt(data, d, 1), f32x4.extract(wx, 1), f32x4.extract(wy, 1))
+    out[at + 2] = bilerpWords(texelAt(data, a, 2), texelAt(data, b, 2), texelAt(data, c, 2), texelAt(data, d, 2), f32x4.extract(wx, 2), f32x4.extract(wy, 2))
+    out[at + 3] = bilerpWords(texelAt(data, a, 3), texelAt(data, b, 3), texelAt(data, c, 3), texelAt(data, d, 3), f32x4.extract(wx, 3), f32x4.extract(wy, 3))
     return true
   }
   /// [`wrap`] per lane.
-  fn wrapLanes(self: &Self, v: simd<f32, 4>, size: simd<f32, 4>) -> simd<i32, 4>
+  fn wrapLanes(self: &Self, v: simd<f32, 4>, size: simd<f32, 4>) -> simd<u32, 4>
   with Intrinsic.inlineAlways() {
     let zero = f32x4.splat(0.0)
     let limit = size - f32x4.splat(1.0)
     let t = if self.extend == EXTEND_REPEAT { minLanes(v - size * floorLanes(v / size), limit) } else { minLanes(maxLanes(v, zero), limit) }
-    return f32x4.toI32x4(maxLanes(t, zero))
+    return i32x4.bitcastToU32x4(f32x4.toI32x4(maxLanes(t, zero)))
   }
 }
 impl<'a> Shader for ImagePattern<'a> {
@@ -495,6 +497,13 @@ with Intrinsic.inlineAlways() {
   let bytes = i32x4.bitcastToU8x16(rounded)
   let packed = u8x16.shuffle(bytes, bytes, [0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12])
   return u32x4.extract(u8x16.bitcastToU32x4(packed), 0)
+}
+
+/// The packed texel at index lane `lane` of `indices`.
+fn texelAt(data: &[u8], indices: simd<u32, 4>, lane: usize) -> u32
+with Intrinsic.inlineAlways() {
+  let texel = Slice.view(data, u32.toUsize(u32x4.extract(indices, lane)) * 4, 4)
+  return u8.toU32(texel[0]) | u32.shiftLeft(u8.toU32(texel[1]), 8) | u32.shiftLeft(u8.toU32(texel[2]), 16) | u32.shiftLeft(u8.toU32(texel[3]), 24)
 }
 
 /// The four channels of a packed color as f32 lanes.
