@@ -51,7 +51,7 @@ fn readU32(bytes: &[u8], offset: usize) -> u32 {
   return u8.toU32(bytes[offset]) | u32.shiftLeft(u8.toU32(bytes[offset + 1]), 8) | u32.shiftLeft(u8.toU32(bytes[offset + 2]), 16) | u32.shiftLeft(u8.toU32(bytes[offset + 3]), 24)
 }
 
-fn extent(width: u32, height: u32) -> Extent3D {
+pub fn extent(width: u32, height: u32) -> Extent3D {
   let mut size = Extent3D.default()
   size.setWidth(width)
   size.setHeight(height)
@@ -109,7 +109,7 @@ fn premultipliedOver() -> BlendComponent {
   return component
 }
 
-effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8], usage: u64) -> Buffer ! GpuError {
+pub effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8], usage: u64) -> Buffer ! GpuError {
   // Bindings must not be empty; keep at least 16 bytes.
   let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
   let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(label, usize.toU64(size), usage | flags.WGPUBufferUsage_CopyDst, false))
@@ -117,14 +117,14 @@ effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8], us
   return move buffer
 }
 
-fn entry<'a>(binding: u32, buffer: &'a Buffer) -> BindGroupEntry<'a> {
+pub fn entry<'a>(binding: u32, buffer: &'a Buffer) -> BindGroupEntry<'a> {
   let mut result = BindGroupEntry.default().withBuffer(buffer)
   result.setBinding(binding)
   result.setSize(buffer.getSize())
   return result
 }
 
-fn textureEntry<'a>(binding: u32, view: &'a TextureView) -> BindGroupEntry<'a> {
+pub fn textureEntry<'a>(binding: u32, view: &'a TextureView) -> BindGroupEntry<'a> {
   let mut result = BindGroupEntry.default().withTextureView(view)
   result.setBinding(binding)
   return result
@@ -296,7 +296,7 @@ impl SceneRenderer {
   }
 }
 
-fn writeU32(bytes: &mut [u8], offset: usize, value: u32) -> () {
+pub fn writeU32(bytes: &mut [u8], offset: usize, value: u32) -> () {
   bytes[offset] = u32.toU8(value & 255)
   bytes[offset + 1] = u32.toU8(u32.shiftRight(value, 8) & 255)
   bytes[offset + 2] = u32.toU8(u32.shiftRight(value, 16) & 255)

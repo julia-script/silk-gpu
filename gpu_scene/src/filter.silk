@@ -1,0 +1,271 @@
+//! SVG filter primitives on the GPU, matching `vector.filter` byte for byte.
+//!
+//! Each primitive records one or more full-target passes of `shaders/filter.wgsl` into an
+//! encoder. Like the CPU versions, a primitive writes its whole output image: the result inside
+//! the primitive subregion and transparent black elsewhere. Inputs and outputs are canvas-sized
+//! [`FilterImage`]s, and an output must not also be an input of the same primitive.
+import webgpu.resources as gpu
+import webgpu.resources { Buffer, RenderPipeline, Texture, TextureView, Queue, CommandEncoder }
+import webgpu.runtime { Device, GpuError }
+import webgpu.descriptors {
+  RenderPassColorAttachment, RenderPassDescriptor, VertexState, FragmentState, ColorTargetState, PrimitiveState,
+  MultisampleState, RenderPipelineDescriptor, BindGroupDescriptor, TextureDescriptor, TextureViewDescriptor,
+  TexelCopyTextureInfo, TexelCopyBufferLayout,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.num.u8
+import silk.num.u32
+import silk.num.i32
+import silk.num.f32
+import silk.num.usize
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import vector.pixmap { Pixmap, Rgba8, div255 }
+import vector.filter { Region, BlurPlan, conversionTable }
+import renderer { FORMAT, extent, storage, entry, textureEntry, writeU32 }
+import generated_shaders as shaders
+
+const OP_FLOOD: u32 = 0
+const OP_OFFSET: u32 = 1
+const OP_MERGE: u32 = 2
+const OP_COMPOSITE: u32 = 3
+const OP_BLEND: u32 = 4
+const OP_MATRIX: u32 = 5
+const OP_BOX: u32 = 6
+const OP_KERNEL: u32 = 7
+const OP_CONVERT: u32 = 8
+
+/// Bytes of the shader's `Params` uniform.
+const PARAMS_BYTES: usize = 144
+
+/// A canvas-sized RGBA8 texture that filter primitives read and write.
+pub struct FilterImage {
+  pub texture: Texture,
+  pub view: TextureView,
+  pub width: u32,
+  pub height: u32,
+}
+
+impl FilterImage {
+  pub effect fn make(device: &Device, width: u32, height: u32) -> FilterImage ! GpuError {
+    let mut descriptor = TextureDescriptor.default().withLabel(b"filter image")
+    descriptor.setSize(extent(width, height))
+    descriptor.setFormat(FORMAT)
+    descriptor.setDimension(flags.WGPUTextureDimension_2D)
+    descriptor.setMipLevelCount(1)
+    descriptor.setSampleCount(1)
+    descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopySrc | flags.WGPUTextureUsage_CopyDst)
+    let texture = run gpu.createTexture(device, &descriptor)
+    let view = run texture.createView(&TextureViewDescriptor.default())
+    return FilterImage { texture: move texture, view: move view, width: width, height: height }
+  }
+  /// Uploads `pixmap`, which must have the image's size.
+  pub fn write(self: &Self, queue: &Queue, pixmap: &Pixmap) -> () {
+    let destination = TexelCopyTextureInfo.default().withTexture(&self.texture)
+    let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+    layout.setBytesPerRow(self.width * 4)
+    layout.setRowsPerImage(self.height)
+    queue.writeTexture(&destination, pixmap.data(), &layout, &extent(self.width, self.height))
+  }
+}
+
+pub struct FilterRenderer {
+  pipeline: RenderPipeline,
+  /// Bound where a pass reads no table or weights.
+  empty: Buffer,
+  toLinearTable: Buffer,
+  toSrgbTable: Buffer,
+  /// Bound where a pass reads no image (an output cannot also be bound for reading).
+  blank: FilterImage,
+}
+
+fn writeF32(bytes: &mut [u8], offset: usize, value: f32) -> () { writeU32(&mut bytes, offset, f32.toBits(value)) }
+
+fn writeRegion(bytes: &mut [u8], region: Region) -> () {
+  writeU32(&mut bytes, 16, region.x0)
+  writeU32(&mut bytes, 20, region.y0)
+  writeU32(&mut bytes, 24, region.x1)
+  writeU32(&mut bytes, 28, region.y1)
+}
+
+/// The `Params` header of an op on `region` with arguments `p0`..`p2`.
+fn header(op: u32, p0: u32, p1: u32, p2: u32, region: Region) -> [u8; 144] {
+  let mut bytes: [u8; 144] = [0; 144]
+  writeU32(&mut bytes, 0, op)
+  writeU32(&mut bytes, 4, p0)
+  writeU32(&mut bytes, 8, p1)
+  writeU32(&mut bytes, 12, p2)
+  writeRegion(&mut bytes, region)
+  return bytes
+}
+
+impl FilterRenderer {
+  pub effect fn make(device: &Device, queue: &Queue) -> FilterRenderer ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let shader = run gpu.createShaderModule(device, b"vector filter", shaders.filter())
+    let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs")
+    let mut plain: ColorTargetState = ColorTargetState.default()
+    plain.setFormat(FORMAT)
+    plain.setWriteMask(flags.WGPUColorWriteMask_All)
+    let targets = [plain]
+    let fragment = FragmentState.default().withModule(&shader).withEntryPoint(b"fs").withTargets(&targets)
+    let mut primitive: PrimitiveState = PrimitiveState.default()
+    primitive.setTopology(flags.WGPUPrimitiveTopology_TriangleList)
+    let mut multisample: MultisampleState = MultisampleState.default()
+    multisample.setCount(1)
+    let mut descriptor = RenderPipelineDescriptor.default().withVertex(vertex).withFragment(&fragment)
+    descriptor.setPrimitive(primitive)
+    descriptor.setMultisample(multisample)
+    let pipeline = run gpu.createRenderPipeline(device, &descriptor)
+    let zeros: [u8; 16] = [0; 16]
+    let empty = run storage(device, queue, b"filter empty", &zeros, flags.WGPUBufferUsage_Storage)
+    let linear = run conversionTable(true)
+    let toLinearTable = run storage(device, queue, b"filter to linear", linear.asSlice(), flags.WGPUBufferUsage_Storage)
+    let srgb = run conversionTable(false)
+    let toSrgbTable = run storage(device, queue, b"filter to srgb", srgb.asSlice(), flags.WGPUBufferUsage_Storage)
+    let blank = run FilterImage.make(device, 1, 1)
+    return FilterRenderer { pipeline: move pipeline, empty: move empty, toLinearTable: move toLinearTable, toSrgbTable: move toSrgbTable, blank: move blank }
+  }
+
+  /// `feFlood`: `color` (straight alpha) times `opacity` over the region.
+  pub effect fn flood(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, color: Rgba8, opacity: u8, region: Region) -> () ! GpuError {
+    let a = div255(u8.toU32(color.a) * u8.toU32(opacity))
+    let c = Rgba8.make(color.r, color.g, color.b, u32.toU8(a)).premultiply()
+    let mut params = header(OP_FLOOD, 0, 0, 0, clamped(region, out))
+    writeU32(&mut params, 32, u8.toU32(c.r))
+    writeU32(&mut params, 36, u8.toU32(c.g))
+    writeU32(&mut params, 40, u8.toU32(c.b))
+    writeU32(&mut params, 44, u8.toU32(c.a))
+    run self.pass(device, queue, &mut encoder, out, &params, &self.blank, &self.blank, &self.empty)
+  }
+
+  /// `feOffset` by whole device pixels.
+  pub effect fn offset(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, dx: i32, dy: i32, region: Region) -> () ! GpuError {
+    let params = header(OP_OFFSET, i32.wrappingToU32(dx), i32.wrappingToU32(dy), 0, clamped(region, out))
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+  }
+
+  /// Copies `input` inside the region; transparent elsewhere.
+  pub effect fn copy(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, region: Region) -> () ! GpuError {
+    run self.offset(device, queue, &mut encoder, out, input, 0, 0, region)
+  }
+
+  /// One `feMerge` step: `input` source-over `below` inside the region, `below` elsewhere (the
+  /// CPU's in-place `mergeOver` with `below` as the pixmap before the call).
+  pub effect fn mergeOver(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, below: &FilterImage, input: &FilterImage, region: Region) -> () ! GpuError {
+    let params = header(OP_MERGE, 0, 0, 0, clamped(region, out))
+    run self.pass(device, queue, &mut encoder, out, &params, below, input, &self.empty)
+  }
+
+  /// `feComposite` of `input` with `backdrop`; `k` holds k1..k4 for the arithmetic operator.
+  pub effect fn composite(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, backdrop: &FilterImage, operator: u8, k: [f32; 4], region: Region) -> () ! GpuError {
+    let mut params = header(OP_COMPOSITE, u8.toU32(operator), 0, 0, clamped(region, out))
+    writeF32(&mut params, 48, k[0])
+    writeF32(&mut params, 52, k[1])
+    writeF32(&mut params, 56, k[2])
+    writeF32(&mut params, 60, k[3])
+    run self.pass(device, queue, &mut encoder, out, &params, input, backdrop, &self.empty)
+  }
+
+  /// `feBlend` of `input` onto `backdrop` with a `vector.layer` BLEND_ mode.
+  pub effect fn blend(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, backdrop: &FilterImage, mode: u8, region: Region) -> () ! GpuError {
+    let params = header(OP_BLEND, u8.toU32(mode), 0, 0, clamped(region, out))
+    run self.pass(device, queue, &mut encoder, out, &params, input, backdrop, &self.empty)
+  }
+
+  /// `feColorMatrix` with a matrix from `vector.filter.colorMatrixOf`.
+  pub effect fn colorMatrix(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, m: [f32; 20], region: Region) -> () ! GpuError {
+    let mut params = header(OP_MATRIX, 0, 0, 0, clamped(region, out))
+    let mut i: usize = 0
+    while i < 20 {
+      writeF32(&mut params, 64 + i * 4, m[i])
+      i = i + 1
+    }
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+  }
+
+  /// `feGaussianBlur` with per-axis plans; `scratch` holds intermediate passes.
+  pub effect fn gaussianBlur(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+    horizontal: &BlurPlan, vertical: &BlurPlan, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let r = clamped(region, out)
+    // Passes alternate between `out` and `scratch`; `source` 0 is the input, 1 out, 2 scratch.
+    let mut source: u32 = 0
+    source = run self.blurAxis(device, queue, &mut encoder, out, input, scratch, horizontal, 1, r, source)
+    source = run self.blurAxis(device, queue, &mut encoder, out, input, scratch, vertical, 0, r, source)
+    if source == 0 {
+      run self.copy(device, queue, &mut encoder, out, input, r)
+    } else if source == 2 {
+      run self.copy(device, queue, &mut encoder, out, scratch, r)
+    }
+  }
+
+  effect fn blurAxis(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+    plan: &BlurPlan, axis: u32, region: Region, start: u32) -> u32 ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let mut source = start
+    let boxes = plan.boxPasses()
+    let mut p: usize = 0
+    while p < boxes.length {
+      let params = header(OP_BOX, axis, boxes[p], boxes[p + 1], region)
+      source = run self.blurPass(device, queue, &mut encoder, out, input, scratch, &params, &self.empty, source)
+      p = p + 2
+    }
+    let weights = plan.kernel()
+    if weights.length > 0 {
+      let mut packed = List<u8>.make()
+      run packed.appendRepeated(0, weights.length * 4)
+      let bytes = packed.asMutSlice()
+      let mut i: usize = 0
+      while i < weights.length {
+        writeU32(&mut bytes, i * 4, weights[i])
+        i = i + 1
+      }
+      let buffer = run storage(device, queue, b"filter blur weights", packed.asSlice(), flags.WGPUBufferUsage_Storage)
+      let params = header(OP_KERNEL, axis, usize.toU32(weights.length), 0, region)
+      source = run self.blurPass(device, queue, &mut encoder, out, input, scratch, &params, &buffer, source)
+    }
+    return source
+  }
+
+  /// One blur pass from the current source into the other of `out` and `scratch`.
+  effect fn blurPass(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+    params: &[u8; 144], data: &Buffer, source: u32) -> u32 ! GpuError {
+    if source == 1 {
+      run self.pass(device, queue, &mut encoder, scratch, params, out, out, data)
+      return 2
+    }
+    let from = if source == 0 { input } else { scratch }
+    run self.pass(device, queue, &mut encoder, out, params, from, from, data)
+    return 1
+  }
+
+  /// Converts the whole of `input` to linear light (`color-interpolation-filters: linearRGB`).
+  pub effect fn toLinear(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage) -> () ! GpuError {
+    let params = header(OP_CONVERT, 0, 0, 0, Region.make(0, 0, out.width, out.height))
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.toLinearTable)
+  }
+
+  /// Converts the whole of `input` from linear light back to sRGB.
+  pub effect fn toSrgb(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage) -> () ! GpuError {
+    let params = header(OP_CONVERT, 0, 0, 0, Region.make(0, 0, out.width, out.height))
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.toSrgbTable)
+  }
+
+  effect fn pass(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, params: &[u8; 144], first: &FilterImage, second: &FilterImage, data: &Buffer) -> () ! GpuError {
+    let uniform = run storage(device, queue, b"filter params", params, flags.WGPUBufferUsage_Uniform)
+    let layout = run self.pipeline.getBindGroupLayout(0)
+    let entries = [entry(0, &uniform), textureEntry(1, &first.view), textureEntry(2, &second.view), entry(3, data)]
+    let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+    let group = run gpu.createBindGroup(device, &groupDescriptor)
+    let mut color = RenderPassColorAttachment.default().withView(&out.view)
+    color.setLoadOp(flags.WGPULoadOp_Clear)
+    color.setStoreOp(flags.WGPUStoreOp_Store)
+    let colors = [color]
+    let passDescriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+    let mut pass = run encoder.beginRenderPass(&passDescriptor)
+    pass.setPipeline(&self.pipeline)
+    pass.setBindGroup(0, &group, &[])
+    pass.draw(3, 1, 0, 0)
+    pass.end()
+  }
+}
+
+fn clamped(region: Region, image: &FilterImage) -> Region { return region.clampTo(image.width, image.height) }
