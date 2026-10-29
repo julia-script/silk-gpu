@@ -1,0 +1,31 @@
+//! Dev-only GLFW 3.4 FFI. This module is not a dependency of webgpu.
+pub type Window = ?*mut u8
+pub type KeyCallback = extern "C" fn(Window, i32, i32, i32, i32) -> ()
+pub unsafe extern "C" fn glfwInit() -> i32
+pub unsafe extern "C" fn glfwTerminate() -> ()
+pub unsafe extern "C" fn glfwWindowHint(hint: i32, value: i32) -> ()
+pub unsafe extern "C" fn glfwCreateWindow(width: i32, height: i32, title: ?[*]const u8, monitor: ?*mut u8, share: Window) -> Window
+pub unsafe extern "C" fn glfwDestroyWindow(window: Window) -> ()
+pub unsafe extern "C" fn glfwPollEvents() -> () with Intrinsic.foreign(invokesDeferredCallbacks: true)
+pub unsafe extern "C" fn glfwWaitEvents() -> () with Intrinsic.foreign(invokesDeferredCallbacks: true)
+pub unsafe extern "C" fn glfwWindowShouldClose(window: Window) -> i32
+pub unsafe extern "C" fn glfwSetWindowShouldClose(window: Window, value: i32) -> ()
+pub unsafe extern "C" fn glfwSetKeyCallback(window: Window, callback: KeyCallback) -> ?*mut u8 with Intrinsic.foreign(deferredCallbacks: ("callback",))
+pub unsafe extern "C" fn glfwGetFramebufferSize(window: Window, width: *mut i32, height: *mut i32) -> ()
+pub unsafe extern "C" fn glfwGetWindowAttrib(window: Window, attribute: i32) -> i32
+pub unsafe extern "C" fn glfwGetPlatform() -> i32
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  pub unsafe extern "C" fn glfwGetCocoaWindow(window: Window) -> ?*mut u8
+  pub unsafe extern "C" fn silk_gpu_attach_metal_layer(window: ?*mut u8) -> ?*mut u8
+  pub unsafe extern "C" fn silk_gpu_resize_metal_layer(window: ?*mut u8, width: i32, height: i32) -> ()
+} else {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    pub unsafe extern "C" fn glfwGetWin32Window(window: Window) -> ?*mut u8
+    pub unsafe extern "C" fn GetModuleHandleA(name: ?[*]const u8) -> ?*mut u8
+  } else {
+    pub unsafe extern "C" fn glfwGetWaylandDisplay() -> ?*mut u8
+    pub unsafe extern "C" fn glfwGetWaylandWindow(window: Window) -> ?*mut u8
+    pub unsafe extern "C" fn glfwGetX11Display() -> ?*mut u8
+    pub unsafe extern "C" fn glfwGetX11Window(window: Window) -> u64
+  }
+}

@@ -60,14 +60,93 @@ Dawn's archive labels identify the upstream build runners, not a guaranteed mini
 
 Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Link the host C++ runtime as well. Windows uses the MSVC archive and SDK libraries listed in the release's `lib/cmake/Dawn/DawnTargets.cmake`. No unverified cross-platform build or test success is claimed here.
 
-### Native checks and CI
+### Reproducible checks and CI
 
-`python3 scripts/check` checks raw generation and embedded WGSL freshness, the complete workspace, compiled C/Silk ABI layouts, native asynchronous ownership/validation scenarios, and all six headless pixel samples. `--skip-native` runs freshness and workspace checks only. The Ubuntu26 PR job selects checksum-pinned Mesa lavapipe and has a 15-minute timeout. Compiles run sequentially.
+`python3 scripts/check` is the PR gate: raw bindings, browser glue and embedded
+WGSL freshness, `silkc check --workspace`, native lifetime/readback/validation
+scenarios, and all six pixel samples. `--skip-native` runs only freshness and
+workspace checks; `--browser` adds compiled wasm sample execution. Native
+compiles run sequentially. `scripts/test-browser` builds `examples` for
+`wasm32-unknown-unknown` and invokes the real browser harness.
 
-The complete safe package includes owned resources, descriptors, capabilities, async requests and the foundational Surface type required by adapter options. Surface host handles remain host-owned; the binding does not create windows. Native device callback registration uses a small C ABI bridge so retained callbacks have explicit Silk foreign contracts.
+The PR workflow uses the explicitly supported
+[`ubuntu-26.04` x86_64 runner](https://github.com/actions/runner-images/issues/14747),
+not the moving `ubuntu-latest` label. Its [published software inventory](https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2604-Readme.md)
+lists LLVM **22.1.2**; the [runner provisioning script](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/install-clang.sh)
+also installs `lld-22`. `scripts/setup-ci` requires that exact Clang version
+and fails on an image change instead of silently downloading a 1.9 GB toolchain.
+Silk, Dawn, downloaded LLVM distributions, schema inputs, and download caches
+are keyed by platform and lockfile hashes. The preinstalled runner LLVM needs
+no separate cache. Every PR job has a **15-minute timeout**; a timeout is failure,
+not proof that a cold successful run fits the budget. Hosted-runner timings
+have not yet been measured.
+
+Linux tests explicitly select **Mesa lavapipe 26.0.8-1ubuntu0.3**.
+`scripts/ci-lock.json` pins the 19,109,714-byte amd64 `.deb` from Ubuntu's
+[`20261027T000000Z` snapshot](https://snapshot.ubuntu.com/ubuntu/20261027T000000Z/),
+SHA-256 `27db5fa34d50d208b58cc94317b573065329740bb98d0e12b7947b06a9d02a4e`.
+The actual package was downloaded and its checksum verified during setup research.
+The installer verifies it again, installs its runtime dependencies with apt,
+checks the installed version, and sets `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` to
+the package's lavapipe ICD. The Mesa binary is fixed; hosted-runner images and
+their system dependency packages are not hermetically frozen.
+
+The weekly/manual workflow runs macOS26 arm64 native tests and Linux browser
+tests outside the PR budget. Browser provisioning downloads only checksum-pinned
+**Playwright 1.64.1** JavaScript packages (including `playwright-core`), never a
+browser. It requires the runner's already-installed Chromium and passes its
+path through `PLAYWRIGHT_CHROMIUM_EXECUTABLE`. Locally, an existing Playwright
+installation may be selected with `PLAYWRIGHT_MODULE`; otherwise normal Node
+module resolution applies. A missing browser, missing `wasm-ld`, unsupported
+WebGPU adapter, or failed pixel comparison is a hard failure, not a skip.
+
+The Windows scheduled job verifies the available Dawn archive, then explicitly
+fails when it cannot install a real native Silk compiler. Windows is blocked by
+[`silk-lang/silk#2542`](https://github.com/silk-lang/silk/issues/2542), not counted
+as successful native coverage. This diagnostic intentionally keeps the
+scheduled workflow red until the upstream platform prerequisite is resolved.
+
+## Surfaces and the dev-only GLFW example
+
+`webgpu.surface` accepts host-owned Metal layers, Wayland display/surface pairs,
+X11 display/window pairs, Win32 HWND/HINSTANCE pairs, and browser canvas selectors
+or ids. Native `SurfaceTarget` constructors are unsafe: the caller must supply
+valid handles, keep their owning host object alive, and honor its thread affinity.
+Each constructor borrows that owner; safe `Surface.create` borrows the typed
+target. `Surface` owns one WebGPU reference, releases it on drop, and explicitly
+duplicates it with `dup()`. Surface capability arrays are freed on drop; their
+slices cannot outlive their owner. Acquired frames contain an owned safe `Texture`.
+Surfaces, duplicated references, and acquired textures participate in their
+instance's debug live-handle accounting; release builds erase the counters.
+Configuration and resize use a borrowed device and view-format slice without a
+per-frame descriptor allocation.
+
+The `examples_window` package is dev-only; neither binding package depends on
+GLFW. Install GLFW **3.4 or newer** and `pkg-config` (on macOS, `brew install glfw
+pkg-config`), then run:
+
+```sh
+scripts/window
+scripts/window --release --build-only
+```
+
+Alternatively set `GLFW_PREFIX` to an existing GLFW installation root with its
+library under `lib/`. The example clears and presents its framebuffer, resizes
+with host framebuffer changes, waits while minimized, and closes through the
+window close control or Escape. Its raw GLFW registrations use `deferredCallbacks`;
+`glfwPollEvents` and `glfwWaitEvents` are marked callback pumps. On macOS the build
+script compiles a small Objective-C helper that attaches a view-owned
+`CAMetalLayer` and updates its drawable size. Linux uses GLFW's actual selected
+Wayland or X11 native handles. The Win32 source uses HWND and HINSTANCE, but the
+published Silk compiler/target prerequisite above still applies; source support
+is not a claim that Windows builds or runs.
+
+Browser canvas chains live in a separate hand-written backend extension rather
+than modifying the pinned generated core schema. Selectors use `querySelector`;
+ids use `getElementById`, with host canvas registration available for offscreen
+canvases.
 
 ## Headless samples and pixel fixtures
-
 
 `examples/` is the `gpu_examples` package. It runs six 64×64 cases without a
 window: render-pass clear, a vertex-buffer triangle, an uploaded RGBA texture
@@ -105,11 +184,6 @@ To intentionally regenerate these analytic fixtures, run
 `python3 tests/pixels/harness.py --regenerate`. WGSL lives in
 `examples/shaders/`; after shader edits run `scripts/embed-shaders`, and use
 `scripts/embed-shaders --check` to detect stale embedded source.
-
-
-## Browser backend
-
-Run `python3 scripts/check --browser` to add real compiled wasm samples and canvas resize/presentation tests in an existing Chromium installation. The scheduled browser workflow provisions pinned Playwright JavaScript packages only; it never downloads Chromium.
 
 Native and wasm use one owned start/poll state machine. The browser exports
 `sample_start(index)`, `sample_poll(state)` (0 pending, 1 complete, negative

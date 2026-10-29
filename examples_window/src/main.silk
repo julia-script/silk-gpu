@@ -1,0 +1,132 @@
+//! Minimal GLFW host: clear, present, resize, and close. Escape closes the window.
+import glfw
+import webgpu.runtime { Instance, RequestAdapterOptions, GpuError }
+import webgpu.surface { SurfaceTarget, Surface, SurfaceConfiguration }
+import webgpu.descriptors { DeviceDescriptor, TextureViewDescriptor, Color, RenderPassColorAttachment, RenderPassDescriptor }
+import webgpu.resources { createCommandEncoder, getQueue }
+import webgpu_sys.generated_webgpu as sys
+import silk.core.ownership { Drop }
+import silk.mem.pointer { Pointer }
+import silk.mem.allocator { OutOfMemoryError }
+import silk.num.i32
+import silk.core.effect { Effect }
+import silk.text.string { String }
+import silk.option { Option }
+
+// These two local owners only arrange teardown; they do not abstract windowing.
+struct GlfwLifetime {}
+impl Drop for GlfwLifetime {
+  fn drop(self: &mut Self) -> () { unsafe glfw.glfwTerminate() }
+}
+struct WindowLifetime { handle: glfw.Window }
+impl Drop for WindowLifetime {
+  fn drop(self: &mut Self) -> () { unsafe glfw.glfwDestroyWindow(self.handle) }
+}
+export "C" fn windowKey(window: glfw.Window, key: i32, scan: i32, action: i32, modifiers: i32) -> () as "silk_gpu_window_key" {
+  if key == 256 && action == 1 { unsafe glfw.glfwSetWindowShouldClose(window, 1) }
+}
+
+fn target<'a>(window: &'a WindowLifetime) -> SurfaceTarget<'a> {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let cocoa = unsafe glfw.glfwGetCocoaWindow(window.handle)
+    let layer = unsafe glfw.silk_gpu_attach_metal_layer(cocoa)
+    return unsafe SurfaceTarget.metalLayer(window, layer)
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "windows" {
+      let hwnd = unsafe glfw.glfwGetWin32Window(window.handle)
+      let module = unsafe glfw.GetModuleHandleA(Pointer.fromSlice<u8>(&[]))
+      return unsafe SurfaceTarget.windows(window, hwnd, module)
+    } else {
+      if unsafe glfw.glfwGetPlatform() == 0x00060003 {
+        let display = unsafe glfw.glfwGetWaylandDisplay()
+        let nativeWindow = unsafe glfw.glfwGetWaylandWindow(window.handle)
+        return unsafe SurfaceTarget.wayland(window, display, nativeWindow)
+      }
+      let display = unsafe glfw.glfwGetX11Display()
+      let nativeWindow = unsafe glfw.glfwGetX11Window(window.handle)
+      return unsafe SurfaceTarget.x11(window, display, nativeWindow)
+    }
+  }
+}
+
+pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+effect fn program() -> i32 ! GpuError | OutOfMemoryError {
+  let instance = run Instance.create()
+  let observer = instance.diagnostics()
+  run windowLoop(&instance)
+  drop instance
+  if observer.liveHandles() != 0 || observer.failureCount() != 0 { fail GpuError.status(0xfffffffb) }
+  return 0
+}
+effect fn windowLoop(instance: &Instance) -> () ! GpuError | OutOfMemoryError {
+  if unsafe glfw.glfwInit() == 0 { fail GpuError.status(sys.WGPUStatus_Error) }
+  let glfwLifetime = GlfwLifetime {}
+  unsafe glfw.glfwWindowHint(0x00022001, 0) // GLFW_CLIENT_API = GLFW_NO_API
+  let handle = unsafe glfw.glfwCreateWindow(800, 600, Pointer.fromSlice(b"Silk WebGPU - Escape to close\0"), Pointer.null<u8>(), Pointer.null<u8>())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let window = WindowLifetime { handle: handle }
+  drop unsafe glfw.glfwSetKeyCallback(handle, windowKey)
+  let surfaceTarget = target(&window)
+  let surface = run Surface.create(instance, &surfaceTarget, String.utf8Bytes("window"))
+  let adapterOptions = RequestAdapterOptions.forSurface(&surface)
+  let adapter = run instance.requestAdapter(&adapterOptions)
+  let capabilities = run surface.getCapabilities(&adapter)
+  if capabilities.formats().length == 0 { fail GpuError.status(sys.WGPUStatus_Error) }
+  let format = capabilities.formats()[0]
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run getQueue(&device)
+  let mut configuration = SurfaceConfiguration.make(&device, format, 800, 600)
+  if capabilities.alphaModes().length != 0 { configuration.setAlphaMode(capabilities.alphaModes()[0]) }
+  let mut previousWidth: i32 = 0
+  let mut previousHeight: i32 = 0
+  let mut reconfigure = true
+  while unsafe glfw.glfwWindowShouldClose(handle) == 0 {
+    unsafe glfw.glfwPollEvents()
+    if unsafe glfw.glfwWindowShouldClose(handle) != 0 { break }
+    let mut width: i32 = 0
+    let mut height: i32 = 0
+    unsafe glfw.glfwGetFramebufferSize(handle, Pointer.fromMutRef(&mut width), Pointer.fromMutRef(&mut height))
+    let iconified = unsafe glfw.glfwGetWindowAttrib(handle, 0x00020002) // GLFW_ICONIFIED
+    if width <= 0 || height <= 0 || iconified != 0 {
+      unsafe glfw.glfwWaitEvents()
+      continue
+    }
+    if width != previousWidth || height != previousHeight || reconfigure {
+      static if Intrinsic.targetOperatingSystem() == "darwin" {
+        unsafe glfw.silk_gpu_resize_metal_layer(unsafe glfw.glfwGetCocoaWindow(handle), width, height)
+      }
+      surface.resize(&mut configuration, i32.toU32(width), i32.toU32(height))
+      previousWidth = width
+      previousHeight = height
+      reconfigure = false
+    }
+    let frame = run surface.getCurrentTexture()
+    let view = run frame.texture.createView(&TextureViewDescriptor.default())
+    let mut clear = Color.default()
+    clear.setR(0.08)
+    clear.setG(0.18)
+    clear.setB(0.32)
+    clear.setA(1.0)
+    let mut attachment = RenderPassColorAttachment.default().withView(&view)
+    attachment.setClearValue(clear)
+    attachment.setLoadOp(sys.WGPULoadOp_Clear)
+    attachment.setStoreOp(sys.WGPUStoreOp_Store)
+    let attachments = [attachment]
+    let passDescriptor = RenderPassDescriptor.default().withColorAttachments(&attachments)
+    let mut encoder = run createCommandEncoder(&device, String.utf8Bytes("window-clear"))
+    let pass = run encoder.beginRenderPass(&passDescriptor)
+    pass.end()
+    let command = run encoder.finish(String.utf8Bytes("window-clear"))
+    queue.submit(&[command.reference()])
+    run surface.present()
+    reconfigure = frame.suboptimal
+    run device.checkErrors()
+  }
+  surface.unconfigure()
+  run device.checkErrors()
+  return ()
+}

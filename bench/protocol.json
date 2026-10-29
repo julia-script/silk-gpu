@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "workloads": {
+    "draws": "N draw(6,1,0,i%64) calls in one render pass, finish and submit once per frame",
+    "writes": "N writes of bytes 1 through 16 at offset zero to one 16-byte buffer, then submit once per frame",
+    "binds": "N alternating setBindGroup calls on two distinct equivalent groups, each followed by draw(6,1,0,i%64), finish and submit once per frame",
+    "rects10k": "One draw(6,10000,0,0), finish and submit per frame",
+    "rects100k": "One draw(6,100000,0,0), finish and submit per frame"
+  },
+  "render_target": "64x64 RGBA8Unorm; clear black alpha one; one sample; no blending",
+  "shader": "examples/shaders/instanced-rects.wgsl",
+  "storage": "100000 48-byte rectangles; repeated 8x8 grid, x/y=tile*8+1, width/height=6, color=(1,0.5,0.25,1), radius=2",
+  "measurement": "Two untimed warmup frames. Measured regions include CPU encoding/writes, finish, submit, and temporary handle destruction. Setup, queue completion waits, error checks and readback are outside the measured region. Queue completion after every frame bounds outstanding work.",
+  "correctness": "Read back final buffer or every target pixel. Buffer bytes must match exactly. Pixels checked against an independent CPU rounded-rectangle distance calculation within one UNORM unit per channel. Output checksum is FNV-1a of canonical expected bytes only after every actual byte passes.",
+  "comparison": "C and Silk link the same pinned Dawn archive and share untimed fixtures. Rust pins wgpu 30.0.1 and Cargo.lock; it is a backend peer, not a measure of Silk wrapper overhead.",
+  "allocation_evidence": "Callgrind client markers delimit measured regions. scripts/ab saves full inclusive caller/callee trees. Attribute measured allocator calls to safe wrappers versus backend before making a no-per-call-allocation claim; wall time and source inspection alone do not establish it.",
+  "baseline_policy": "bench/results/baseline.json is created only by scripts/bench --record-baseline after successful real GPU checks and measurements. No entry means no baseline measurement is claimed. Local samples and call trees live under ignored .cache/bench."
+}

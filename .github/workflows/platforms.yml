@@ -1,14 +1,33 @@
-name: Scheduled browser
+name: Scheduled platforms
 on:
   schedule:
     - cron: '23 5 * * 1'
   workflow_dispatch:
+  push:
+    branches: [codex/05-platforms]
 permissions:
   contents: read
 concurrency:
-  group: browser-${{ github.ref }}
+  group: platforms-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  macos:
+    name: macOS26 arm64 Metal
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/silk
+            .cache/webgpu
+            .cache/llvm
+            .cache/downloads
+            .cache/webgpu-headers
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains.lock.json', 'scripts/ci-lock.json', 'scripts/schema-lock.json') }}
+      - name: Freshness, workspace, native scenarios and six pixel samples
+        run: python3 scripts/check
   browser:
     name: Compiled Silk wasm in installed Chromium
     runs-on: ubuntu-26.04
@@ -28,3 +47,16 @@ jobs:
         run: python3 scripts/setup-ci --browser
       - name: Freshness, workspace and browser pixel/compute tests
         run: python3 scripts/check --skip-native --browser
+  windows-prerequisite:
+    name: Windows native compiler prerequisite (blocked by silk#2542)
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify available Dawn binary
+        run: python scripts/install-webgpu
+      - name: Require a real native Silk compiler (no skipped or simulated success)
+        run: |
+          Write-Output "Native Windows target unsupported: https://github.com/silk-lang/silk/issues/2542"
+          python scripts/install-silk
+          exit $LASTEXITCODE

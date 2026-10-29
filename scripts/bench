@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Build/run real checked GPU workloads; store local samples, compare actual baselines.
+
+scripts/bench --build
+scripts/bench --record-baseline  # only after reviewing successful measurements
+scripts/bench --compare OLD.json NEW.json
+BENCH_CALLGRIND=1 scripts/bench --build --build-only
+scripts/ab .cache/bench/silk OLD-OR-NEW-BINARY
+
+CPU time means encode/write plus submit, not GPU completion. No allocation or Ir
+claim is made by a wall-time run. Use scripts/ab's measured call trees for that.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bench"))
+from runner import LOCAL, measure, compare, peer_ratios
+
+
+def invoke(*args, **kwargs):
+    return subprocess.run(list(map(str, args)), check=True, **kwargs)
+
+
+def build():
+    LOCAL.mkdir(parents=True, exist_ok=True)
+    dawn = Path(subprocess.check_output([str(ROOT / "scripts/install-webgpu")], text=True).strip())
+    clang = Path(subprocess.check_output([str(ROOT / "scripts/install-llvm")], text=True).strip())
+    shader = (ROOT / "examples/shaders/instanced-rects.wgsl").read_text()
+    (LOCAL / "rect_shader.h").write_text("static const char rect_shader[] = " + json.dumps(shader) + ";\n")
+    flags = ["-std=c11", "-O3", "-g", "-I", dawn / "include", "-I", dawn / "include/dawn", "-I", LOCAL]
+    if os.environ.get("BENCH_CALLGRIND"): flags += ["-DBENCH_CALLGRIND"]
+    if sys.platform == "darwin":
+        sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        flags += ["-isysroot", sdk, "-mmacosx-version-min=26.0"]
+        library = dawn / "lib/libwebgpu_dawn.a"
+        links = ["-lc++", "-lpthread"]
+        for name in ("CoreFoundation", "Foundation", "IOSurface", "QuartzCore", "Cocoa", "IOKit", "Metal"):
+            links += ["-framework", name]
+    elif sys.platform.startswith("linux"):
+        library = dawn / "lib64/libwebgpu_dawn.a"
+        links = ["-lstdc++", "-ldl", "-lrt", "-lpthread", "-lm"]
+    else:
+        raise SystemExit("benchmark build currently requires macOS or Linux native C toolchain")
+    invoke(clang, *flags, "-c", ROOT / "bench/support.c", "-o", LOCAL / "support.o")
+    invoke("ar", "crs", LOCAL / "libbench_support.a", LOCAL / "support.o")
+    invoke(clang, *flags, ROOT / "bench/main.c", LOCAL / "libbench_support.a", library, *links, "-o", LOCAL / "c")
+    from _build import build as build_silk
+    binary = build_silk(ROOT / "bench", release=True,
+                        extra_links=[{"static-archive": str(LOCAL / "libbench_support.a")}])
+    shutil.copy2(binary, LOCAL / "silk")
+    env = dict(os.environ, CARGO_TARGET_DIR=str(LOCAL / "rust-target"))
+    invoke("cargo", "build", "--locked", "--release", "--manifest-path", ROOT / "bench/rust/Cargo.toml", env=env)
+    shutil.copy2(LOCAL / "rust-target/release/gpu-bench-wgpu", LOCAL / "rust")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--build", action="store_true")
+    parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--silk", type=Path, default=LOCAL / "silk")
+    parser.add_argument("--c", type=Path, default=LOCAL / "c")
+    parser.add_argument("--rust", type=Path, default=LOCAL / "rust")
+    parser.add_argument("--n", type=int, default=10000)
+    parser.add_argument("--frames", type=int, default=10)
+    parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--output", type=Path, default=LOCAL / "results.json")
+    parser.add_argument("--baseline", type=Path, default=ROOT / "bench/results/baseline.json")
+    parser.add_argument("--record-baseline", action="store_true")
+    parser.add_argument("--compare", nargs=2, type=Path, metavar=("OLD", "NEW"))
+    args = parser.parse_args()
+    if args.compare:
+        compare(*(json.loads(path.read_text()) for path in args.compare)); return
+    if not 64 <= args.n <= 1000000 or not 1 <= args.frames <= 10000 or args.repeats < 1:
+        parser.error("n must be 64..1000000, frames 1..10000, repeats >=1")
+    if args.build or args.build_only: build()
+    if args.build_only: return
+    binaries = {name: getattr(args, name).resolve() for name in ("silk", "c", "rust")}
+    for name, path in binaries.items():
+        if not path.is_file(): parser.error(f"missing {name} executable {path}; run --build first")
+    result = measure(binaries, args.n, args.frames, args.repeats)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    peer_ratios(result)
+    if args.baseline.exists(): compare(json.loads(args.baseline.read_text()), result)
+    else: print("No measured baseline exists; use --record-baseline after reviewing this run.")
+    if args.record_baseline:
+        args.baseline.parent.mkdir(parents=True, exist_ok=True)
+        args.baseline.write_text(json.dumps(result, indent=2) + "\n")
+    print(f"Measured samples: {args.output}")
+
+
+if __name__ == "__main__": main()

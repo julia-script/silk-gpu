@@ -1,0 +1,15 @@
+[package]
+name = "gpu-bench-wgpu"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+publish = false
+
+[dependencies]
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
+pollster = "=0.4.0"
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
