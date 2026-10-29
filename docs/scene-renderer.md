@@ -26,8 +26,19 @@ without Dawn.
    `n = ceil(sqrt(d(d-1)/8 * M / tolerance))`, where `M` is the largest second difference of the
    control points. The default tolerance is 0.25 device pixels. Subpaths close implicitly for fills.
    Non-finite points and horizontal segments are dropped; they add no area.
-3. **Stroke** (planned, PR 2): strokes are expanded into fill outlines before flattening, with the
-   SVG 2 joins (miter, miter-clip, round, bevel, arcs), caps and dashes, and filled with nonzero.
+3. **Stroke** (`vector.stroke`): strokes are expanded in user space into closed outlines that are
+   filled with nonzero, so the CTM (including skew and non-uniform scale) applies to the pen as SVG
+   requires. The centerline is flattened at the device tolerance divided by the transform's
+   largest singular value. Joins: miter (falls back to bevel past `stroke-miterlimit`),
+   miter-clip, round, bevel, and arcs (on flattened segments arcs have zero curvature, so they
+   behave as miter-clip; using source curvature is future work). Caps: butt, round, square,
+   including the dots SVG 2 requires for zero-length subpaths. Vertices inside a flattened curve
+   always get a round join. Inner joins end at the intersection of the two offset lines when both
+   segments are long enough, and otherwise pass through the vertex: such overlaps reach the inner
+   edge, where clamping per-pixel area would overstate coverage, so they are only the fallback.
+   Round arcs place interior vertices on a radius that keeps the arc's area. Dashes are cut from
+   the flattened centerline (odd lists repeat, negative or all-zero lists disable dashing, the
+   pattern restarts per subpath).
 4. **Coverage** (`vector.strips`): exact signed area per pixel cell, accumulated and prefix-summed
    along each row (the font-rs method). Nonzero coverage is `min(|a|, 1)`; even-odd is
    `|a - 2 round(a / 2)|`. Lines are split at x = 0 and x = width and then clamped, so geometry

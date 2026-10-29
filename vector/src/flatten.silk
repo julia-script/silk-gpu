@@ -30,7 +30,7 @@ fn length(x: f64, y: f64) -> f64 { return f64.sqrt(x * x + y * y) }
 
 /// Wang's formula: `n = ceil(sqrt(degree * (degree - 1) / 8 * M / tolerance))`, where `M` is the
 /// largest second difference of the control points. `factor` is `degree * (degree - 1) / 8`.
-fn segments(m: f64, factor: f64, tolerance: f64) -> u32 {
+pub fn segments(m: f64, factor: f64, tolerance: f64) -> u32 {
   let n = f64.ceil(f64.sqrt(factor * m / tolerance))
   if !(n >= 1.0) { return 1 }
   if n > MAX_SEGMENTS { return 1024 }
