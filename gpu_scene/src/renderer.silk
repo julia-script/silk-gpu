@@ -31,6 +31,9 @@ pub struct SceneRenderer {
   layers: List<Layer>,
   layerWidth: u32,
   layerHeight: u32,
+  /// The scene's canvas, runs, alphas, paints and ramps buffers, kept between renders and
+  /// replaced only when a scene outgrows one.
+  buffers: List<Buffer>,
 }
 
 const COMPOSE_LAYER: u32 = 0
@@ -115,6 +118,26 @@ pub effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8]
   return move buffer
 }
 
+/// Writes `bytes` into buffer `index` of `slots`, replacing it with a bigger one (or appending
+/// it, when `index` is `slots.length()`) if it is too small. Shaders bound to these buffers
+/// read only the lengths the scene header gives, so a larger buffer is harmless.
+effect fn upload(device: &Device, queue: &Queue, slots: &mut List<Buffer>, index: usize, label: &[u8], bytes: &[u8], usage: u64)
+  -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+  if index < slots.length() {
+    let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
+    if slots.asSlice()[index].getSize() >= usize.toU64(size) {
+      if bytes.length > 0 && bytes.length % 4 == 0 { queue.writeBuffer(&slots.asSlice()[index], 0, bytes) }
+      return
+    }
+  }
+  let buffer = run storage(device, queue, label, bytes, usage)
+  if index < slots.length() {
+    slots.set(index, move buffer)
+  } else {
+    run slots.append(move buffer)
+  }
+}
+
 pub fn entry<'a>(binding: u32, buffer: &'a Buffer) -> BindGroupEntry<'a> {
   let mut result = BindGroupEntry.default().withBuffer(buffer)
   result.setBinding(binding)
@@ -161,7 +184,7 @@ impl SceneRenderer {
     composeDescriptor.setPrimitive(primitive)
     composeDescriptor.setMultisample(multisample)
     let compose = run gpu.createRenderPipeline(device, &composeDescriptor)
-    return SceneRenderer { pipeline: move pipeline, compose: move compose, layers: List<Layer>.make(), layerWidth: 0, layerHeight: 0 }
+    return SceneRenderer { pipeline: move pipeline, compose: move compose, layers: List<Layer>.make(), layerWidth: 0, layerHeight: 0, buffers: List<Buffer>.make() }
   }
 
   /// Clears `target` to the premultiplied form of `background` and draws `scene` on it, then
@@ -172,22 +195,23 @@ impl SceneRenderer {
     writeU32(&mut header, 0, scene.width())
     writeU32(&mut header, 4, scene.height())
     writeU32(&mut header, 8, scene.runCount())
-    let canvas = run storage(device, queue, b"scene canvas", &header, flags.WGPUBufferUsage_Uniform)
-    let runs = run storage(device, queue, b"scene runs", scene.runs(), flags.WGPUBufferUsage_Storage)
-    let alphas = run storage(device, queue, b"scene alphas", scene.alphas(), flags.WGPUBufferUsage_Storage)
-    let paints = run storage(device, queue, b"scene paints", scene.paints(), flags.WGPUBufferUsage_Storage)
-    let ramps = run storage(device, queue, b"scene ramps", scene.ramps(), flags.WGPUBufferUsage_Storage)
+    let commands = scene.commands()
+    if commands.length != 0 { run self.reserveLayers(device, scene) }
+    run upload(device, queue, &mut self.buffers, 0, b"scene canvas", &header, flags.WGPUBufferUsage_Uniform)
+    run upload(device, queue, &mut self.buffers, 1, b"scene runs", scene.runs(), flags.WGPUBufferUsage_Storage)
+    run upload(device, queue, &mut self.buffers, 2, b"scene alphas", scene.alphas(), flags.WGPUBufferUsage_Storage)
+    run upload(device, queue, &mut self.buffers, 3, b"scene paints", scene.paints(), flags.WGPUBufferUsage_Storage)
+    run upload(device, queue, &mut self.buffers, 4, b"scene ramps", scene.ramps(), flags.WGPUBufferUsage_Storage)
     let layout = run self.pipeline.getBindGroupLayout(0)
-    let entries = [entry(0, &canvas), entry(1, &runs), entry(2, &alphas), entry(3, &paints), entry(4, &ramps)]
+    let b = self.buffers.asSlice()
+    let entries = [entry(0, &b[0]), entry(1, &b[1]), entry(2, &b[2]), entry(3, &b[3]), entry(4, &b[4])]
     let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
     let group = run gpu.createBindGroup(device, &groupDescriptor)
 
     let mut encoder = run gpu.createCommandEncoder(device, b"vector scene")
-    let commands = scene.commands()
     if commands.length == 0 {
       run drawRuns(&mut encoder, target, &self.pipeline, &group, false, colorOf(background), 0, scene.runCount())
     } else {
-      run self.reserveLayers(device, scene)
       run self.renderLayers(device, queue, &mut encoder, scene, &group, target, background)
     }
     let finished = run encoder.finish(b"vector scene")
