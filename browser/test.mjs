@@ -97,6 +97,9 @@ try {
     executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined, args: [
     '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan',
     '--disable-vulkan-surface', '--enable-unsafe-swiftshader',
+    // Linux's system Vulkan loader may have no usable ICD even when ANGLE's
+    // SwiftShader works. The compositor needs the same software Vulkan driver.
+    ...(process.platform === 'linux' ? ['--use-vulkan=swiftshader'] : []),
     '--enable-logging=stderr',
   ] });
   const page = await browser.newPage();
