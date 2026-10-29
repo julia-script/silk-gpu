@@ -8,19 +8,23 @@ import silk.core.ownership { Copy }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
 import silk.num.f64
 import silk.num.u8
 import silk.num.u32
 import silk.num.u64
 import silk.num.usize
 import silk.num.i64
+import silk.num.i32
 import silk.option { Option }
 import strips { Coverage, BAND, minU32 }
 import geometry { Affine, Point }
-import pixmap { Pixmap, Rgba8, div255, over, overPacked, overSpan, overMaskedFour, pack, scalePacked, storePacked, floorF64, truncateToI64, truncateF64ToU8 }
+import pixmap { Pixmap, Rgba8, div255, over, overPacked, overSpan, overMaskedFour, pack, unpack, scalePacked, storePacked, floorF64, truncateToI64, truncateF64ToU8 }
 import silk.simd.u8x16
 import silk.simd.u16x16
 import silk.simd.u32x4
+import silk.simd.f32x4
+import silk.simd.i32x4
 
 pub interface Shader {
   /// The premultiplied color at the center of device pixel `(x, y)`.
@@ -336,9 +340,15 @@ pub const EXTEND_REPEAT: u8 = 1
 
 /// A premultiplied image placed by `transform` (image pixel space to device space). `EXTEND_CLAMP`
 /// suits `image` (clip with its rectangle); `EXTEND_REPEAT` suits pattern tiles.
+///
+/// Sampling runs in f32 with the same operations, in the same order, as the GPU scene shader
+/// (`gpu_scene/shaders/scene.wgsl`, `shadeImage`), on the inverse rounded to f32 as the GPU
+/// receives it.
 pub struct ImagePattern<'a> {
   image: &'a Pixmap,
   inverse: Affine,
+  /// `inverse` in f32: a b c d e f.
+  m: [f32; 6],
   valid: bool,
   sampling: u8,
   extend: u8,
@@ -348,7 +358,8 @@ impl<'a> ImagePattern<'a> {
     let mut inverse = Affine.identity()
     let mut valid = image.width() > 0 && image.height() > 0
     if let Option<Affine>.Some { value: found } = transform.invert() { inverse = found } else { valid = false }
-    return ImagePattern { image: image, inverse: inverse, valid: valid, sampling: sampling, extend: extend }
+    let m = [f64.toF32(inverse.a), f64.toF32(inverse.b), f64.toF32(inverse.c), f64.toF32(inverse.d), f64.toF32(inverse.e), f64.toF32(inverse.f)]
+    return ImagePattern { image: image, inverse: inverse, m: m, valid: valid, sampling: sampling, extend: extend }
   }
   /// The premultiplied image being placed.
   pub fn pixmap(self: &Self) -> &'a Pixmap { return self.image }
@@ -358,61 +369,172 @@ impl<'a> ImagePattern<'a> {
   pub fn extendMode(self: &Self) -> u8 { return self.extend }
   /// False for an empty image or a non-invertible transform: the pattern paints nothing.
   pub fn isPaintable(self: &Self) -> bool { return self.valid }
-  fn texel(self: &Self, x: i64, y: i64) -> Rgba8 {
-    let w = u32.toI64(self.image.width())
-    let h = u32.toI64(self.image.height())
-    let mut tx = x
-    let mut ty = y
-    if self.extend == EXTEND_REPEAT {
-      tx = ((x % w) + w) % w
-      ty = ((y % h) + h) % h
-    } else {
-      tx = if x < 0 { 0 } else if x >= w { w - 1 } else { x }
-      ty = if y < 0 { 0 } else if y >= h { h - 1 } else { y }
+  /// The column (or row, with `size` the height) for the integer-valued image coordinate `v`,
+  /// repeated or clamped into the image as the shader's `texel` does.
+  fn wrap(self: &Self, v: f32, size: f32) -> usize
+  with Intrinsic.inlineAlways() {
+    // Rounding can land exactly on the size; keep the index inside the image.
+    let t = if self.extend == EXTEND_REPEAT { minF32(v - size * floorF32(v / size), size - 1.0) } else { minF32(maxF32(v, 0.0), size - 1.0) }
+    // WGSL's float-to-u32 conversion saturates: a remainder rounded below zero reads index 0.
+    return u32.toUsize(saturateToU32(t))
+  }
+  /// The packed texel at column `x`, row `y`.
+  fn word(self: &Self, x: usize, y: usize) -> u32
+  with Intrinsic.inlineAlways() {
+    let texel = Slice.view(self.image.data(), (y * u32.toUsize(self.image.width()) + x) * 4, 4)
+    return u8.toU32(texel[0]) | u32.shiftLeft(u8.toU32(texel[1]), 8) | u32.shiftLeft(u8.toU32(texel[2]), 16) | u32.shiftLeft(u8.toU32(texel[3]), 24)
+  }
+  /// The packed color at the center of device pixel `(px, py)`.
+  fn sample(self: &Self, px: u32, py: u32) -> u32
+  with Intrinsic.inlineAlways() {
+    let fx = u32.toF32(px) + 0.5
+    let fy = u32.toF32(py) + 0.5
+    let x = self.m[0] * fx + self.m[2] * fy + self.m[4]
+    let y = self.m[1] * fx + self.m[3] * fy + self.m[5]
+    if !(f32.abs(x) <= 1.0e15) || !(f32.abs(y) <= 1.0e15) { return 0 }
+    let w = u32.toF32(self.image.width())
+    let h = u32.toF32(self.image.height())
+    if self.sampling == SAMPLE_NEAREST { return self.word(self.wrap(floorF32(x), w), self.wrap(floorF32(y), h)) }
+    let x0 = floorF32(x - 0.5)
+    let y0 = floorF32(y - 0.5)
+    let wx = x - 0.5 - x0
+    let wy = y - 0.5 - y0
+    // The shader wraps each of the four texels' coordinates; the four distinct ones suffice.
+    let left = self.wrap(x0, w)
+    let right = self.wrap(x0 + 1.0, w)
+    let top = self.wrap(y0, h)
+    let bottom = self.wrap(y0 + 1.0, h)
+    let a = self.word(left, top)
+    let b = self.word(right, top)
+    let c = self.word(left, bottom)
+    let d = self.word(right, bottom)
+    return bilerpWords(a, b, c, d, wx, wy)
+  }
+}
+impl<'a> ImagePattern<'a> {
+  /// [`sample`] of pixels `px .. px + 4` on row `py` into `out[at .. at + 4]`, one pixel per lane
+  /// with the same operations per lane. Returns false, writing nothing, when a pixel maps outside
+  /// the 1e15 range (the scalar path then handles it).
+  fn sampleFour(self: &Self, px: u32, py: u32, out: &mut [u32], at: usize) -> bool
+  with Intrinsic.inlineAlways() {
+    let column = u32.toI32(px)
+    let half = f32x4.splat(0.5)
+    let fx = i32x4.toF32x4(i32x4.fromArray([column, column + 1, column + 2, column + 3])) + half
+    let fy = u32.toF32(py) + 0.5
+    let x = f32x4.splat(self.m[0]) * fx + f32x4.splat(self.m[2] * fy) + f32x4.splat(self.m[4])
+    let y = f32x4.splat(self.m[1]) * fx + f32x4.splat(self.m[3] * fy) + f32x4.splat(self.m[5])
+    let range = f32x4.splat(1.0e15)
+    let inside = u32x4.reduceBitAnd(u32x4.select(f32x4.lanesLessOrEqual(absLanes(x), range), u32x4.splat(1), u32x4.splat(0)))
+      & u32x4.reduceBitAnd(u32x4.select(f32x4.lanesLessOrEqual(absLanes(y), range), u32x4.splat(1), u32x4.splat(0)))
+    if inside == 0 { return false }
+    let x0 = floorLanes(x - half)
+    let y0 = floorLanes(y - half)
+    let wx = x - half - x0
+    let wy = y - half - y0
+    let one = f32x4.splat(1.0)
+    let w = f32x4.splat(u32.toF32(self.image.width()))
+    let h = f32x4.splat(u32.toF32(self.image.height()))
+    let left = self.wrapLanes(x0, w)
+    let right = self.wrapLanes(x0 + one, w)
+    let top = self.wrapLanes(y0, h)
+    let bottom = self.wrapLanes(y0 + one, h)
+    let mut k: usize = 0
+    while k < 4 {
+      let l = i32.toUsize(i32x4.extract(left, k))
+      let r = i32.toUsize(i32x4.extract(right, k))
+      let t = i32.toUsize(i32x4.extract(top, k))
+      let b = i32.toUsize(i32x4.extract(bottom, k))
+      out[at + k] = bilerpWords(self.word(l, t), self.word(r, t), self.word(l, b), self.word(r, b), f32x4.extract(wx, k), f32x4.extract(wy, k))
+      k = k + 1
     }
-    return self.image.pixel(i64.toU32(tx), i64.toU32(ty))
+    return true
+  }
+  /// [`wrap`] per lane.
+  fn wrapLanes(self: &Self, v: simd<f32, 4>, size: simd<f32, 4>) -> simd<i32, 4>
+  with Intrinsic.inlineAlways() {
+    let zero = f32x4.splat(0.0)
+    let limit = size - f32x4.splat(1.0)
+    let t = if self.extend == EXTEND_REPEAT { minLanes(v - size * floorLanes(v / size), limit) } else { minLanes(maxLanes(v, zero), limit) }
+    return f32x4.toI32x4(maxLanes(t, zero))
   }
 }
 impl<'a> Shader for ImagePattern<'a> {
   fn isUniform(self: &Self) -> bool { return !self.valid }
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
     if !self.valid { return Rgba8.make(0, 0, 0, 0) }
-    let p = self.inverse.apply(Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5))
-    if !p.isFinite() || f64.abs(p.x) > 1.0e15 || f64.abs(p.y) > 1.0e15 { return Rgba8.make(0, 0, 0, 0) }
-    if self.sampling == SAMPLE_NEAREST {
-      return self.texel(truncateToI64(floorF64(p.x)), truncateToI64(floorF64(p.y)))
-    }
-    let fx = p.x - 0.5
-    let fy = p.y - 0.5
-    let x0 = floorF64(fx)
-    let y0 = floorF64(fy)
-    let wx = fx - x0
-    let wy = fy - y0
-    let ix = truncateToI64(x0)
-    let iy = truncateToI64(y0)
-    let a = self.texel(ix, iy)
-    let b = self.texel(ix + 1, iy)
-    let c = self.texel(ix, iy + 1)
-    let d = self.texel(ix + 1, iy + 1)
-    return Rgba8 {
-      r: bilerp(a.r, b.r, c.r, d.r, wx, wy), g: bilerp(a.g, b.g, c.g, d.g, wx, wy),
-      b: bilerp(a.b, b.b, c.b, d.b, wx, wy), a: bilerp(a.a, b.a, c.a, d.a, wx, wy),
-    }
+    return unpack(self.sample(x, y))
   }
   fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
     let mut i: usize = 0
+    if self.valid && self.sampling == SAMPLE_BILINEAR {
+      while i + 4 <= count {
+        if !self.sampleFour(x + usize.toU32(i), y, &mut out, i) { break }
+        i = i + 4
+      }
+    }
     while i < count {
-      out[i] = pack(self.shade(x + usize.toU32(i), y))
+      out[i] = if self.valid { self.sample(x + usize.toU32(i), y) } else { 0 }
       i = i + 1
     }
   }
 }
 
-fn bilerp(a: u8, b: u8, c: u8, d: u8, wx: f64, wy: f64) -> u8 {
-  let top = u8.toF64(a) + (u8.toF64(b) - u8.toF64(a)) * wx
-  let bottom = u8.toF64(c) + (u8.toF64(d) - u8.toF64(c)) * wx
-  // Never negative, so truncating is the floor.
-  return truncateF64ToU8(top + (bottom - top) * wy + 0.5)
+/// The shader's `bilerp` of four packed texels, the four channels in the lanes of one vector
+/// (the same f32 operations per channel).
+fn bilerpWords(a: u32, b: u32, c: u32, d: u32, wx: f32, wy: f32) -> u32
+with Intrinsic.inlineAlways() {
+  let ca = channels(a)
+  let cb = channels(b)
+  let cc = channels(c)
+  let cd = channels(d)
+  let x = f32x4.splat(wx)
+  let top = ca + (cb - ca) * x
+  let bottom = cc + (cd - cc) * x
+  // floor(v + 0.5) for v in 0 ..= 255: never negative, so truncating is the floor.
+  let rounded = f32x4.toI32x4(top + (bottom - top) * f32x4.splat(wy) + f32x4.splat(0.5))
+  let bytes = i32x4.bitcastToU8x16(rounded)
+  let packed = u8x16.shuffle(bytes, bytes, [0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12])
+  return u32x4.extract(u8x16.bitcastToU32x4(packed), 0)
+}
+
+/// The four channels of a packed color as f32 lanes.
+fn channels(word: u32) -> simd<f32, 4>
+with Intrinsic.inlineAlways() {
+  let bytes = u32x4.bitcastToU8x16(u32x4.splat(word))
+  let wide = u8x16.shuffle(bytes, u8x16.splat(0), [0, 16, 16, 16, 1, 16, 16, 16, 2, 16, 16, 16, 3, 16, 16, 16])
+  return i32x4.toF32x4(u8x16.bitcastToI32x4(wide))
+}
+
+// LIMITATION-6/7 (silk-lang/silk#2561, #2566): plain selects and a conversion-based floor, exact
+// for every f32 (magnitudes from 2^23 up are already integers; NaN never reaches them here).
+fn minF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() { return if a < b { a } else { b } }
+fn maxF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() { return if a > b { a } else { b } }
+fn floorF32(v: f32) -> f32 with Intrinsic.inlineAlways() {
+  if v > -8388608.0 && v < 8388608.0 {
+    let t = i32.toF32(Intrinsic.f32ToI32(v))
+    return if t > v { t - 1.0 } else { t }
+  }
+  return v
+}
+fn minLanes(a: simd<f32, 4>, b: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  return f32x4.select(f32x4.lanesLess(a, b), a, b)
+}
+fn maxLanes(a: simd<f32, 4>, b: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  return f32x4.select(f32x4.lanesGreater(a, b), a, b)
+}
+fn absLanes(v: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  return f32x4.select(f32x4.lanesLess(v, f32x4.splat(0.0)), f32x4.splat(0.0) - v, v)
+}
+/// [`floorF32`] per lane.
+fn floorLanes(v: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
+  let small = f32x4.lanesLess(absLanes(v), f32x4.splat(8388608.0))
+  let t = i32x4.toF32x4(f32x4.toI32x4(f32x4.select(small, v, f32x4.splat(0.0))))
+  let floored = f32x4.select(f32x4.lanesGreater(t, v), t - f32x4.splat(1.0), t)
+  return f32x4.select(small, floored, v)
+}
+/// WGSL `u32(v)`: truncates, with negative values giving 0 (callers keep `v` below 2^32).
+fn saturateToU32(v: f32) -> u32 with Intrinsic.inlineAlways() {
+  return if v > 0.0 { Intrinsic.f32ToU32(v) } else { 0 }
 }
 
 /// Composites `shader` source-over into `target` through `coverage`, scaled by `opacity`

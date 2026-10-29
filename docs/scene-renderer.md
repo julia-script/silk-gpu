@@ -63,7 +63,8 @@ without Dawn.
      straight alpha by default (resvg and Skia's SVG behaviour) or premultiplied (CSS Images 3).
      Color-space choice (`color-interpolation: linearRGB`) is the caller's, by converting stops.
    - Image patterns: nearest or bilinear sampling of a premultiplied pixmap, clamped (for
-     `image`, clipped by its rectangle) or repeated (pattern tiles).
+     `image`, clipped by its rectangle) or repeated (pattern tiles). Sampling is f32 with the GPU
+     shader's operations in its order (on the inverse rounded to f32), four pixels per step.
    - Opacity (`fill-opacity`, `stroke-opacity`) scales the coverage mask.
    The target is premultiplied RGBA8. Every blend uses the exact integer
    `div255(x) = (x + 128 + ((x + 128) >> 8)) >> 8`, which equals `round(x / 255)` for all
@@ -139,17 +140,18 @@ without Dawn.
 ## Benchmarks
 
 `scripts/bench-vector` (scheduled weekly in the benchmarks workflow, not in PR CI) renders the
-five scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
+six scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
 frame time of each, and compares the two images. Latest run (2026-10-29, x86_64 container, release
 builds, 512 x 512):
 
 | Scene | vector ms | tiny-skia ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| fills (300 translucent circles) | 4.8 | 9.9 | 0.48x | 2.3% |
-| strokes (150 round-joined stars) | 3.6 | 7.9 | 0.46x | 3.2% |
-| gradients (100 linear and radial rects) | 3.0 | 4.8 | 0.62x | 0.0% |
-| polygon (4000 edges, even-odd) | 5.9 | 22.9 | 0.26x | 30% |
-| icons (4000 glyph-sized circles and stars) | 12.6 | 22.2 | 0.57x | 11% |
+| fills (300 translucent circles) | 4.2 | 10.2 | 0.41x | 2.3% |
+| strokes (150 round-joined stars) | 3.1 | 7.7 | 0.40x | 3.2% |
+| gradients (100 linear and radial rects) | 2.9 | 4.6 | 0.63x | 0.0% |
+| polygon (4000 edges, even-odd) | 3.7 | 21.7 | 0.17x | 30% |
+| icons (4000 glyph-sized circles and stars) | 10.0 | 21.7 | 0.46x | 11% |
+| images (60 rotated, scaled, repeated bilinear tiles) | 5.5 | 5.5 | 1.0x | 0.0% |
 
 The first run, before the coverage and compositing work, was 2.20x, 1.33x, 3.75x and 0.54x.
 What made the difference: coverage accumulates every line once into one buffer for the whole
@@ -199,6 +201,6 @@ and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the deta
 - **Column granularity.** Strips start and end at any column, not at 4-pixel tile edges. This
   emits fewer alpha bytes than tile-aligned strips for thin shapes and keeps solid runs exact.
 - **f32 coverage, f64 geometry.** User-space math is f64 so large transforms keep precision;
-  device-space lines and area accumulation are f32 like the GPU.
+  device-space lines, area accumulation and image sampling are f32 like the GPU.
 - **Antialiasing only by area.** No MSAA. `shape-rendering: crispEdges` can be served later by
   snapping coverage to 0 or 255.
