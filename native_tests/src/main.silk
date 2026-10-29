@@ -39,6 +39,24 @@ effect fn scenarios(instance: &Instance) -> () ! GpuError | OutOfMemoryError {
   }
   instance.processEvents()
   let device = run adapter.requestDevice(&DeviceDescriptor.default())
+
+  // Strict arithmetic must not silently fall back on an ordinary device.
+  match move run Effect.result(
+    gpu.createShaderModuleStrict(
+      &device,
+      b"strict without feature",
+      b"@compute @workgroup_size(1) fn main() {}",
+    ),
+  ) {
+    Result<gpu.ShaderModule, GpuError>.Success { value } => {
+      fail GpuError.status(0xffff000b)
+    }
+    Result<gpu.ShaderModule, GpuError>.Failure { error } => {
+      if error.code != gpu.STRICT_MATH_UNAVAILABLE {
+        fail move error
+      }
+    }
+  }
   let available = capabilities.instanceFeatures()
   let instanceLimits = run capabilities.instanceLimits()
   if !available.has(sys.WGPUInstanceFeatureName_TimedWaitAny) || instanceLimits.timedWaitAnyMaxCount() < 1 {

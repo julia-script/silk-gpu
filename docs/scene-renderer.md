@@ -63,8 +63,9 @@ without Dawn.
      straight alpha by default (resvg and Skia's SVG behaviour) or premultiplied (CSS Images 3).
      Color-space choice (`color-interpolation: linearRGB`) is the caller's, by converting stops.
    - Image patterns: nearest or bilinear sampling of a premultiplied pixmap, clamped (for
-     `image`, clipped by its rectangle) or repeated (pattern tiles). Sampling is f32 with the GPU
-     shader's operations in its order (on the inverse rounded to f32), four pixels per step.
+     `image`, clipped by its rectangle) or repeated (pattern tiles). CPU sampling is f32 with
+     separately rounded operations on the inverse rounded to f32, four pixels per step. Native
+     scene shaders use strict math to preserve those operations at nearest-texel boundaries.
    - Opacity (`fill-opacity`, `stroke-opacity`) scales the coverage mask.
    The target is premultiplied RGBA8. Every blend uses the exact integer
    `div255(x) = (x + 128 + ((x + 128) >> 8)) >> 8`, which equals `round(x / 255)` for all
@@ -88,7 +89,23 @@ without Dawn.
    `s + div255(d (255 - as))`, so solid fills match the CPU pixmap byte for byte. Gradients use
    the same formulas in f32. Image paints (`Scene.fillImage`) append the image's texels to the
    ramp buffer and sample them like `ImagePattern` (nearest or bilinear, clamp or repeat). Buffers
-   are recreated per frame for now.
+   are recreated per frame for now. Request `SceneRenderer.requiredFeatures(&adapter)` through
+   `DeviceDescriptor.withRequiredFeatures` when creating the scene's device. Where the adapter
+   offers Dawn's `ShaderModuleCompilationOptions` (Metal), this enables it and only the scene
+   paint module is created with `strictMath = true`. Vulkan (lavapipe in CI) and D3D compile WGSL
+   without fast-math contraction and do not offer the feature, so they use the ordinary module
+   and still match the CPU exactly. Composition and filters keep their existing math mode.
+
+   This is necessary on Metal: relaxed arithmetic changed the image fixture's device column
+   `x = 21` from source texel 1 to texel 2 (242 differing channels, maximum delta 130). The
+   existing zero-tolerance CPU/GPU image comparison and an independent boundary-texel assertion
+   protect that case. It also reproduced on untouched upstream base `2f25e03`, independently
+   of stroke/path changes. Dawn's
+   [pinned Metal compiler](https://github.com/google/dawn/blob/106704a9ac3fc21b1580ea85aea302ac17d416f1/src/dawn/native/metal/ShaderModuleMTL.mm)
+   selects the Metal `safe` or `relaxed` math pragma from the per-module strict option.
+   Browser WGSL has no equivalent portable strict-math feature: the required-feature list is
+   empty there and the browser scene path retains standard WGSL arithmetic. Native exact-image
+   results are not a claim of browser pixel parity.
 
 9. **GPU layers** (`gpu_scene`): `Scene.pushLayer` starts a group, `popLayer(mode, opacity,
    mask)` composites it onto its parent, and `popMask(kind, clip)` turns the group into a mask

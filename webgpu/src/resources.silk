@@ -15,7 +15,24 @@ import webgpu_sys.generated_webgpu { WGPUShaderSourceSPIRV }
 import silk.num.usize
 import diagnostics { Diagnostics, HandleLease }
 
-pub struct BindGroup { handle: sys.WGPUBindGroup, lease: HandleLease }
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  unsafe extern "C" fn createShaderModuleStrictNative(
+    device: sys.WGPUDevice,
+    descriptor: *const sys.WGPUShaderModuleDescriptor,
+  ) -> sys.WGPUShaderModule as "silkWebgpuCreateShaderModuleStrict"
+}
+
+/// Dawn's native device feature for per-module compilation options; request it explicitly
+/// through `DeviceDescriptor.withRequiredFeatures` before using [`createShaderModuleStrict`].
+pub const SHADER_MODULE_COMPILATION_OPTIONS: u32 = 0x0005002e
+
+/// Strict shader math was requested on the web or without its enabled native device feature.
+pub const STRICT_MATH_UNAVAILABLE: u32 = 0xfffffffb
+
+pub struct BindGroup {
+  handle: sys.WGPUBindGroup,
+  lease: HandleLease
+}
 
 impl BindGroup {
   // `handle` must be non-null and transfer one owned native reference.
@@ -913,9 +930,46 @@ pub effect fn createShaderModule(device: &Device, label: &[u8], code: &[u8]) -> 
   return unsafe ShaderModule.adoptTracked(handle, &observer)
 }
 
-pub effect fn createShaderModuleFromDescriptor(device: &Device, descriptor: &desc.ShaderModuleDescriptor) -> ShaderModule ! GpuError {
-  let handle = unsafe sys.wgpuDeviceCreateShaderModule(unsafe device.raw(), unsafe descriptor.rawPointer())
-  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+/// Creates a native Dawn WGSL module with strict floating-point math. Ordinary shader creation
+/// is unchanged. Fails with [`STRICT_MATH_UNAVAILABLE`] on the web or when the device was not
+/// created with [`SHADER_MODULE_COMPILATION_OPTIONS`]; never silently uses relaxed arithmetic.
+pub effect fn createShaderModuleStrict(device: &Device, label: &[u8], code: &[u8]) -> ShaderModule
+  ! GpuError {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    fail GpuError.status(STRICT_MATH_UNAVAILABLE)
+  } else {
+    if !device.hasFeature(SHADER_MODULE_COMPILATION_OPTIONS) {
+      fail GpuError.status(STRICT_MATH_UNAVAILABLE)
+    }
+    let mut source = WGPUShaderSourceWGSL.default()
+    source.code = desc.stringView(code)
+    let mut descriptor = WGPUShaderModuleDescriptor.default()
+    descriptor.label = desc.stringView(label)
+    descriptor.nextInChain = Pointer.fromMutRef(&mut source.chain)
+    let handle = unsafe createShaderModuleStrictNative(
+      unsafe device.raw(),
+      Pointer.fromRef(&descriptor),
+    )
+    if Pointer.isNull(handle) {
+      fail GpuError.status(sys.WGPUStatus_Error)
+    }
+    let observer = device.diagnostics()
+    return unsafe ShaderModule.adoptTracked(handle, &observer)
+  }
+}
+
+pub effect fn createShaderModuleFromDescriptor(
+  device: &Device,
+  descriptor: &desc.ShaderModuleDescriptor,
+) -> ShaderModule
+  ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateShaderModule(
+    unsafe device.raw(),
+    unsafe descriptor.rawPointer(),
+  )
+  if Pointer.isNull(handle) {
+    fail GpuError.status(sys.WGPUStatus_Error)
+  }
   let observer = device.diagnostics()
   return unsafe ShaderModule.adoptTracked(handle, &observer)
 }

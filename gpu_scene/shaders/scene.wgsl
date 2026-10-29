@@ -36,6 +36,8 @@ fn word(p: u32, i: u32) -> f32 { return bitcast<f32>(paints[p + i]); }
 
 // Image paints (kind 3): texel start in `ramps`, width, height, the device-to-image inverse
 // a b c d e f, sampling (0 nearest, 1 bilinear), extend (0 clamp, 1 repeat).
+// Native SceneRenderer compiles this module with strict math: relaxed contraction/reassociation
+// can move a transformed coordinate across a nearest-texel boundary relative to vector.paint.
 fn texel(p: u32, x: f32, y: f32) -> vec4u {
   let w = f32(paints[p + 2u]);
   let h = f32(paints[p + 3u]);
