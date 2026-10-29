@@ -343,7 +343,8 @@ pub const EXTEND_REPEAT: u8 = 1
 ///
 /// Sampling runs in f32 with the same operations, in the same order, as the GPU scene shader
 /// (`gpu_scene/shaders/scene.wgsl`, `shadeImage`), on the inverse rounded to f32 as the GPU
-/// receives it.
+/// receives it. Native scene rendering requires strict shader math to preserve these rounding
+/// steps; standard browser WGSL arithmetic does not guarantee exact CPU image parity.
 pub struct ImagePattern<'a> {
   image: &'a Pixmap,
   inverse: Affine,

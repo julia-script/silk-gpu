@@ -24,6 +24,19 @@ import generated_shaders as shaders
 /// The target format the pipeline renders to.
 pub const FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
 
+const NATIVE_FEATURES: [u32; 1] = [gpu.SHADER_MODULE_COMPILATION_OPTIONS]
+
+const WEB_FEATURES: [u32; 0] = []
+
+effect fn sceneShader(device: &Device) -> gpu.ShaderModule
+  ! GpuError {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    return run gpu.createShaderModule(device, b"vector scene", shaders.scene())
+  } else {
+    return run gpu.createShaderModuleStrict(device, b"vector scene", shaders.scene())
+  }
+}
+
 pub struct SceneRenderer {
   pipeline: RenderPipeline,
   compose: RenderPipeline,
@@ -154,8 +167,21 @@ pub fn textureEntry<'a>(binding: u32, view: &'a TextureView) -> BindGroupEntry<'
 }
 
 impl SceneRenderer {
-  pub effect fn make(device: &Device) -> SceneRenderer ! GpuError {
-    let shader = run gpu.createShaderModule(device, b"vector scene", shaders.scene())
+  /// Pass these features to `DeviceDescriptor.withRequiredFeatures` when creating the device.
+  /// Native scene sampling requires Dawn's strict-math module option. Browser WGSL has no
+  /// equivalent feature: this list is empty there and exact CPU image parity is not promised.
+  pub fn requiredFeatures() -> &'static [u32] {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return &WEB_FEATURES
+    } else {
+      return &NATIVE_FEATURES
+    }
+  }
+
+  /// Native devices missing [`requiredFeatures`] fail with `gpu.STRICT_MATH_UNAVAILABLE`.
+  pub effect fn make(device: &Device) -> SceneRenderer
+    ! GpuError {
+    let shader = run sceneShader(device)
     let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs")
     let mut blend = BlendState.default()
     blend.setColor(premultipliedOver())
