@@ -1,0 +1,116 @@
+//! Full-precision sRGB transfer around color arithmetic. Stored pixels remain sRGB RGBA8.
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import pixmap { Rgba8 }
+
+/// Decodes a straight sRGB channel in [0, 1] to linear light (CSS Color 4).
+pub fn srgbToLinear(v: f64) -> f64 {
+  if v <= 0.04045 {
+    return v / 12.92
+  }
+  return pow((v + 0.055) / 1.055, 2.4)
+}
+
+/// Encodes a straight linear-light channel in [0, 1] to sRGB (CSS Color 4).
+pub fn linearToSrgb(v: f64) -> f64 {
+  if v <= 0.0031308 {
+    return v * 12.92
+  }
+  return 1.055 * pow(v, 1.0 / 2.4) - 0.055
+}
+
+/// Decodes a premultiplied sRGB byte without first rounding the straight channel to a byte.
+pub fn decode(channel: u8, alpha: u8) -> f64 {
+  if alpha == 0 {
+    return 0.0
+  }
+  return srgbToLinear(f64.min(u8.toF64(channel) / u8.toF64(alpha), 1.0))
+}
+
+/// Encodes a premultiplied linear-light value using floating alpha, quantizing only the result.
+pub fn encode(channel: f64, alpha: f64) -> u8 {
+  if alpha <= 0.0 {
+    return 0
+  }
+  return byte(linearToSrgb(f64.min(f64.max(channel / alpha, 0.0), 1.0)) * alpha)
+}
+
+pub fn byte(value: f64) -> u8 {
+  return f64.toU8(f64.min(f64.max(value, 0.0), 1.0) * 255.0 + 0.5)
+}
+
+/// Source-over in linear light. `source` and destination are premultiplied sRGB bytes;
+/// `mask` is coverage/opacity in 0..=255, applied in floating point before compositing.
+pub fn over(d: &mut [u8], i: usize, source: Rgba8, mask: u32) -> () {
+  if source.a == 0 || mask == 0 {
+    return
+  }
+  if mask == 255 && (source.a == 255 || d[i + 3] == 0) {
+    d[i] = source.r
+    d[i + 1] = source.g
+    d[i + 2] = source.b
+    d[i + 3] = source.a
+    return
+  }
+  let sa = u8.toF64(source.a) / 255.0 * u32.toF64(mask) / 255.0
+  let ba = u8.toF64(d[i + 3]) / 255.0
+  let remainder = ba * (1.0 - sa)
+  let alpha = sa + remainder
+  d[i] = encode(decode(source.r, source.a) * sa + decode(d[i], d[i + 3]) * remainder, alpha)
+  d[i + 1] = encode(decode(source.g, source.a) * sa + decode(d[i + 1], d[i + 3]) * remainder, alpha)
+  d[i + 2] = encode(decode(source.b, source.a) * sa + decode(d[i + 2], d[i + 3]) * remainder, alpha)
+  d[i + 3] = byte(alpha)
+}
+
+/// `base ^ power` for `base` in `(0, 1]` via exp and a series log (silk-lang/silk#2539).
+pub fn pow(base: f64, power: f64) -> f64 {
+  if base <= 0.0 {
+    return 0.0
+  }
+  return exp(power * ln(base))
+}
+
+/// `ln(x)` for `x` in `(0, 1]`: atanh series after scaling into [0.5, 1].
+fn ln(x: f64) -> f64 {
+  let mut v = x
+  let mut shift = 0.0
+  while v < 0.5 {
+    v = v * 2.0
+    shift = shift - 0.6931471805599453
+  }
+  let z = (v - 1.0) / (v + 1.0)
+  let z2 = z * z
+  let mut term = z
+  let mut sum = 0.0
+  let mut n: u32 = 0
+  while n < 30 {
+    sum = sum + term / u32.toF64(2 * n + 1)
+    term = term * z2
+    n = n + 1
+  }
+  return 2.0 * sum + shift
+}
+
+/// `exp(x)` for `x <= 0` (silk-lang/silk#2539: the stdlib has no exp yet).
+pub fn exp(x: f64) -> f64 {
+  let mut v = x
+  let mut halvings: u32 = 0
+  while v < -0.0625 {
+    v = v * 0.5
+    halvings = halvings + 1
+  }
+  let mut term = 1.0
+  let mut sum = 1.0
+  let mut n: u32 = 1
+  while n < 12 {
+    term = term * v / u32.toF64(n)
+    sum = sum + term
+    n = n + 1
+  }
+  while halvings > 0 {
+    sum = sum * sum
+    halvings = halvings - 1
+  }
+  return sum
+}

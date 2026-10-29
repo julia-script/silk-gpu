@@ -19,22 +19,27 @@ import strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import pixmap { Pixmap, Rgba8, div255 }
 import geometry_error { GeometryError }
 
-test effect fn affineThenAppliesRightFirst() -> () ! AssertionError<'static> {
+test effect fn affineThenAppliesRightFirst() -> ()
+  ! AssertionError<'static> {
   let m = Affine.translate(10.0, 0.0).then(&Affine.scale(2.0, 3.0))
   let p = m.apply(Point.make(1.0, 1.0))
   run Testing.expect(p.x == 12.0 && p.y == 3.0, "scale then translate")
 }
 
-test effect fn div255IsExactRounding() -> () ! AssertionError<'static> {
+test effect fn div255IsExactRounding() -> ()
+  ! AssertionError<'static> {
   let mut a: u32 = 0
   let mut ok = true
   while a < 256 {
     let mut b: u32 = 0
     while b < 256 {
       let p = a * b
+
       // round(p / 255) with ties up, in exact integers.
       let expected = (2 * p + 255) / 510
-      if div255(p) != expected { ok = false }
+      if div255(p) != expected {
+        ok = false
+      }
       b = b + 1
     }
     a = a + 1
@@ -65,7 +70,9 @@ fn totalArea(coverage: &Coverage) -> f64 {
   return sum
 }
 
-effect fn rectangle(x: f64, y: f64, w: f64, h: f64) -> Path ! OutOfMemoryError ? &mut Allocator {
+effect fn rectangle(x: f64, y: f64, w: f64, h: f64) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let mut p = Path.make()
   run p.rect(Rect.make(x, y, w, h))
   return move p
@@ -75,11 +82,19 @@ test effect fn integerRectIsSolid() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(2.0, 1.0, 9.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 16, 12) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run cover(&p, &Affine.identity(), NONZERO, 16, 12)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(c.alphaAt(2, 1) == 255 && c.alphaAt(10, 10) == 255, "corners inside")
-  run Testing.expect(c.alphaAt(1, 1) == 0 && c.alphaAt(11, 6) == 0 && c.alphaAt(2, 0) == 0 && c.alphaAt(2, 11) == 0, "outside")
+  run Testing.expect(
+    c.alphaAt(1, 1) == 0 && c.alphaAt(11, 6) == 0 && c.alphaAt(2, 0) == 0 && c.alphaAt(2, 11) == 0,
+    "outside",
+  )
+
   // Band 4..8 is fully covered across the rect, so it is one fill and no alphas.
-  run Testing.expect(c.fills().length == 1 && c.strips().length == 2, "one fill band, two strip bands")
+  run Testing.expect(
+    c.fills().length == 1 && c.strips().length == 2,
+    "one fill band, two strip bands",
+  )
   run Testing.expect(totalArea(&c) == 90.0, "area 90")
 }
 
@@ -87,8 +102,13 @@ test effect fn halfPixelEdgesAreHalfCovered() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.5, 0.0, 2.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
-  run Testing.expect(c.alphaAt(0, 0) == 128 && c.alphaAt(1, 2) == 255 && c.alphaAt(2, 3) == 128 && c.alphaAt(3, 0) == 0, "half, full, half, none")
+  let c = run cover(&p, &Affine.identity(), NONZERO, 4, 4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    c.alphaAt(0, 0) == 128 && c.alphaAt(1, 2) == 255 && c.alphaAt(2, 3) == 128
+      && c.alphaAt(3, 0) == 0,
+    "half, full, half, none",
+  )
 }
 
 test effect fn triangleAreaIsExact() -> ()
@@ -98,9 +118,12 @@ test effect fn triangleAreaIsExact() -> ()
   run p.moveTo(1.3, 0.7) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.lineTo(17.9, 5.1) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.lineTo(4.2, 13.6) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 20, 15) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run cover(&p, &Affine.identity(), NONZERO, 20, 15)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
   // Shoelace area of the triangle.
   let expected = 0.5 * f64.abs((17.9 - 1.3) * (13.6 - 0.7) - (4.2 - 1.3) * (5.1 - 0.7))
+
   // Byte quantization costs at most 1/510 per edge pixel.
   run Testing.expect(f64.abs(totalArea(&c) - expected) < 0.1, "triangle area")
 }
@@ -110,17 +133,30 @@ test effect fn circleAreaMatchesPiRSquared() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.circle(32.0, 32.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run cover(&p, &Affine.identity(), NONZERO, 64, 64)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let expected = 3.141592653589793 * 400.0
+
   // At the default 0.25 px tolerance the inscribed polyline loses about 1.1% of the area.
-  run Testing.expect(f64.abs(totalArea(&c) - expected) / expected < 0.015, "circle area within 1.5%")
-  run Testing.expect(c.alphaAt(32, 32) == 255 && c.alphaAt(32, 5) == 0, "center covered, outside empty")
+  run Testing.expect(
+    f64.abs(totalArea(&c) - expected) / expected < 0.015,
+    "circle area within 1.5%",
+  )
+  run Testing.expect(
+    c.alphaAt(32, 32) == 255 && c.alphaAt(32, 5) == 0,
+    "center covered, outside empty",
+  )
   let mut fine = List<Line>.make()
-  run flattening.fill(&p, &Affine.identity(), 0.001, &mut fine) |> Effect.provideMut<Allocator>(&mut allocator)
+  run flattening.fill(&p, &Affine.identity(), 0.001, &mut fine)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let mut raster = Rasterizer.make()
   let mut precise = Coverage.make(64, 64)
-  run raster.fillPolylines(fine.asSlice(), NONZERO, &mut precise) |> Effect.provideMut<Allocator>(&mut allocator)
-  run Testing.expect(f64.abs(totalArea(&precise) - expected) / expected < 0.001, "finely flattened circle within 0.1%")
+  run raster.fillPolylines(fine.asSlice(), NONZERO, &mut precise)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    f64.abs(totalArea(&precise) - expected) / expected < 0.001,
+    "finely flattened circle within 0.1%",
+  )
 }
 
 test effect fn flatteningStaysWithinTolerance() -> ()
@@ -129,15 +165,19 @@ test effect fn flatteningStaysWithinTolerance() -> ()
   let mut p = Path.make()
   run p.circle(0.0, 0.0, 100.0) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut lines = List<Line>.make()
-  run flattening.fill(&p, &Affine.identity(), 0.25, &mut lines) |> Effect.provideMut<Allocator>(&mut allocator)
+  run flattening.fill(&p, &Affine.identity(), 0.25, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let mut ok = lines.length() >= 16
   let mut i: usize = 0
   while i < lines.length() {
     let l = lines.asSlice()[i]
     let mx = f32.toF64(l.x0 + l.x1) * 0.5
     let my = f32.toF64(l.y0 + l.y1) * 0.5
+
     // The cubic circle deviates from a true circle by 0.027%; allow that plus the tolerance.
-    if f64.abs(f64.sqrt(mx * mx + my * my) - 100.0) > 0.25 + 0.03 { ok = false }
+    if f64.abs(f64.sqrt(mx * mx + my * my) - 100.0) > 0.25 + 0.03 {
+      ok = false
+    }
     i = i + 1
   }
   run Testing.expect(ok, "chord midpoints within tolerance")
@@ -149,21 +189,29 @@ test effect fn evenOddCancelsOverlap() -> ()
   let mut p = Path.make()
   run p.rect(Rect.make(0.0, 0.0, 8.0, 8.0)) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.rect(Rect.make(2.0, 2.0, 4.0, 4.0)) |> Effect.provideMut<Allocator>(&mut allocator)
-  let nonzero = run cover(&p, &Affine.identity(), NONZERO, 8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
-  let evenodd = run cover(&p, &Affine.identity(), EVENODD, 8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
-  run Testing.expect(nonzero.alphaAt(4, 4) == 255 && evenodd.alphaAt(4, 4) == 0 && evenodd.alphaAt(0, 0) == 255, "hole only under even-odd")
+  let nonzero = run cover(&p, &Affine.identity(), NONZERO, 8, 8)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let evenodd = run cover(&p, &Affine.identity(), EVENODD, 8, 8)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nonzero.alphaAt(4, 4) == 255 && evenodd.alphaAt(4, 4) == 0 && evenodd.alphaAt(0, 0) == 255,
+    "hole only under even-odd",
+  )
 }
 
 test effect fn offCanvasGeometryKeepsWinding() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
+
   // A diagonal edge that starts left of and above the canvas and ends right of it.
   let mut p = Path.make()
   run p.moveTo(-10.0, -6.0) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.lineTo(30.0, -6.0) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.lineTo(30.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.lineTo(-10.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 10, 10) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run cover(&p, &Affine.identity(), NONZERO, 10, 10)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
   // Reference: the visible part is the canvas area above the line y = 4 + 0.4 (x + 10) = 8 + 0.4 x.
   let mut expected: f64 = 0.0
   let mut x: u32 = 0
@@ -174,14 +222,18 @@ test effect fn offCanvasGeometryKeepsWinding() -> ()
     x = x + 1
   }
   run Testing.expect(f64.abs(totalArea(&c) - expected) < 0.05, "visible area of clipped shape")
-  run Testing.expect(c.alphaAt(0, 0) == 255 && c.alphaAt(9, 0) == 255, "left and right columns covered")
+  run Testing.expect(
+    c.alphaAt(0, 0) == 255 && c.alphaAt(9, 0) == 255,
+    "left and right columns covered",
+  )
 }
 
 test effect fn partialLastBandClipsToHeight() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.0, 0.0, 6.0, 6.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 6, 6) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run cover(&p, &Affine.identity(), NONZERO, 6, 6)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(totalArea(&c) == 36.0 && c.strips().length == 0, "two bands of fills")
   let mut pixmap = run Pixmap.make(6, 6) |> Effect.provideMut<Allocator>(&mut allocator)
   pixmap.fillCoverage(&c, Rgba8.make(255, 0, 0, 255))
@@ -193,15 +245,20 @@ test effect fn transformScalesGeometry() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(1.0, 1.0, 2.0, 2.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.scale(2.0, 2.0), NONZERO, 8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
-  run Testing.expect(totalArea(&c) == 16.0 && c.alphaAt(2, 2) == 255 && c.alphaAt(1, 2) == 0, "scaled rect")
+  let c = run cover(&p, &Affine.scale(2.0, 2.0), NONZERO, 8, 8)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    totalArea(&c) == 16.0 && c.alphaAt(2, 2) == 255 && c.alphaAt(1, 2) == 0,
+    "scaled rect",
+  )
 }
 
 test effect fn pixmapCompositesSourceOver() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.5, 0.0, 2.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
-  let c = run cover(&p, &Affine.identity(), NONZERO, 4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let c = run cover(&p, &Affine.identity(), NONZERO, 4, 4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let mut pixmap = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   pixmap.clear(Rgba8.make(0, 0, 255, 255))
   pixmap.fillCoverage(&c, Rgba8.make(255, 0, 0, 255))
@@ -209,14 +266,59 @@ test effect fn pixmapCompositesSourceOver() -> ()
   let inside = pixmap.pixel(1, 0)
   let outside = pixmap.pixel(3, 0)
   run Testing.expect(edge.r == 128 && edge.b == 127 && edge.a == 255, "half red over blue")
-  run Testing.expect(inside.r == 255 && inside.b == 0 && outside.b == 255 && outside.r == 0, "full and none")
+  run Testing.expect(
+    inside.r == 255 && inside.b == 0 && outside.b == 255 && outside.r == 0,
+    "full and none",
+  )
 }
+
 import stroke_tests
 import stroke_curve_tests
 import stroke_arcs_tests
 import paint_tests
 import layer_tests
 import filter_tests
+
+// SVG 2 https://www.w3.org/TR/2018/CR-SVG2-20181004/painting.html#ShapeRendering
+// The spec permits disabled AA; the library's explicit quantization contract is >=128 -> 255.
+test effect fn binaryCoverageThresholdPreservesSharedPayload() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run rectangle(0.5, 0.0, 1.0, 8.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut c = run cover(&p, &Affine.identity(), NONZERO, 3, 8)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Both boundary columns round to 128; a separate shape supplies the byte below threshold.
+  run Testing.expect(c.alphaAt(0, 0) == 128 && c.alphaAt(1, 0) == 128, "coverage boundary fixture")
+  let stripCount = c.strips().length
+  let alphaCount = c.alphas().length
+  c.binarize()
+  c.binarize()
+  run Testing.expect(
+    c.alphaAt(0, 0) == 255 && c.alphaAt(1, 0) == 255 && c.alphaAt(2, 0) == 0,
+    "threshold includes 128 and retains empty space",
+  )
+  run Testing.expect(
+    c.strips().length == stripCount && c.alphas().length == alphaCount,
+    "idempotent in-place conversion preserves GPU run indexing",
+  )
+  let below = run rectangle(0.0, 0.0, 127.0 / 255.0, 4.0)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut low = run cover(&below, &Affine.identity(), NONZERO, 2, 4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(low.alphaAt(0, 0) == 127, "coverage below threshold fixture")
+  low.binarize()
+  run Testing.expect(low.alphaAt(0, 0) == 0, "127 snaps to zero")
+  let full = run rectangle(0.0, 0.0, 2.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut solid = run cover(&full, &Affine.identity(), NONZERO, 2, 4)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let fillCount = solid.fills().length
+  solid.binarize()
+  run Testing.expect(
+    solid.alphaAt(0, 0) == 255 && solid.fills().length == fillCount,
+    "solid fills need no alpha storage changes",
+  )
+}
 
 test effect fn aliasedFillSamplesPixelCenters() -> () ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
