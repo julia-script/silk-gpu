@@ -315,7 +315,7 @@ fn blendPixel(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
   d[i + 3] = toByte(sa + ba * (1.0 - sa))
 }
 
-fn toByte(value: f32) -> u8 { return f32.toU8(f32.floor(f32.min(f32.max(value, 0.0), 1.0) * 255.0 + 0.5)) }
+fn toByte(value: f32) -> u8 { return f32.toU8(f32.min(f32.max(value, 0.0), 1.0) * 255.0 + 0.5) }
 
 fn separable(cb: f32, cs: f32, mode: u8) -> f32 {
   if mode == BLEND_MULTIPLY { return cb * cs }
