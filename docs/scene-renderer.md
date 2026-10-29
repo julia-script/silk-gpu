@@ -139,23 +139,25 @@ without Dawn.
 ## Benchmarks
 
 `scripts/bench-vector` (scheduled weekly in the benchmarks workflow, not in PR CI) renders the
-four scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
+five scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
 frame time of each, and compares the two images. Latest run (2026-10-29, x86_64 container, release
 builds, 512 x 512):
 
 | Scene | vector ms | tiny-skia ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| fills (300 translucent circles) | 6.0 | 10.0 | 0.60x | 2.3% |
-| strokes (150 round-joined stars) | 4.9 | 7.9 | 0.62x | 3.2% |
-| gradients (100 linear and radial rects) | 3.0 | 4.9 | 0.61x | 0.0% |
-| polygon (4000 edges, even-odd) | 6.0 | 22.3 | 0.27x | 30% |
+| fills (300 translucent circles) | 5.2 | 9.9 | 0.53x | 2.3% |
+| strokes (150 round-joined stars) | 4.2 | 7.9 | 0.53x | 3.2% |
+| gradients (100 linear and radial rects) | 3.0 | 4.8 | 0.64x | 0.0% |
+| polygon (4000 edges, even-odd) | 6.1 | 22.1 | 0.28x | 30% |
+| icons (4000 glyph-sized circles and stars) | 13.5 | 22.0 | 0.61x | 11% |
 
 The first run, before the coverage and compositing work, was 2.20x, 1.33x, 3.75x and 0.54x.
 What made the difference: coverage accumulates every line once into one buffer for the whole
 path and resolves only columns a line touched (an untouched column repeats the one before it);
 compositing works on packed pixels with a two-lane `div255`, four pixels at a time with
 `silk.simd` for spans; shaders fill whole spans
-(`Shader.shadeSpan`), stepping the linear parameter along the row; gradient ramps interpolate in
+(`Shader.shadeSpan`), stepping the linear parameter along the row, and a uniform paint
+(`Shader.isUniform`, such as a solid color) skips shading and composites one color; gradient ramps interpolate in
 fixed point.
 
 The polygon difference is a known limit of area accumulation: the winding is clamped (nonzero)

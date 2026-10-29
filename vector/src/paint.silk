@@ -25,6 +25,9 @@ pub interface Shader {
   /// Packed premultiplied colors (see [`pack`]) of pixels `x .. x + count` on row `y` into
   /// `out[0 .. count]`.
   fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> ()
+  /// Whether every pixel has the same color, so [`fill`] can composite `shade(0, 0)` without
+  /// shading spans.
+  fn isUniform(self: &Self) -> bool
 }
 
 /// One premultiplied color everywhere.
@@ -38,6 +41,7 @@ impl Solid {
 }
 impl Shader for Solid {
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8 { return self.color }
+  fn isUniform(self: &Self) -> bool { return true }
   fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
     let word = pack(self.color)
     let mut i: usize = 0
@@ -245,6 +249,7 @@ with Intrinsic.inlineAlways() {
 }
 
 impl Shader for Gradient {
+  fn isUniform(self: &Self) -> bool { return !self.isPaintable() || self.single }
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
     if !self.isPaintable() { return Rgba8.make(0, 0, 0, 0) }
     let ramp = self.ramp.asSlice()
@@ -366,6 +371,7 @@ impl<'a> ImagePattern<'a> {
   }
 }
 impl<'a> Shader for ImagePattern<'a> {
+  fn isUniform(self: &Self) -> bool { return !self.valid }
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
     if !self.valid { return Rgba8.make(0, 0, 0, 0) }
     let p = self.inverse.apply(Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5))
@@ -410,6 +416,10 @@ fn bilerp(a: u8, b: u8, c: u8, d: u8, wx: f64, wy: f64) -> u8 {
 /// (0..=255, for `fill-opacity` and `stroke-opacity`).
 pub fn fill<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opacity: u8) -> () {
   if opacity == 0 { return }
+  if shader.isUniform() {
+    fillUniform(&mut target, coverage, pack(shader.shade(0, 0)), opacity)
+    return
+  }
   let width = minU32(target.width(), coverage.width())
   let height = minU32(target.height(), coverage.height())
   let stride = u32.toUsize(target.width()) * 4
@@ -470,6 +480,72 @@ pub fn fill<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opa
         x = x + usize.toU32(count)
       }
       row = row + 1
+    }
+    s = s + 1
+  }
+}
+
+/// [`fill`] with one packed premultiplied color: the same bytes, without shading spans.
+fn fillUniform(target: &mut Pixmap, coverage: &Coverage, word: u32, opacity: u8) -> () {
+  let width = minU32(target.width(), coverage.width())
+  let height = minU32(target.height(), coverage.height())
+  let stride = u32.toUsize(target.width()) * 4
+  let fullMask = u8.toU32(opacity)
+  let d = target.dataMut()
+  let color = if fullMask == 255 { word } else { scalePacked(word, fullMask) }
+  let fills = coverage.fills()
+  if color != 0 {
+    let mut colors: [u32; SPAN] = [0; SPAN]
+    let mut i: usize = 0
+    while i < SPAN {
+      colors[i] = color
+      i = i + 1
+    }
+    let mut f: usize = 0
+    while f < fills.length {
+      let span = fills[f]
+      let right = minU32(span.x + span.width, width)
+      let mut y = span.y
+      while y < span.y + BAND && y < height {
+        let row = u32.toUsize(y) * stride
+        let mut x = span.x
+        while x < right {
+          let count = u32.toUsize(minU32(right - x, SPAN_U32))
+          overSpan(&mut d, row + u32.toUsize(x) * 4, &colors, count)
+          x = x + usize.toU32(count)
+        }
+        y = y + 1
+      }
+      f = f + 1
+    }
+  }
+  if word == 0 { return }
+  // Column by column: each strip column's four alphas are adjacent.
+  let alphas = coverage.alphas()
+  let strips = coverage.strips()
+  let rows = u32.toUsize(BAND)
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let right = minU32(strip.x + strip.width, width)
+    let visible = u32.toUsize(minU32(BAND, height - minU32(strip.y, height)))
+    let mut x = strip.x
+    while x < right {
+      let column = Slice.view(alphas, u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND), rows)
+      let mut at = u32.toUsize(strip.y) * stride + u32.toUsize(x) * 4
+      let mut row: usize = 0
+      while row < visible {
+        let alpha = u8.toU32(column[row])
+        let mask = if fullMask == 255 { alpha } else { div255(alpha * fullMask) }
+        if mask == 255 {
+          overPacked(&mut d, at, word)
+        } else if mask != 0 {
+          overPacked(&mut d, at, scalePacked(word, mask))
+        }
+        at = at + stride
+        row = row + 1
+      }
+      x = x + 1
     }
     s = s + 1
   }

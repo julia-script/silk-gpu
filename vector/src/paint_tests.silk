@@ -15,6 +15,7 @@ import paint {
   SAMPLE_NEAREST, SAMPLE_BILINEAR, EXTEND_CLAMP, EXTEND_REPEAT,
 }
 import paint as painting
+import paint { Shader }
 
 fn close(a: u8, b: u8, tolerance: i32) -> bool {
   let d = u8.toI32(a) - u8.toI32(b)
@@ -172,4 +173,51 @@ test effect fn opacityScalesCoverage() -> () ! AssertionError<'static> | OutOfMe
   let mut a = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut a, &c, &Solid.make(Rgba8.make(255, 255, 255, 255)), 128)
   run Testing.expect(a.pixel(0, 0).r == 128 && a.pixel(3, 3).a == 128, "half opacity")
+}
+
+/// A solid color that does not report itself uniform, so `fill` shades it span by span.
+struct Spanned {
+  solid: Solid,
+}
+impl Shader for Spanned {
+  fn shade(self: &Self, x: u32, y: u32) -> Rgba8 { return self.solid.shade(x, y) }
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () { self.solid.shadeSpan(x, y, count, &mut out) }
+  fn isUniform(self: &Self) -> bool { return false }
+}
+
+test effect fn uniformFillMatchesShadedSpans() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.circle(20.3, 17.6, 13.2) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.rect(Rect.make(30.5, 2.25, 9.5, 31.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut raster = Rasterizer.make()
+  // 37 rows: the last band is cut by the canvas.
+  let mut coverage = Coverage.make(48, 37)
+  run raster.fill(&p, &Affine.identity(), NONZERO, &mut coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  let colors = [Rgba8.make(200, 40, 90, 255), Rgba8.make(10, 220, 130, 140), Rgba8.make(0, 0, 0, 0)]
+  let opacities: [u8; 3] = [255, 97, 1]
+  let mut ok = true
+  let mut c: usize = 0
+  while c < 3 {
+    let mut o: usize = 0
+    while o < 3 {
+      let mut fast = run Pixmap.make(48, 37) |> Effect.provideMut<Allocator>(&mut allocator)
+      let mut slow = run Pixmap.make(48, 37) |> Effect.provideMut<Allocator>(&mut allocator)
+      fast.clear(Rgba8.make(30, 60, 90, 200))
+      slow.clear(Rgba8.make(30, 60, 90, 200))
+      let solid = Solid.make(colors[c])
+      painting.fill(&mut fast, &coverage, &solid, opacities[o])
+      painting.fill(&mut slow, &coverage, &Spanned { solid: solid }, opacities[o])
+      let a = fast.data()
+      let b = slow.data()
+      let mut i: usize = 0
+      while i < a.length {
+        if a[i] != b[i] { ok = false }
+        i = i + 1
+      }
+      o = o + 1
+    }
+    c = c + 1
+  }
+  run Testing.expect(ok, "uniform fills match span shading byte for byte")
 }

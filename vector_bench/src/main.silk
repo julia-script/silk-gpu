@@ -148,6 +148,23 @@ effect fn polygon(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryErro
   painting.fill(&mut target, &r.coverage, &Solid.make(Rgba8.make(20, 40, 160, 255)), 255)
 }
 
+effect fn icons(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut random = Random.make()
+  let id = Affine.identity()
+  let mut i: u32 = 0
+  while i < 4000 {
+    let cx = random.next() * 512.0
+    let cy = random.next() * 512.0
+    let size = 2.0 + random.next() * 10.0
+    let color = Rgba8.make(random.byte(), random.byte(), random.byte(), 255)
+    r.path.clear()
+    if i % 2 == 0 { run circle(&mut r.path, cx, cy, size) } else { run star(&mut r.path, cx, cy, size, size * 0.4) }
+    run r.raster.fill(&r.path, &id, NONZERO, &mut r.coverage)
+    painting.fill(&mut target, &r.coverage, &Solid.make(color), 255)
+    i = i + 1
+  }
+}
+
 fn nanos(start: &Instant, end: &Instant) -> i64 {
   return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000 + SystemClock.nanoseconds(end) - SystemClock.nanoseconds(start)
 }
@@ -157,7 +174,8 @@ effect fn scene(r: &mut Renderer, target: &mut Pixmap, index: u32) -> () ! OutOf
   if index == 0 { run fills(&mut r, &mut target) }
   else if index == 1 { run strokes(&mut r, &mut target) }
   else if index == 2 { run gradients(&mut r, &mut target) }
-  else { run polygon(&mut r, &mut target) }
+  else if index == 3 { run polygon(&mut r, &mut target) }
+  else { run icons(&mut r, &mut target) }
 }
 
 fn name(index: u32) -> string<'static> {
@@ -165,7 +183,8 @@ fn name(index: u32) -> string<'static> {
     0 => "fills"
     1 => "strokes"
     2 => "gradients"
-    _ => "polygon"
+    3 => "polygon"
+    _ => "icons"
   }
 }
 
@@ -174,7 +193,8 @@ fn output(index: u32) -> string<'static> {
     0 => "vector-fills.rgba"
     1 => "vector-strokes.rgba"
     2 => "vector-gradients.rgba"
-    _ => "vector-polygon.rgba"
+    3 => "vector-polygon.rgba"
+    _ => "vector-icons.rgba"
   }
 }
 
@@ -193,7 +213,7 @@ effect fn program() -> i32 ! OutOfMemoryError | FileError | HostInputError ? &mu
   let mut r = Renderer { raster: Rasterizer.make(), stroker: Stroker.make(), coverage: Coverage.make(SIZE, SIZE), path: Path.make(), outline: Path.make() }
   let mut target = run Pixmap.make(SIZE, SIZE)
   let mut index: u32 = 0
-  while index < 4 {
+  while index < 5 {
     let mut times = List<i64>.make()
     let mut frame: u32 = 0
     while frame < frames {
