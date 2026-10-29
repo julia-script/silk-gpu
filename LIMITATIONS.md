@@ -15,7 +15,7 @@ All reproductions below use the published **0.1.0-dev.27+323ceb59e7ee** compiler
 - Report: [silk-lang/silk#2541](https://github.com/silk-lang/silk/issues/2541).
 - Observed: `extern "C" struct BufferRef<'a> { handle: ?*mut u8 }` fails with SEM0205.
 - Workaround: safe descriptors and borrowed handle-array entries are single-field ordinary wrappers. Direct calls use the raw field's address; array conversions check equal wrapper/raw size and alignment. With one full-size field, equal size establishes offset zero. Borrowed lifetimes remain in the safe type.
-- Cost: layout invariants at conversion boundaries. The [Linux Callgrind run](https://github.com/julia-script/silk-gpu/actions/runs/40795501390) measures aggregate safe-wrapper workloads at 0.789–3.221% above C (1.833% geometric mean; `bench/results/linux-callgrind.json`). The isolated layout-conversion cost is not measured; these whole-region totals do not establish that any particular conversion is free.
+- Cost: layout invariants at conversion boundaries. The [label-matched Linux Callgrind run](https://github.com/julia-script/silk-gpu/actions/runs/40797020474) measures aggregate safe-wrapper workloads at 0.596–1.046% above C (0.786% geometric mean; `bench/results/linux-callgrind.json`). The isolated layout-conversion cost is not measured; these whole-region totals do not establish that any particular conversion is free.
 - Sites: `webgpu/src/descriptors.silk`, borrowed `*Ref` types in `webgpu/src/resources.silk`.
 
 ## LIMITATION-3 — Native Windows target unavailable

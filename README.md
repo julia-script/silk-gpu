@@ -74,6 +74,11 @@ executable name and DWARF unwind metadata. This avoids the hosted Apple linker's
 compact-unwind personality limit without disabling foreign-unwind guards; see
 [LIMITATION-5](LIMITATIONS.md#limitation-5--apple-linker-compact-unwind-personality-limit).
 
+The [cold hosted macOS run](https://github.com/julia-script/silk-gpu/actions/runs/40796358521)
+passed in **3 minutes 59 seconds**, including the pinned LLVM download: all six
+packages, ABI checks, native lifetime/error scenarios, and six pixel samples.
+Every native sample had zero differing pixels on that run.
+
 ### Reproducible checks and CI
 
 `python3 scripts/check` is the PR gate: raw bindings, browser glue and embedded
@@ -120,6 +125,28 @@ path through `PLAYWRIGHT_CHROMIUM_EXECUTABLE`. Locally, an existing Playwright
 installation may be selected with `PLAYWRIGHT_MODULE`; otherwise normal Node
 module resolution applies. A missing browser, missing `wasm-ld`, unsupported
 WebGPU adapter, or failed pixel comparison is a hard failure, not a skip.
+
+On Linux, `scripts/test-browser` runs headed Chromium on a private
+`xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24"` display;
+install `xvfb` and `xauth` for local Linux runs. macOS uses headless Chromium.
+Both use:
+
+```text
+--enable-unsafe-webgpu
+--use-angle=swiftshader
+--enable-features=Vulkan,CDPScreenshotNewSurface
+--disable-vulkan-surface
+--enable-unsafe-swiftshader
+```
+
+Linux also supplies `--use-vulkan=swiftshader` so the Vulkan compositor has a
+usable software driver. `CDPScreenshotNewSurface` preserves Playwright's default
+feature while enabling Vulkan. Linux headless Chromium 156.0.8078.0 produced
+correct intrinsic canvas pixels but a white compositor capture; headed Chromium
+on Xvfb passed the unchanged full pixel comparison. No rendering moves into JS.
+The [actual hosted browser run](https://github.com/julia-script/silk-gpu/actions/runs/40798507066/job/123200675877)
+passed ten host-contract tests, six compiled Silk samples, and canvas
+configure/present/resize/compositor-pixel/cleanup checks with that browser version.
 
 The Windows scheduled job verifies the available Dawn archive, then explicitly
 fails when it cannot install a real native Silk compiler. Windows is blocked by
@@ -298,6 +325,10 @@ Dawn binary, and Rust `wgpu` 30.0.1 with a committed Cargo lockfile. Each worklo
 validates readback and requires equal peer checksums before accepting a timing.
 The timer covers encode/write and submit, not device/pipeline setup, GPU completion,
 or checked readback. Two warmup frames precede measurement.
+C and Silk supply the same explicit empty labels for command encoders and
+command buffers: an absent C descriptor is observably different inside Dawn.
+Rust uses an explicitly empty encoder label and its API's default command-buffer
+finish behavior; it does not expose a separate finish-label argument.
 
 ```sh
 scripts/bench --build --frames 20 --repeats 7 --n 10000 --record-baseline
@@ -315,14 +346,47 @@ cases issue one instanced draw with the stated instance count.
 
 | Workload | Silk / Dawn | C / Dawn | Rust / wgpu |
 | --- | ---: | ---: | ---: |
-| 10k draws | 1,196.10 | 1,087.35 | 1,044.27 |
-| 10k buffer writes | 8,466.60 | 4,630.50 | 130,891.35 |
-| 10k bind-group switches | 6,793.45 | 6,500.85 | 5,954.62 |
-| 10k instanced rounded rectangles | 91.70 | 83.30 | 85.25 |
-| 100k instanced rounded rectangles | 101.60 | 86.55 | 85.80 |
+| 10k draws | 1,051.00 | 1,106.65 | 927.33 |
+| 10k buffer writes | 4,373.30 | 4,924.15 | 50,001.74 |
+| 10k bind-group switches | 4,602.40 | 4,362.80 | 4,172.14 |
+| 10k instanced rounded rectangles | 106.00 | 112.45 | 221.54 |
+| 100k instanced rounded rectangles | 141.65 | 138.50 | 126.02 |
 
 This shared-workstation wall baseline is noisy and does **not** establish the
 few-percent instruction-count target or prove allocation freedom. Rust uses a
 different WebGPU implementation, so its timings are a peer comparison, not
 isolated Silk wrapper overhead. Retain the raw samples rather than interpreting
 a single ratio as compiler quality.
+
+### Instruction count and allocation attribution
+
+The [matched Linux Callgrind run](https://github.com/julia-script/silk-gpu/actions/runs/40797020474)
+passed in **10 minutes 14 seconds** using LLVM 22.1.2, Valgrind 3.26.0,
+the pinned Dawn binary, and lavapipe. Three runs of three measured frames follow
+two warmup frames. Collection covers the submitting thread's encode/write and
+submit work; setup, GPU waits, checked readback, and worker threads are excluded.
+
+| Workload | C Ir/frame | Silk Ir/frame | Silk overhead |
+| --- | ---: | ---: | ---: |
+| 10k draws | 8,596,903.67 | 8,686,847.67 | 1.046% |
+| 10k buffer writes | 9,916,615.00 | 10,006,637.00 | 0.908% |
+| 10k bind-group switches | 26,266,641.67 | 26,472,977.33 | 0.786% |
+| 10k instanced rounded rectangles | 29,371.00 | 29,546.00 | 0.596% |
+| 100k instanced rounded rectangles | 29,371.00 | 29,546.00 | 0.596% |
+
+Geometric-mean overhead is **0.786%**; every workload meets the few-percent target.
+The rectangle cases have equal CPU instruction counts because each encodes one
+instanced draw; instance execution belongs to the excluded GPU work.
+
+All fifteen Silk profiles have positive-Ir outbound edges only to `wgpu*` or
+the benchmark marker, with **no wrapper allocator path observed** in these hot
+loops. Backend allocations remain visible through Dawn/C++ and lavapipe/libc;
+they are not attributed to Silk wrappers. Explicit empty-label handling has
+identical C/Silk cost, including its backend allocation. This is not a claim
+that asynchronous setup, resource creation, or every API method is allocation-free.
+
+[Committed evidence](bench/results/linux-callgrind.json) preserves every measured
+Ir total, checksums, tool/binary hashes, scope, and allocation call-path attribution,
+plus the downloadable raw Callgrind artifact. Annotated `x` call counts include
+uncollected startup/warmup and must **not** be used as a measured allocation census.
+The scheduled/manual benchmark workflow keeps this slow measurement outside the PR gate.

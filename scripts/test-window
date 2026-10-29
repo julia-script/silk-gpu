@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Exercise the real GLFW X11 surface under a private Xvfb (no window manager)."""
+import argparse
+import ctypes as C
+from ctypes.util import find_library
+import json
+import os
+from pathlib import Path
+import runpy
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+from _build import build
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class XImage(C.Structure):
+    _fields_ = [("width", C.c_int), ("height", C.c_int), ("xoffset", C.c_int),
+                ("format", C.c_int), ("data", C.c_void_p), ("byte_order", C.c_int),
+                ("bitmap_unit", C.c_int), ("bitmap_bit_order", C.c_int),
+                ("bitmap_pad", C.c_int), ("depth", C.c_int),
+                ("bytes_per_line", C.c_int), ("bits_per_pixel", C.c_int),
+                ("red_mask", C.c_ulong), ("green_mask", C.c_ulong), ("blue_mask", C.c_ulong)]
+
+
+def png(path, width, height, rgb):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    rows = b"".join(b"\0" + rgb[y * width * 3:(y + 1) * width * 3] for y in range(height))
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def smoke(executable, output):
+    x11 = C.CDLL(find_library("X11"))
+    x11.XOpenDisplay.argtypes = [C.c_char_p]
+    x11.XOpenDisplay.restype = C.c_void_p
+    x11.XCloseDisplay.argtypes = [C.c_void_p]
+    x11.XGetImage.argtypes = [C.c_void_p, C.c_ulong, C.c_int, C.c_int, C.c_uint, C.c_uint, C.c_ulong, C.c_int]
+    x11.XGetImage.restype = C.POINTER(XImage)
+    x11.XDestroyImage.argtypes = [C.POINTER(XImage)]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("Cannot connect to private Xvfb")
+    environment = dict(os.environ)
+    environment.pop("WAYLAND_DISPLAY", None)
+    environment["XDG_SESSION_TYPE"] = "x11"
+    output.mkdir(parents=True, exist_ok=True)
+    process = None
+    proof = {"backend": "GLFW X11 / lavapipe", "frames": [], "minimize": "not exercised: Xvfb has no window manager", "wayland": "not exercised"}
+    try:
+        with (output / "window.log").open("wb") as log:
+            process = subprocess.Popen([str(executable)], env=environment, stdout=log, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + 30
+            window = None
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise RuntimeError(f"Window exited before presentation: {process.returncode}; see window.log")
+                found = subprocess.run(["xdotool", "search", "--onlyvisible", "--pid", str(process.pid), "--name", "^Silk WebGPU - Escape to close$"], capture_output=True, text=True)
+                if found.returncode == 0 and found.stdout.strip():
+                    window = int(found.stdout.splitlines()[0])
+                    break
+                time.sleep(0.05)
+            if window is None:
+                raise RuntimeError("GLFW window did not become visible")
+            encoding = None
+            # The sample selects the adapter's first supported surface format.
+            # Both legal format families have exact independent transfer-function
+            # expectations; every captured pixel must match one consistent family.
+            linear = [0.08, 0.18, 0.32]
+            expected = {
+                "unorm": [round(v * 255) for v in linear],
+                "srgb": [round((12.92 * v if v <= 0.0031308 else 1.055 * v ** (1 / 2.4) - 0.055) * 255) for v in linear],
+            }
+            for width, height in [(800, 600), (960, 480)]:
+                subprocess.run(["xdotool", "windowsize", str(window), str(width), str(height)], check=True)
+                deadline = time.monotonic() + 30
+                observed = None
+                while time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        raise RuntimeError(f"Window exited during presentation: {process.returncode}")
+                    geometry = subprocess.check_output(["xdotool", "getwindowgeometry", "--shell", str(window)], text=True)
+                    values = dict(line.split("=", 1) for line in geometry.splitlines() if "=" in line)
+                    if int(values["WIDTH"]) != width or int(values["HEIGHT"]) != height:
+                        time.sleep(0.05)
+                        continue
+                    image = x11.XGetImage(display, window, 0, 0, width, height, C.c_ulong(-1).value, 2)
+                    if not image:
+                        raise RuntimeError("XGetImage failed")
+                    try:
+                        header = image.contents
+                        if header.bits_per_pixel not in (24, 32) or header.depth != 24:
+                            raise RuntimeError(f"Unexpected Xvfb pixel layout: depth={header.depth}, bpp={header.bits_per_pixel}")
+                        masks = [header.red_mask, header.green_mask, header.blue_mask]
+                        shifts = [(mask & -mask).bit_length() - 1 for mask in masks]
+                        if any(mask >> shift != 255 for mask, shift in zip(masks, shifts)):
+                            raise RuntimeError("Expected 8-bit Xvfb RGB masks")
+                        packed = C.string_at(header.data, header.bytes_per_line * height)
+                        step = header.bits_per_pixel // 8
+                        order = "little" if header.byte_order == 0 else "big"
+                        rgb = bytearray(width * height * 3)
+                        for y in range(height):
+                            for x in range(width):
+                                offset = y * header.bytes_per_line + x * step
+                                pixel = int.from_bytes(packed[offset:offset + step], order)
+                                destination = (y * width + x) * 3
+                                for channel, (mask, shift) in enumerate(zip(masks, shifts)):
+                                    rgb[destination + channel] = (pixel & mask) >> shift
+                    finally:
+                        x11.XDestroyImage(image)
+                    observed = list(rgb[:3])
+                    matching = [name for name, color in expected.items() if all(abs(value - color[index % 3]) <= 2 for index, value in enumerate(rgb))]
+                    if matching:
+                        selected = matching[0]
+                        if encoding is not None and encoding != selected:
+                            raise RuntimeError("Surface color encoding changed during resize")
+                        encoding = selected
+                        png(output / f"window-{width}x{height}.png", width, height, rgb)
+                        proof["frames"].append({"width": width, "height": height, "encoding": encoding, "expectedRGB": expected[encoding], "observedRGB": observed, "pixelsChecked": width * height, "tolerance": 2})
+                        print(f"PASS X11 {width}x{height}: {width * height} pixels match {encoding} clear {expected[encoding]}", flush=True)
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise RuntimeError(f"Surface did not present expected {width}x{height} clear; first pixel {observed}, expected {expected}")
+            # Focus plus XTEST input delivers a real host key event, not a direct
+            # application close command or a test-only frame-count exit.
+            subprocess.run(["xdotool", "windowfocus", "--sync", str(window)], check=True)
+            subprocess.run(["xdotool", "key", "Escape"], check=True)
+            result = process.wait(timeout=30)
+            if result != 0:
+                raise RuntimeError(f"Escape exit={result}; debug handle/failure check did not pass")
+            proof["escapeExit"] = result
+            proof["silkDebugHandlesAndFailures"] = 0
+            (output / "proof.json").write_text(json.dumps(proof, indent=2) + "\n")
+            print("PASS real Escape close: exit 0, debug live handles=0 and failures=0", flush=True)
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        x11.XCloseDisplay(display)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / ".cache/window-proof")
+    parser.add_argument("--inside-xvfb", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if sys.platform != "linux":
+        raise SystemExit("test-window requires Linux X11; it does not simulate other backends")
+    if args.inside_xvfb:
+        smoke(args.inside_xvfb, args.output.resolve())
+        return 0
+    if not os.environ.get("VK_DRIVER_FILES") and not os.environ.get("VK_ICD_FILENAMES"):
+        raise SystemExit("Select the pinned lavapipe ICD first (scripts/setup-ci in CI)")
+    window = runpy.run_path(str(ROOT / "scripts/window"))
+    executable = build(ROOT / "examples_window", extra_links=window["glfw_links"]())
+    return subprocess.run(["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x800x24 -nolisten tcp", sys.executable, str(Path(__file__).resolve()), "--inside-xvfb", str(executable), "--output", str(args.output.resolve())], cwd=ROOT).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

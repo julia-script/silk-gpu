@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "metric": "Ir",
-  "timestamp_utc": "2026-10-29T00:41:40Z",
-  "source_commit": "4dff91ae05641fc09cdec053eb8aaf7236790524",
-  "run_url": "https://github.com/julia-script/silk-gpu/actions/runs/40795501390",
+  "timestamp_utc": "2026-10-29T00:55:35Z",
+  "source_commit": "d15e8d2352e4035d4942c42cd5d9db9db0d81b49",
+  "run_url": "https://github.com/julia-script/silk-gpu/actions/runs/40797020474",
   "artifact": {
-    "name": "linux-callgrind-40795501390-1",
-    "url": "https://github.com/julia-script/silk-gpu/actions/runs/40795501390/artifacts/12864505263",
-    "sha256": "bdbfa7d8bb3da8a711a67b3b7bd3bd720f891f400a0ba243b51bf30f27487536",
-    "expires_at": "2026-11-28T00:50:43Z",
+    "name": "linux-callgrind-40797020474-1",
+    "url": "https://github.com/julia-script/silk-gpu/actions/runs/40797020474/artifacts/12865071208",
+    "sha256": "1ca345fb519f716e08cccde1ed29ac1d87a2c54b68839e20fac7b27704c50b6d",
+    "expires_at": "2026-11-28T01:04:14Z",
     "contents": "comparison.json and all 30 raw Callgrind profiles with annotated caller/callee trees"
   },
   "host": {
@@ -27,7 +27,7 @@
     "g++": "4:15.2.0-5ubuntu1"
   },
   "binary_sha256": {
-    "c": "a4dee120dbb23ad43675910c9ef19179c2c93ba51d4f9cec2300c81177caabf1",
+    "c": "5aabb639ced41a25c507e265a217e5c68adc8691eff9717898dcfe23fffbf924",
     "silk": "b57f534f265d492419536cf437bf5ddf7683cc461e29a0eb352af402687bcb97"
   },
   "shader_sha256": "98b3f60f7eb3fe7b046764a0fdc434ba76879d40935127e89f93e82f94e0e9c7",
@@ -45,7 +45,8 @@
     "warmup_frames_per_run": 2,
     "scope": "Calling-thread CPU encode/write and submit; excludes setup, warmup, GPU waits, checked readback and worker-thread execution. Both binaries use real Dawn Vulkan on lavapipe.",
     "call_counts": "Annotation x-call counts include uncollected startup/warmup and are not a measured-region allocation census. Ir alone is scoped.",
-    "thread_scope_source": "https://sourceware.org/git/?p=valgrind.git;a=blob_plain;f=callgrind/main.c;hb=VALGRIND_3_26_0 (VG_USERREQ__TOGGLE_COLLECT changes thread-specific current_state.collect)"
+    "thread_scope_source": "https://sourceware.org/git/?p=valgrind.git;a=blob_plain;f=callgrind/main.c;hb=VALGRIND_3_26_0 (VG_USERREQ__TOGGLE_COLLECT changes thread-specific current_state.collect)",
+    "descriptor_parity": "C and Silk both supply explicit empty string views for command encoder and command buffer labels; render-pass labels remain absent in both. Rust peer uses Some(\"\") for encoder label; wgpu 30.0.1 finish() exposes no label argument and its native backend supplies CommandBufferDescriptor::default(). Rust is not part of this C/Silk Ir comparison."
   },
   "results": [
     {
@@ -55,22 +56,22 @@
       "checksum": 15506621279517942565,
       "total_Ir_samples": {
         "c": [
-          25800015,
-          25787929,
-          25787929
+          25807580,
+          25790711,
+          25790711
         ],
         "silk": [
-          26061212,
-          26061212,
-          26061212
+          26060543,
+          26060543,
+          26060543
         ]
       },
       "median_Ir_per_frame": {
-        "c": 8595976.333333334,
-        "silk": 8687070.666666666
+        "c": 8596903.666666666,
+        "silk": 8686847.666666666
       },
-      "silk_over_c": 1.0105973224914648,
-      "overhead_percent": 1.0597322491464833
+      "silk_over_c": 1.0104623715104248,
+      "overhead_percent": 1.046237151042484
     },
     {
       "workload": "writes",
@@ -103,22 +104,22 @@
       "checksum": 15506621279517942565,
       "total_Ir_samples": {
         "c": [
-          78796688,
-          78796688,
-          78796688
+          78799925,
+          78799925,
+          78799925
         ],
         "silk": [
-          79418025,
-          79418025,
-          79418025
+          79418932,
+          79418920,
+          79419020
         ]
       },
       "median_Ir_per_frame": {
-        "c": 26265562.666666668,
-        "silk": 26472675.0
+        "c": 26266641.666666668,
+        "silk": 26472977.333333332
       },
-      "silk_over_c": 1.0078853187331933,
-      "overhead_percent": 0.7885318733193314
+      "silk_over_c": 1.007855426258337,
+      "overhead_percent": 0.7855426258337017
     },
     {
       "workload": "rects10k",
@@ -127,9 +128,9 @@
       "checksum": 15506621279517942565,
       "total_Ir_samples": {
         "c": [
-          85872,
-          85872,
-          85872
+          88113,
+          88113,
+          88113
         ],
         "silk": [
           88638,
@@ -138,11 +139,11 @@
         ]
       },
       "median_Ir_per_frame": {
-        "c": 28624.0,
+        "c": 29371.0,
         "silk": 29546.0
       },
-      "silk_over_c": 1.032210732252655,
-      "overhead_percent": 3.2210732252655028
+      "silk_over_c": 1.00595825814579,
+      "overhead_percent": 0.5958258145789985
     },
     {
       "workload": "rects100k",
@@ -151,25 +152,25 @@
       "checksum": 15506621279517942565,
       "total_Ir_samples": {
         "c": [
-          85872,
-          85872,
-          85872
+          88113,
+          88113,
+          88113
         ],
         "silk": [
           88638,
-          88638,
+          88649,
           88638
         ]
       },
       "median_Ir_per_frame": {
-        "c": 28624.0,
+        "c": 29371.0,
         "silk": 29546.0
       },
-      "silk_over_c": 1.032210732252655,
-      "overhead_percent": 3.2210732252655028
+      "silk_over_c": 1.00595825814579,
+      "overhead_percent": 0.5958258145789985
     }
   ],
-  "geomean_silk_over_c": 1.0183337538300974,
+  "geomean_silk_over_c": 1.0078609055804972,
   "allocation_attribution": {
     "profiles_reviewed": 15,
     "wrapper_outbound_symbols": [
@@ -194,18 +195,17 @@
       "render workloads: Dawn CommandAllocator::AppendNewBlock -> C++ operator new -> libc malloc",
       "all workloads: Dawn ExecutionQueueBase::TrackSerialTask -> C++ operator new -> libc malloc"
     ],
-    "label_difference": "Silk render profiles additionally contain Dawn ApiObjectBase::ApiObjectBase -> SetLabel -> operator new: 288 inclusive Ir per three measured frames (96/frame) at the operator-new edge, versus no positive-Ir SetLabel entry in C. This is backend label handling for per-frame resource creation, not a wrapper allocator call or per-draw/write/bind allocation.",
     "representative_profiles": [
       {
         "workload": "draws",
         "repeat": 0,
         "total_Ir_in_three_frames": {
           "c": {
-            "malloc": 5632011,
-            "operator_new_inclusive": 4272
+            "malloc": 5637518,
+            "operator_new_inclusive": 4560
           },
           "silk": {
-            "malloc": 5620649,
+            "malloc": 5619980,
             "operator_new_inclusive": 4560
           }
         }
@@ -229,11 +229,11 @@
         "repeat": 0,
         "total_Ir_in_three_frames": {
           "c": {
-            "malloc": 22093043,
-            "operator_new_inclusive": 5502
+            "malloc": 22094219,
+            "operator_new_inclusive": 5790
           },
           "silk": {
-            "malloc": 22096821,
+            "malloc": 22097816,
             "operator_new_inclusive": 5790
           }
         }
@@ -243,8 +243,8 @@
         "repeat": 0,
         "total_Ir_in_three_frames": {
           "c": {
-            "malloc": 4416,
-            "operator_new_inclusive": 3696
+            "malloc": 4596,
+            "operator_new_inclusive": 3984
           },
           "silk": {
             "malloc": 4596,
@@ -257,8 +257,8 @@
         "repeat": 0,
         "total_Ir_in_three_frames": {
           "c": {
-            "malloc": 4416,
-            "operator_new_inclusive": 3696
+            "malloc": 4596,
+            "operator_new_inclusive": 3984
           },
           "silk": {
             "malloc": 4596,
@@ -266,7 +266,13 @@
           }
         }
       }
-    ]
+    ],
+    "label_parity": "All four render workloads show identical C/Silk Dawn ApiObjectBase::SetLabel cost: 1530 inclusive Ir per three measured frames, including a 288-Ir operator-new edge (96/frame). No label handling cost is hidden or attributed to Silk allocation. Writes contain no positive-Ir SetLabel entry."
   },
-  "interpretation": "Measured aggregate overhead ranges from 0.789% to 3.221% (geomean 1.833%), within a few percent of C. These are whole marked-region totals, not isolated descriptor-layout conversion costs. Identical rects10k/100k CPU counts reflect one instanced draw each; worker GPU rasterization is excluded."
+  "interpretation": "With matched descriptor labels, measured aggregate overhead ranges from 0.596% to 1.046% (geomean 0.786%), within a few percent of C. These are whole marked-region totals, not isolated descriptor-layout conversion costs. Identical rects10k/100k CPU counts reflect one instanced draw each; worker GPU rasterization is excluded.",
+  "supersedes": {
+    "run_url": "https://github.com/julia-script/silk-gpu/actions/runs/40795501390",
+    "source_commit": "4dff91ae05641fc09cdec053eb8aaf7236790524",
+    "reason": "Earlier C benchmark used absent command-encoder/buffer descriptors while Silk supplied explicit empty labels. This run aligns C/Silk descriptors; earlier actual evidence remains in that run artifact and git history."
+  }
 }

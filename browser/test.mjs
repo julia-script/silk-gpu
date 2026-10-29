@@ -18,8 +18,6 @@ const wasm = await readFile(resolve(options.get('--wasm')));
 const manifestPath = resolve(options.get('--fixtures'));
 const fixtures = JSON.parse(await readFile(manifestPath, 'utf8'));
 const require = createRequire(import.meta.url);
-// [DEBUG-linux-canvas] Capture Chromium's GPU-process stderr for hosted diagnosis.
-process.env.DEBUG = [process.env.DEBUG, 'pw:browser'].filter(Boolean).join(',');
 let chromium;
 try { ({ chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')); }
 catch (error) { throw new Error('An existing Playwright installation is required (set PLAYWRIGHT_MODULE to its installed absolute module path); do not run playwright install', { cause: error }); }
@@ -101,14 +99,8 @@ try {
     // Linux's system Vulkan loader may have no usable ICD even when ANGLE's
     // SwiftShader works. The compositor needs the same software Vulkan driver.
     ...(process.platform === 'linux' ? ['--use-vulkan=swiftshader'] : []),
-    '--enable-logging=stderr',
   ] });
   console.log(`Chromium ${browser.version()} (${process.platform}): compiled Silk WebGPU tests`);
-  // [DEBUG-linux-canvas] Distinguish device rendering from compositor capture.
-  const gpuSession = await browser.newBrowserCDPSession();
-  const gpuInfo = await gpuSession.send('SystemInfo.getInfo');
-  console.log('Chromium GPU configuration:', JSON.stringify({ devices: gpuInfo.gpu.devices, featureStatus: gpuInfo.gpu.featureStatus, auxAttributes: gpuInfo.gpu.auxAttributes }));
-  await gpuSession.detach();
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -147,9 +139,6 @@ try {
     return { frames: globalThis.canvasCheck.frames, rgba: globalThis.canvasCheck.expectedRGBA };
   });
   try {
-    const canvasSnapshot = await page.locator('#gpu-test').evaluate(canvas => canvas.toDataURL('image/png'));
-    const canvasPixels = png(Buffer.from(canvasSnapshot.split(',')[1], 'base64'));
-    console.log('Canvas intrinsic RGBA:', [...canvasPixels.rgba.subarray(0, 4)]);
     const screenshot = await page.locator('#gpu-test').screenshot();
     await mkdir(resolve(root, '.cache/pixels'), { recursive: true });
     await writeFile(resolve(root, '.cache/pixels/browser-canvas.png'), screenshot);
