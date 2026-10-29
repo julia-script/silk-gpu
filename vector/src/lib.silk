@@ -5,3 +5,4 @@ import flatten
 import strips
 import pixmap
 import stroke
+import paint

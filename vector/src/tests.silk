@@ -196,3 +196,4 @@ test effect fn pixmapCompositesSourceOver() -> () ! AssertionError<'static> | Ou
   run Testing.expect(inside.r == 255 && inside.b == 0 && outside.b == 255 && outside.r == 0, "full and none")
 }
 import stroke_tests
+import paint_tests

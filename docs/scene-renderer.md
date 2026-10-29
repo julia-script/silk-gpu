@@ -48,8 +48,22 @@ without Dawn.
    per column, stored column major so a column is one `u32` on the GPU. Runs of solid columns
    become a `Fill`, which carries no alphas. Lines are binned into bands with a counting sort, and
    only the path's bounding box is visited.
-6. **Paint and composite** (CPU: `vector.pixmap`; GPU: `gpu_scene`): each strip or fill is drawn
-   with its paint. The target is premultiplied RGBA8. Every blend uses the exact integer
+6. **Paint and composite** (CPU: `vector.pixmap` and `vector.paint`; GPU: `gpu_scene`): each
+   strip or fill is drawn with its paint, a `Shader` that returns the premultiplied color at a
+   device pixel center. Paints carry one transform from their own space to device space (callers
+   fold in `gradientTransform`, `objectBoundingBox` units and the CTM) and sample at
+   `(x + 0.5, y + 0.5)` mapped through its inverse.
+   - Gradients: linear, and radial in the SVG 2 two-point conical form (focal circle `fx fy fr`
+     to end circle `cx cy r`, taking the largest `t` with a non-negative radius; points outside
+     a cone stay transparent). Spread pad, reflect and repeat. Stop offsets are clamped and made
+     non-decreasing; equal offsets give hard edges; a zero-length vector or zero radius paints
+     the last stop. Colors are tabulated into a 1024-entry premultiplied ramp; interpolation is in
+     straight alpha by default (resvg and Skia's SVG behaviour) or premultiplied (CSS Images 3).
+     Color-space choice (`color-interpolation: linearRGB`) is the caller's, by converting stops.
+   - Image patterns: nearest or bilinear sampling of a premultiplied pixmap, clamped (for
+     `image`, clipped by its rectangle) or repeated (pattern tiles).
+   - Opacity (`fill-opacity`, `stroke-opacity`) scales the coverage mask.
+   The target is premultiplied RGBA8. Every blend uses the exact integer
    `div255(x) = (x + 128 + ((x + 128) >> 8)) >> 8`, which equals `round(x / 255)` for all
    products of two bytes, so CPU and GPU can agree byte for byte.
 

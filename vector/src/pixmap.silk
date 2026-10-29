@@ -51,6 +51,11 @@ impl Pixmap {
   pub fn height(self: &Self) -> u32 { return self.pixelHeight }
   /// Premultiplied RGBA8 bytes, row major with no padding.
   pub fn data(self: &Self) -> &[u8] { return self.bytes.asSlice() }
+  pub fn dataMut(self: &mut Self) -> &mut [u8] { return self.bytes.asMutSlice() }
+  /// Wraps premultiplied RGBA8 `bytes` (row major, `width * height * 4` long) as a pixmap.
+  pub fn fromBytes(width: u32, height: u32, bytes: List<u8>) -> Pixmap {
+    return Pixmap { pixelWidth: width, pixelHeight: height, bytes: move bytes }
+  }
   /// The premultiplied pixel at `(x, y)`.
   pub fn pixel(self: &Self, x: u32, y: u32) -> Rgba8 {
     let i = (u32.toUsize(y) * u32.toUsize(self.pixelWidth) + u32.toUsize(x)) * 4
@@ -121,7 +126,7 @@ impl Pixmap {
 }
 
 /// Premultiplied source-over of `source` onto the pixel at byte offset `i`.
-fn over(d: &mut [u8], i: usize, source: Rgba8) -> () {
+pub fn over(d: &mut [u8], i: usize, source: Rgba8) -> () {
   let inverse = 255 - u8.toU32(source.a)
   d[i] = u32.toU8(u8.toU32(source.r) + div255(u8.toU32(d[i]) * inverse))
   d[i + 1] = u32.toU8(u8.toU32(source.g) + div255(u8.toU32(d[i + 1]) * inverse))
