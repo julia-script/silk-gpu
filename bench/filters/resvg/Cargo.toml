@@ -1,0 +1,13 @@
+[package]
+name = "filter-bench-resvg"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+resvg = { version = "=0.45.1", default-features = false, features = ["raster-images"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

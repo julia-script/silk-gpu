@@ -41,6 +41,11 @@ jobs:
           set -o pipefail
           mkdir -p .cache/bench/ab
           python3 scripts/bench-vector | tee .cache/bench/ab/vector.txt
+      - name: Time vector.filter against resvg and compare their images
+        run: |
+          set -o pipefail
+          mkdir -p .cache/bench/ab
+          python3 scripts/bench-filters | tee .cache/bench/ab/filters.txt
       - name: Retain instruction counts, binary hashes and allocator call trees
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

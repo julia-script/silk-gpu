@@ -1,0 +1,206 @@
+//! Times vector.filter primitives on a 512 x 512 source; bench/filters/WORKLOADS.md lists them.
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.system.filesystem { FileSystem, FileError, Path as FilePath }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.host_input_native { OsHostInput }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.collections.bytes { Bytes }
+import vector.geometry { Affine, Rect }
+import vector.path { Path }
+import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.filter as filtering
+import vector.filter {
+  Region, BlurPlan, ComponentTransfer, Convolution, Turbulence, TurbulenceSettings, Light, Lighting, transferGamma, colorMatrixOf,
+  displacementTable, SATURATE, MORPHOLOGY_DILATE, EDGE_DUPLICATE, LIGHT_POINT, CHANNEL_R, CHANNEL_G,
+}
+import vector.paint { Solid }
+import vector.paint as painting
+
+const SIZE: u32 = 512
+const PI: f64 = 3.141592653589793
+
+struct Random {
+  state: u64,
+}
+impl Random {
+  fn make() -> Random { return Random { state: 7 } }
+  fn next(self: &mut Self) -> f64 {
+    self.state = u64.wrappingAdd(u64.wrappingMultiply(self.state, 6364136223846793005), 1442695040888963407)
+    return u64.toF64(u64.shiftRight(self.state, 11)) / 9007199254740992.0
+  }
+  fn byte(self: &mut Self) -> u8 { return f64.toU8(f64.floor(self.next() * 255.0)) }
+}
+
+effect fn circle(path: &mut Path, cx: f64, cy: f64, r: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run path.circle(cx, cy, r)
+}
+
+fn nanos(start: &Instant, end: &Instant) -> i64 {
+  return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000 + SystemClock.nanoseconds(end) - SystemClock.nanoseconds(start)
+}
+
+effect fn save(fileName: string, bytes: &[u8]) -> () ! FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+  let snapshot = run unsafe NativeHostInput.environmentSnapshot()
+  let mut inputs = OsHostInput.make(move snapshot)
+  let cwd = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+  let mut system = run OsFileSystem.makeBytes(Bytes.asSlice(&cwd))
+  let root = run FilePath.root()
+  let path = run FilePath.join(&root, fileName)
+  run FileSystem.writeFile(&path, bytes) |> Effect.provideMut<FileSystem>(&mut system)
+}
+
+
+/// The source graphic: the vector bench's 300 random circles on a transparent canvas.
+effect fn source() -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+  let mut target = run Pixmap.make(SIZE, SIZE)
+  target.clear(Rgba8.make(0, 0, 0, 0))
+  let mut raster = Rasterizer.make()
+  let mut coverage = Coverage.make(SIZE, SIZE)
+  let mut path = Path.make()
+  let mut random = Random.make()
+  let id = Affine.identity()
+  let mut i: u32 = 0
+  while i < 300 {
+    let cx = 512.0 * random.next()
+    let cy = 512.0 * random.next()
+    let r = 4.0 + 60.0 * random.next()
+    let color = Rgba8.make(random.byte(), random.byte(), random.byte(), u32.toU8(128 + u8.toU32(random.byte()) / 2))
+    path.clear()
+    run circle(&mut path, cx, cy, r)
+    run raster.fill(&path, &id, NONZERO, &mut coverage)
+    painting.fill(&mut target, &coverage, &Solid.make(color), 255)
+    i = i + 1
+  }
+  return move target
+}
+
+const WORKLOADS: u32 = 9
+
+fn name(index: u32) -> string<'static> {
+  return match index {
+    0 => "blur4"
+    1 => "blur16"
+    2 => "saturate"
+    3 => "dilate3"
+    4 => "gamma"
+    5 => "sharpen"
+    6 => "turbulence"
+    7 => "lighting"
+    _ => "displace"
+  }
+}
+
+fn output(index: u32) -> string<'static> {
+  return match index {
+    0 => "vector-blur4.rgba"
+    1 => "vector-blur16.rgba"
+    2 => "vector-saturate.rgba"
+    3 => "vector-dilate3.rgba"
+    4 => "vector-gamma.rgba"
+    5 => "vector-sharpen.rgba"
+    6 => "vector-turbulence.rgba"
+    7 => "vector-lighting.rgba"
+    _ => "vector-displace.rgba"
+  }
+}
+
+/// Inputs prepared outside the timed region.
+struct Setup {
+  blur4: BlurPlan,
+  blur16: BlurPlan,
+  transfer: ComponentTransfer,
+  noise: Turbulence,
+  displacement: [i32; 256],
+}
+
+effect fn workload(index: u32, s: &Setup, input: &Pixmap, out: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let region = Region.make(0, 0, SIZE, SIZE)
+  if index == 0 {
+    run filtering.gaussianBlur(&mut out, input, &s.blur4, &s.blur4, region)
+  } else if index == 1 {
+    run filtering.gaussianBlur(&mut out, input, &s.blur16, &s.blur16, region)
+  } else if index == 2 {
+    let amount: [f32; 1] = [0.3]
+    filtering.colorMatrix(&mut out, input, colorMatrixOf(SATURATE, &amount), region)
+  } else if index == 3 {
+    run filtering.morphology(&mut out, input, MORPHOLOGY_DILATE, 3, 3, region)
+  } else if index == 4 {
+    filtering.componentTransfer(&mut out, input, &s.transfer, region)
+  } else if index == 5 {
+    let kernel: [f32; 9] = [0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0]
+    let k = Convolution { kernel: &kernel, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_DUPLICATE, preserveAlpha: false }
+    filtering.convolveMatrix(&mut out, input, &k, region)
+  } else if index == 6 {
+    let settings = TurbulenceSettings {
+      baseFrequencyX: 0.02, baseFrequencyY: 0.02, octaves: 4, fractalNoise: false, stitchTiles: false, tileX: 0.0, tileY: 0.0, tileWidth: 512.0, tileHeight: 512.0,
+    }
+    filtering.turbulence(&mut out, &s.noise, &settings, &Affine.identity(), region)
+  } else if index == 7 {
+    let light = Light {
+      kind: LIGHT_POINT, azimuth: 0.0, elevation: 0.0, x: 150.0, y: 120.0, z: 100.0, pointsAtX: 0.0, pointsAtY: 0.0, pointsAtZ: 0.0,
+      specularExponent: 1.0, limitingConeAngle: -1.0,
+    }
+    let lit = Lighting { specular: false, surfaceScale: 3.0, constant: 1.0, exponent: 1.0, color: Rgba8.make(255, 255, 255, 255), light: light }
+    filtering.lighting(&mut out, input, &lit, region)
+  } else {
+    filtering.displacementMap(&mut out, input, input, &s.displacement, CHANNEL_R, CHANNEL_G, region)
+  }
+}
+
+effect fn program() -> i32 ! OutOfMemoryError | FileError | HostInputError ? &mut Allocator | &mut MonotonicClock {
+  let frames: u32 = 15
+  let input = run source()
+  run save("vector-source.rgba", input.data())
+  let mut transfer = ComponentTransfer.identity()
+  transfer.r = transferGamma(1.0, 0.5, 0.0)
+  transfer.g = transferGamma(1.0, 0.5, 0.0)
+  transfer.b = transferGamma(1.0, 0.5, 0.0)
+  let setup = Setup {
+    blur4: run BlurPlan.make(4.0), blur16: run BlurPlan.make(16.0), transfer: move transfer, noise: run Turbulence.make(0.0),
+    displacement: displacementTable(20.0),
+  }
+  let mut out = run Pixmap.make(SIZE, SIZE)
+  let mut index: u32 = 0
+  while index < WORKLOADS {
+    let mut times = List<i64>.make()
+    let mut frame: u32 = 0
+    while frame < frames {
+      let start = run MonotonicClock.now()
+      run workload(index, &setup, &input, &mut out)
+      let end = run MonotonicClock.now()
+      run times.append(nanos(&start, &end))
+      frame = frame + 1
+    }
+    run times.sort()
+    let median = times.asSlice()[u32.toUsize(frames / 2)]
+    StderrWriter.print("{} {}\n", &(name(index), i64.toF64(median) / 1000000.0))
+    run save(output(index), out.data())
+    index = index + 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
