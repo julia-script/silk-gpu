@@ -138,7 +138,9 @@ without Dawn.
    go through a 256 x 256 table of `(alpha, channel)` so the GPU applies exactly the CPU's
    result. On the GPU each primitive is a full-target pass of `shaders/filter.wgsl` (blur takes
    one pass per box or kernel and ping-pongs through a scratch image); `blend.wgsl` holds the
-   blend math shared with `compose.wgsl`, and `scripts/embed-shaders` prepends it. The scene test
+   blend math shared with `compose.wgsl`, and `scripts/embed-shaders` prepends it.
+   `FilterRenderer` keeps one uniform (and table) buffer per pass and reuses them after
+   `reset()`, which the caller makes once the encoders holding the passes are submitted. The scene test
    runs every primitive, operator, blend mode and several blur sizes on both sides and matches
    byte for byte on lavapipe. Scene integration (filter commands in `Scene`) comes with the SVG
    renderer, which decides the filter graph and region.
@@ -219,5 +221,6 @@ and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the deta
   emits fewer alpha bytes than tile-aligned strips for thin shapes and keeps solid runs exact.
 - **f32 coverage, f64 geometry.** User-space math is f64 so large transforms keep precision;
   device-space lines, area accumulation and image sampling are f32 like the GPU.
-- **Antialiasing only by area.** No MSAA. `shape-rendering: crispEdges` can be served later by
-  snapping coverage to 0 or 255.
+- **Antialiasing by area.** No MSAA. `shape-rendering: crispEdges` uses
+  `Rasterizer.fillAliased`, which covers a pixel fully when its center is inside the path and
+  emits the same strips and fills, so paints, layers and the GPU take it unchanged.

@@ -5,7 +5,7 @@
 //! the primitive subregion and transparent black elsewhere. Inputs and outputs are canvas-sized
 //! [`FilterImage`]s, and an output must not also be an input of the same primitive.
 import webgpu.resources as gpu
-import webgpu.resources { Buffer, RenderPipeline, Texture, TextureView, Queue, CommandEncoder }
+import webgpu.resources { Buffer, BindGroupLayout, RenderPipeline, Texture, TextureView, Queue, CommandEncoder }
 import webgpu.runtime { Device, GpuError }
 import webgpu.descriptors {
   RenderPassColorAttachment, RenderPassDescriptor, VertexState, FragmentState, ColorTargetState, PrimitiveState,
@@ -25,7 +25,7 @@ import vector.filter { Region, BlurPlan, ComponentTransfer, Convolution, Turbule
 import vector.geometry { Affine }
 import silk.num.i64
 import silk.num.f64
-import renderer { FORMAT, extent, storage, entry, textureEntry, writeU32 }
+import renderer { FORMAT, extent, storage, upload, entry, textureEntry, writeU32 }
 import generated_shaders as shaders
 
 const OP_FLOOD: u32 = 0
@@ -47,6 +47,12 @@ const OP_LIGHTING: u32 = 15
 
 /// Bytes of the shader's `Params` uniform.
 const PARAMS_BYTES: usize = 144
+
+/// `data` codes of a pass that binds one of the renderer's fixed buffers; any other value is
+/// an index into `tables`.
+const DATA_EMPTY: u32 = 0xffffffff
+const DATA_TO_LINEAR: u32 = 0xfffffffe
+const DATA_TO_SRGB: u32 = 0xfffffffd
 
 /// A canvas-sized RGBA8 texture that filter primitives read and write.
 pub struct FilterImage {
@@ -81,6 +87,14 @@ impl FilterImage {
 
 pub struct FilterRenderer {
   pipeline: RenderPipeline,
+  layout: BindGroupLayout,
+  /// One `Params` uniform per pass recorded since the last [`FilterRenderer.reset`]: queue
+  /// writes land before any submitted pass runs, so passes in flight cannot share one.
+  params: List<Buffer>,
+  usedParams: usize,
+  /// Per-pass tables (blur weights, transfer tables, kernels, noise), reused the same way.
+  tables: List<Buffer>,
+  usedTables: usize,
   /// Bound where a pass reads no table or weights.
   empty: Buffer,
   toLinearTable: Buffer,
@@ -133,11 +147,20 @@ impl FilterRenderer {
     let srgb = run conversionTable(false)
     let toSrgbTable = run storage(device, queue, b"filter to srgb", srgb.asSlice(), flags.WGPUBufferUsage_Storage)
     let blank = run FilterImage.make(device, 1, 1)
-    return FilterRenderer { pipeline: move pipeline, empty: move empty, toLinearTable: move toLinearTable, toSrgbTable: move toSrgbTable, blank: move blank }
+    let layout = run pipeline.getBindGroupLayout(0)
+    return FilterRenderer { pipeline: move pipeline, layout: move layout, params: List<Buffer>.make(), usedParams: 0,
+      tables: List<Buffer>.make(), usedTables: 0, empty: move empty, toLinearTable: move toLinearTable, toSrgbTable: move toSrgbTable, blank: move blank }
+  }
+
+  /// Lets the next passes reuse the uniforms and tables of the passes recorded so far. Call it
+  /// once the encoders holding those passes are submitted; until then every pass keeps its own.
+  pub fn reset(self: &mut Self) -> () {
+    self.usedParams = 0
+    self.usedTables = 0
   }
 
   /// `feFlood`: `color` (straight alpha) times `opacity` over the region.
-  pub effect fn flood(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, color: Rgba8, opacity: u8, region: Region) -> () ! GpuError {
+  pub effect fn flood(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, color: Rgba8, opacity: u8, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let a = div255(u8.toU32(color.a) * u8.toU32(opacity))
     let c = Rgba8.make(color.r, color.g, color.b, u32.toU8(a)).premultiply()
     let mut params = header(OP_FLOOD, 0, 0, 0, clamped(region, out))
@@ -145,56 +168,56 @@ impl FilterRenderer {
     writeU32(&mut params, 36, u8.toU32(c.g))
     writeU32(&mut params, 40, u8.toU32(c.b))
     writeU32(&mut params, 44, u8.toU32(c.a))
-    run self.pass(device, queue, &mut encoder, out, &params, &self.blank, &self.blank, &self.empty)
+    run self.passBlank(device, queue, &mut encoder, out, &params, DATA_EMPTY)
   }
 
   /// `feOffset` by whole device pixels.
-  pub effect fn offset(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, dx: i32, dy: i32, region: Region) -> () ! GpuError {
+  pub effect fn offset(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, dx: i32, dy: i32, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let params = header(OP_OFFSET, i32.wrappingToU32(dx), i32.wrappingToU32(dy), 0, clamped(region, out))
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, DATA_EMPTY)
   }
 
   /// Copies `input` inside the region; transparent elsewhere.
-  pub effect fn copy(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, region: Region) -> () ! GpuError {
+  pub effect fn copy(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     run self.offset(device, queue, &mut encoder, out, input, 0, 0, region)
   }
 
   /// One `feMerge` step: `input` source-over `below` inside the region, `below` elsewhere (the
   /// CPU's in-place `mergeOver` with `below` as the pixmap before the call).
-  pub effect fn mergeOver(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, below: &FilterImage, input: &FilterImage, region: Region) -> () ! GpuError {
+  pub effect fn mergeOver(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, below: &FilterImage, input: &FilterImage, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let params = header(OP_MERGE, 0, 0, 0, clamped(region, out))
-    run self.pass(device, queue, &mut encoder, out, &params, below, input, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, below, input, DATA_EMPTY)
   }
 
   /// `feComposite` of `input` with `backdrop`; `k` holds k1..k4 for the arithmetic operator.
-  pub effect fn composite(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, backdrop: &FilterImage, operator: u8, k: [f32; 4], region: Region) -> () ! GpuError {
+  pub effect fn composite(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, backdrop: &FilterImage, operator: u8, k: [f32; 4], region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let mut params = header(OP_COMPOSITE, u8.toU32(operator), 0, 0, clamped(region, out))
     writeF32(&mut params, 48, k[0])
     writeF32(&mut params, 52, k[1])
     writeF32(&mut params, 56, k[2])
     writeF32(&mut params, 60, k[3])
-    run self.pass(device, queue, &mut encoder, out, &params, input, backdrop, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, input, backdrop, DATA_EMPTY)
   }
 
   /// `feBlend` of `input` onto `backdrop` with a `vector.layer` BLEND_ mode.
-  pub effect fn blend(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, backdrop: &FilterImage, mode: u8, region: Region) -> () ! GpuError {
+  pub effect fn blend(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, backdrop: &FilterImage, mode: u8, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let params = header(OP_BLEND, u8.toU32(mode), 0, 0, clamped(region, out))
-    run self.pass(device, queue, &mut encoder, out, &params, input, backdrop, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, input, backdrop, DATA_EMPTY)
   }
 
   /// `feColorMatrix` with a matrix from `vector.filter.colorMatrixOf`.
-  pub effect fn colorMatrix(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, m: [f32; 20], region: Region) -> () ! GpuError {
+  pub effect fn colorMatrix(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, m: [f32; 20], region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let mut params = header(OP_MATRIX, 0, 0, 0, clamped(region, out))
     let mut i: usize = 0
     while i < 20 {
       writeF32(&mut params, 64 + i * 4, m[i])
       i = i + 1
     }
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, DATA_EMPTY)
   }
 
   /// `feGaussianBlur` with per-axis plans; `scratch` holds intermediate passes.
-  pub effect fn gaussianBlur(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+  pub effect fn gaussianBlur(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
     horizontal: &BlurPlan, vertical: &BlurPlan, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let r = clamped(region, out)
     // Passes alternate between `out` and `scratch`; `source` 0 is the input, 1 out, 2 scratch.
@@ -208,14 +231,14 @@ impl FilterRenderer {
     }
   }
 
-  effect fn blurAxis(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+  effect fn blurAxis(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
     plan: &BlurPlan, axis: u32, region: Region, start: u32) -> u32 ! GpuError | OutOfMemoryError ? &mut Allocator {
     let mut source = start
     let boxes = plan.boxPasses()
     let mut p: usize = 0
     while p < boxes.length {
       let params = header(OP_BOX, axis, boxes[p], boxes[p + 1], region)
-      source = run self.blurPass(device, queue, &mut encoder, out, input, scratch, &params, &self.empty, source)
+      source = run self.blurPass(device, queue, &mut encoder, out, input, scratch, &params, DATA_EMPTY, source)
       p = p + 2
     }
     let weights = plan.kernel()
@@ -228,16 +251,16 @@ impl FilterRenderer {
         writeU32(&mut bytes, i * 4, weights[i])
         i = i + 1
       }
-      let buffer = run storage(device, queue, b"filter blur weights", packed.asSlice(), flags.WGPUBufferUsage_Storage)
+      let table = run self.stageTable(device, queue, b"filter blur weights", packed.asSlice())
       let params = header(OP_KERNEL, axis, usize.toU32(weights.length), 0, region)
-      source = run self.blurPass(device, queue, &mut encoder, out, input, scratch, &params, &buffer, source)
+      source = run self.blurPass(device, queue, &mut encoder, out, input, scratch, &params, table, source)
     }
     return source
   }
 
   /// One blur pass from the current source into the other of `out` and `scratch`.
-  effect fn blurPass(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
-    params: &[u8; 144], data: &Buffer, source: u32) -> u32 ! GpuError {
+  effect fn blurPass(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+    params: &[u8; 144], data: u32, source: u32) -> u32 ! GpuError | OutOfMemoryError ? &mut Allocator {
     if source == 1 {
       run self.pass(device, queue, &mut encoder, scratch, params, out, out, data)
       return 2
@@ -249,22 +272,22 @@ impl FilterRenderer {
 
   /// `feMorphology` (`vector.filter` MORPHOLOGY_ operator) with radii in device pixels: a row
   /// pass into `scratch`, then a column pass.
-  pub effect fn morphology(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
-    operator: u8, rx: u32, ry: u32, region: Region) -> () ! GpuError {
+  pub effect fn morphology(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, scratch: &FilterImage,
+    operator: u8, rx: u32, ry: u32, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let r = clamped(region, out)
     if rx == 0 || ry == 0 {
       run self.copy(device, queue, &mut encoder, out, input, r)
       return
     }
     let rows = header(OP_MORPHOLOGY, 1, rx, u8.toU32(operator), r)
-    run self.pass(device, queue, &mut encoder, scratch, &rows, input, input, &self.empty)
+    run self.pass(device, queue, &mut encoder, scratch, &rows, input, input, DATA_EMPTY)
     let columns = header(OP_MORPHOLOGY, 0, ry, u8.toU32(operator), r)
-    run self.pass(device, queue, &mut encoder, out, &columns, scratch, scratch, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &columns, scratch, scratch, DATA_EMPTY)
   }
 
   /// `feComponentTransfer` with `transfer`'s tables.
-  pub effect fn componentTransfer(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
-    transfer: &ComponentTransfer, region: Region) -> () ! GpuError {
+  pub effect fn componentTransfer(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
+    transfer: &ComponentTransfer, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let mut tables: [u8; 1024] = [0; 1024]
     let mut i: usize = 0
     while i < 256 {
@@ -274,24 +297,24 @@ impl FilterRenderer {
       tables[768 + i] = transfer.a[i]
       i = i + 1
     }
-    let buffer = run storage(device, queue, b"filter transfer", &tables, flags.WGPUBufferUsage_Storage)
+    let table = run self.stageTable(device, queue, b"filter transfer", &tables)
     let params = header(OP_TRANSFER, 0, 0, 0, clamped(region, out))
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &buffer)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, table)
   }
 
   /// `feTile`: repeats the `source` rectangle of `input` across the region.
-  pub effect fn tile(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, source: Region, region: Region) -> () ! GpuError {
+  pub effect fn tile(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, source: Region, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let t = source.clampTo(input.width, input.height)
     let mut params = header(OP_TILE, 0, 0, 0, clamped(region, out))
     writeU32(&mut params, 32, t.x0)
     writeU32(&mut params, 36, t.y0)
     writeU32(&mut params, 40, t.x1)
     writeU32(&mut params, 44, t.y1)
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, DATA_EMPTY)
   }
 
   /// `feConvolveMatrix`; the region is also the input's extent for the edge mode.
-  pub effect fn convolveMatrix(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
+  pub effect fn convolveMatrix(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
     convolution: &Convolution, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let r = clamped(region, out)
     let count = u32.toUsize(convolution.orderX * convolution.orderY)
@@ -307,34 +330,34 @@ impl FilterRenderer {
       writeF32(&mut bytes, i * 4, convolution.kernel[i])
       i = i + 1
     }
-    let buffer = run storage(device, queue, b"filter kernel", packed.asSlice(), flags.WGPUBufferUsage_Storage)
+    let table = run self.stageTable(device, queue, b"filter kernel", packed.asSlice())
     let preserve: u32 = if convolution.preserveAlpha { 256 } else { 0 }
     let mut params = header(OP_CONVOLVE, convolution.orderX, convolution.orderY, u8.toU32(convolution.edgeMode) | preserve, r)
     writeU32(&mut params, 32, convolution.targetX)
     writeU32(&mut params, 36, convolution.targetY)
     writeF32(&mut params, 48, convolution.divisor)
     writeF32(&mut params, 52, convolution.bias)
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &buffer)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, table)
   }
 
   /// `feDisplacementMap` with a table from `vector.filter.displacementTable` and CHANNEL_
   /// selectors.
-  pub effect fn displacementMap(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, map: &FilterImage,
-    table: &[i32; 256], xChannel: u8, yChannel: u8, region: Region) -> () ! GpuError {
+  pub effect fn displacementMap(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage, map: &FilterImage,
+    table: &[i32; 256], xChannel: u8, yChannel: u8, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let mut packed: [u8; 1024] = [0; 1024]
     let mut i: usize = 0
     while i < 256 {
       writeU32(&mut packed, i * 4, i32.wrappingToU32(table[i]))
       i = i + 1
     }
-    let buffer = run storage(device, queue, b"filter displacement", &packed, flags.WGPUBufferUsage_Storage)
+    let table = run self.stageTable(device, queue, b"filter displacement", &packed)
     let params = header(OP_DISPLACE, u8.toU32(xChannel), u8.toU32(yChannel), 0, clamped(region, out))
-    run self.pass(device, queue, &mut encoder, out, &params, input, map, &buffer)
+    run self.pass(device, queue, &mut encoder, out, &params, input, map, table)
   }
 
   /// `feTurbulence` from `noise`'s tables, computed in f32; `toUser` maps device pixels to
   /// user space.
-  pub effect fn turbulence(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, noise: &Turbulence,
+  pub effect fn turbulence(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, noise: &Turbulence,
     settings: &TurbulenceSettings, toUser: &Affine, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let lattice = noise.lattice()
     let gradients = noise.gradients()
@@ -351,7 +374,7 @@ impl FilterRenderer {
       writeF32(&mut bytes, (lattice.length + i) * 4, f64.toF32(gradients[i]))
       i = i + 1
     }
-    let buffer = run storage(device, queue, b"filter noise", packed.asSlice(), flags.WGPUBufferUsage_Storage)
+    let table = run self.stageTable(device, queue, b"filter noise", packed.asSlice())
     let stitch = stitchOf(settings)
     let mut flagBits: u32 = if settings.fractalNoise { 1 } else { 0 }
     if stitch.enabled { flagBits = flagBits | 2 }
@@ -368,12 +391,12 @@ impl FilterRenderer {
     writeF32(&mut params, 76, f64.toF32(toUser.d))
     writeF32(&mut params, 80, f64.toF32(toUser.e))
     writeF32(&mut params, 84, f64.toF32(toUser.f))
-    run self.pass(device, queue, &mut encoder, out, &params, &self.blank, &self.blank, &buffer)
+    run self.passBlank(device, queue, &mut encoder, out, &params, table)
   }
 
   /// `feDiffuseLighting` or `feSpecularLighting` with `input`'s alpha as the bump map.
-  pub effect fn lighting(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
-    lighting: &Lighting, region: Region) -> () ! GpuError {
+  pub effect fn lighting(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
+    lighting: &Lighting, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let setup = lightingSetupOf(lighting)
     let specular: u32 = if lighting.specular { 1 } else { 0 }
     let mut params = header(OP_LIGHTING, specular | u32.shiftLeft(u8.toU32(setup.kind), 8), 0, 0, clamped(region, out))
@@ -390,26 +413,52 @@ impl FilterRenderer {
       i = i + 1
     }
     writeF32(&mut params, 76, setup.spotExponent)
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, DATA_EMPTY)
   }
 
   /// Converts the whole of `input` to linear light (`color-interpolation-filters: linearRGB`).
-  pub effect fn toLinear(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage) -> () ! GpuError {
+  pub effect fn toLinear(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let params = header(OP_CONVERT, 0, 0, 0, Region.make(0, 0, out.width, out.height))
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.toLinearTable)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, DATA_TO_LINEAR)
   }
 
   /// Converts the whole of `input` from linear light back to sRGB.
-  pub effect fn toSrgb(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage) -> () ! GpuError {
+  pub effect fn toSrgb(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
     let params = header(OP_CONVERT, 0, 0, 0, Region.make(0, 0, out.width, out.height))
-    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.toSrgbTable)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, DATA_TO_SRGB)
   }
 
-  effect fn pass(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, params: &[u8; 144], first: &FilterImage, second: &FilterImage, data: &Buffer) -> () ! GpuError {
-    let uniform = run storage(device, queue, b"filter params", params, flags.WGPUBufferUsage_Uniform)
-    let layout = run self.pipeline.getBindGroupLayout(0)
-    let entries = [entry(0, &uniform), textureEntry(1, &first.view), textureEntry(2, &second.view), entry(3, data)]
-    let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+  effect fn pass(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, params: &[u8; 144], first: &FilterImage, second: &FilterImage, data: u32)
+    -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let slot = run self.stageParams(device, queue, params)
+    run self.record(device, &mut encoder, out, slot, first, second, data)
+  }
+
+  /// A pass that reads no image.
+  effect fn passBlank(self: &mut Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, params: &[u8; 144], data: u32)
+    -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let slot = run self.stageParams(device, queue, params)
+    run self.record(device, &mut encoder, out, slot, &self.blank, &self.blank, data)
+  }
+
+  effect fn stageParams(self: &mut Self, device: &Device, queue: &Queue, params: &[u8; 144]) -> usize ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let slot = self.usedParams
+    run upload(device, queue, &mut self.params, slot, b"filter params", params, flags.WGPUBufferUsage_Uniform)
+    self.usedParams = slot + 1
+    return slot
+  }
+
+  effect fn stageTable(self: &mut Self, device: &Device, queue: &Queue, label: &[u8], bytes: &[u8]) -> u32 ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let slot = self.usedTables
+    run upload(device, queue, &mut self.tables, slot, label, bytes, flags.WGPUBufferUsage_Storage)
+    self.usedTables = slot + 1
+    return usize.toU32(slot)
+  }
+
+  effect fn record(self: &Self, device: &Device, encoder: &mut CommandEncoder, out: &FilterImage, slot: usize, first: &FilterImage, second: &FilterImage, data: u32) -> () ! GpuError {
+    let table = if data == DATA_EMPTY { &self.empty } else if data == DATA_TO_LINEAR { &self.toLinearTable } else if data == DATA_TO_SRGB { &self.toSrgbTable } else { &self.tables.asSlice()[u32.toUsize(data)] }
+    let entries = [entry(0, &self.params.asSlice()[slot]), textureEntry(1, &first.view), textureEntry(2, &second.view), entry(3, table)]
+    let groupDescriptor = BindGroupDescriptor.default().withLayout(&self.layout).withEntries(&entries)
     let group = run gpu.createBindGroup(device, &groupDescriptor)
     let mut color = RenderPassColorAttachment.default().withView(&out.view)
     color.setLoadOp(flags.WGPULoadOp_Clear)

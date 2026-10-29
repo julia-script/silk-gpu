@@ -142,7 +142,7 @@ pub effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8]
 /// Writes `bytes` into buffer `index` of `slots`, replacing it with a bigger one (or appending
 /// it, when `index` is `slots.length()`) if it is too small. Shaders bound to these buffers
 /// read only the lengths the scene header gives, so a larger buffer is harmless.
-effect fn upload(device: &Device, queue: &Queue, slots: &mut List<Buffer>, index: usize, label: &[u8], bytes: &[u8], usage: u64)
+pub effect fn upload(device: &Device, queue: &Queue, slots: &mut List<Buffer>, index: usize, label: &[u8], bytes: &[u8], usage: u64)
   -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
   if index < slots.length() {
     let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
