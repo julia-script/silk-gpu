@@ -18,6 +18,8 @@ const wasm = await readFile(resolve(options.get('--wasm')));
 const manifestPath = resolve(options.get('--fixtures'));
 const fixtures = JSON.parse(await readFile(manifestPath, 'utf8'));
 const require = createRequire(import.meta.url);
+// [DEBUG-linux-canvas] Capture Chromium's GPU-process stderr for hosted diagnosis.
+process.env.DEBUG = [process.env.DEBUG, 'pw:browser'].filter(Boolean).join(',');
 let chromium;
 try { ({ chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')); }
 catch (error) { throw new Error('An existing Playwright installation is required (set PLAYWRIGHT_MODULE to its installed absolute module path); do not run playwright install', { cause: error }); }
@@ -95,10 +97,14 @@ try {
     executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined, args: [
     '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan',
     '--disable-vulkan-surface', '--enable-unsafe-swiftshader',
+    '--enable-logging=stderr',
   ] });
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  page.on('console', message => {
+    if (message.type() === 'error' || message.type() === 'warning') console.error(`[Chromium ${message.type()}] ${message.text()}`);
+  });
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const results = await page.evaluate(async ({ indices, timeout }) => {
     const { runSamples } = await import('/browser/runner.ts');
