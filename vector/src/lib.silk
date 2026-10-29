@@ -6,3 +6,4 @@ import strips
 import pixmap
 import stroke
 import paint
+import layer
