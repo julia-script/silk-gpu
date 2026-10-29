@@ -20,6 +20,7 @@ def run(command):
 
 for generator in ("generate", "generate-browser", "embed-shaders"):
     run([sys.executable, ROOT / "scripts" / generator, "--check"])
+run([sys.executable, "-m", "unittest", "discover", "-s", "tests/pixels", "-p", "test_*.py"])
 compiler_bin = command_path("install-silk")
 os.environ["SILK_CLANG"] = str(command_path("install-llvm"))
 run([compiler_bin / "silkc", "check", "--workspace", "--stdlib", compiler_bin.parent / "lib/silk/stdlib"])

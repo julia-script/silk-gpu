@@ -5,6 +5,7 @@ import platform
 import subprocess
 import tomllib
 import hashlib
+import shutil
 
 from _install import ROOT, CACHE
 
@@ -37,6 +38,34 @@ def callback_archive(clang, dawn):
         temporary.replace(archive)
         object_path.unlink()
     return archive
+
+
+def darwin_linker(clang):
+    """Keep LLVM's Mach-O driver name through Silk's executable realpath resolution."""
+    candidates = (clang.parent / "ld64.lld", Path("/opt/homebrew/opt/lld/bin/ld64.lld"),
+                  Path("/usr/local/opt/lld/bin/ld64.lld"))
+    source = next((path.resolve() for path in candidates if path.is_file()), None)
+    if source is None:
+        raise RuntimeError("Native macOS builds require LLVM 22 ld64.lld (install lld alongside clang)")
+    identity = repr((str(source), source.stat().st_size, source.stat().st_mtime_ns))
+    directory = CACHE / "linker" / hashlib.sha256(identity.encode()).hexdigest()[:20]
+    binary_directory = directory / "bin"
+    binary_directory.mkdir(parents=True, exist_ok=True)
+    # Homebrew LLD uses @executable_path/../lib; preserve that relative layout.
+    libraries = source.parent.parent / "lib"
+    if libraries.is_dir() and not (directory / "lib").exists():
+        (directory / "lib").symlink_to(libraries, target_is_directory=True)
+    linker = binary_directory / "ld64.lld"
+    if not linker.exists():
+        temporary = binary_directory / f"ld64.lld-{os.getpid()}"
+        # A symlink resolves to generic `lld`, which cannot infer Mach-O flavor.
+        # Copy the unmodified published executable; never patch compiler or linker.
+        shutil.copy2(source, temporary)
+        temporary.replace(linker)
+    version = subprocess.check_output([str(linker), "--version"], text=True)
+    if not version.startswith(("LLD 22.", "Homebrew LLD 22.")):
+        raise RuntimeError(f"Expected LLVM 22 Mach-O linker, found {version.strip()}")
+    return linker
 
 
 def build(package_path, release=False, extra_links=(), target=None):
@@ -99,8 +128,10 @@ def build(package_path, release=False, extra_links=(), target=None):
         lines.extend(["", "[native]", "link = [", ",\n".join(staged_links), "]"])
         if platform.system() == "Darwin":
             sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
-            linker = subprocess.check_output(["xcrun", "--find", "ld"], text=True).strip()
-            lines.append('platform-supply = { kind = "explicit", target = "aarch64-apple-darwin", root = ' + quoted(sdk) + ', linker = ' + quoted(linker) + ', origin = "active Xcode SDK" }')
+            # Apple ld promotes per-object Silk personalities to compact unwind
+            # and exceeds its three-personality limit. LLVM preserves DWARF FDEs.
+            linker = darwin_linker(clang)
+            lines.append('platform-supply = { kind = "explicit", target = "aarch64-apple-darwin", root = ' + quoted(sdk) + ', linker = ' + quoted(linker) + ', origin = "active Xcode SDK with LLVM 22 Mach-O linker" }')
     staged_manifest = stage / "silk.toml"
     staged_manifest.write_text("\n".join(lines) + "\n")
     command = [str(compiler_bin / "silkc"), "build", "--manifest-path", str(staged_manifest), "--stdlib", str(stdlib), "--clang", str(clang)]

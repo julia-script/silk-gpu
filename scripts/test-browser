@@ -3,5 +3,6 @@
 import subprocess
 from _build import ROOT, build
 
+subprocess.run(["node", "--test", str(ROOT / "browser/host.test.mjs")], cwd=ROOT, check=True, timeout=60)
 binary = build(ROOT / "examples", target="wasm32-unknown-unknown")
 subprocess.run(["node", str(ROOT / "browser/test.mjs"), "--wasm", str(binary), "--fixtures", str(ROOT / "browser/fixtures.json")], cwd=ROOT, check=True, timeout=180)
