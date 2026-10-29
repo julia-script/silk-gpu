@@ -27,7 +27,7 @@ import silk.simd.i32x4
 import silk.simd.f32x4
 import silk.num.usize
 import strips { minU32 }
-import pixmap { Pixmap, Rgba8, div255, truncateToU8, truncateF64ToU8, truncateToI64 }
+import pixmap { Pixmap, Rgba8, div255 }
 import layer as layering
 import geometry { Affine, Point }
 
@@ -310,7 +310,7 @@ pub fn matrixPixel(c: Rgba8, m: [f32; 20]) -> Rgba8 with Intrinsic.inlineAlways(
 fn clamp01(v: f32) -> f32 with Intrinsic.inlineAlways() { return f32.min(f32.max(v, 0.0), 1.0) }
 /// `floor(v * 255 + 0.5)` for `v` in `0 ..= 1`, where the floor is the conversion's truncation
 /// (x86-64's baseline has no SSE4.1 round, so an explicit floor is a dozen instructions).
-fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() { return truncateToU8(v * 255.0 + 0.5) }
+fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() { return f32.toU8(v * 255.0 + 0.5) }
 
 /// The passes of an `feGaussianBlur` along one axis with standard deviation `sigma` (device
 /// pixels): three box blurs for `sigma >= 2` as the spec prescribes, else one kernel of
@@ -851,7 +851,7 @@ impl ComponentTransfer {
 }
 
 /// The conversion truncates, which is the floor for these non-negative values.
-fn transferByte(v: f64) -> u8 with Intrinsic.inlineAlways() { return truncateF64ToU8(f64.min(f64.max(v, 0.0), 1.0) * 255.0 + 0.5) }
+fn transferByte(v: f64) -> u8 with Intrinsic.inlineAlways() { return f64.toU8(f64.min(f64.max(v, 0.0), 1.0) * 255.0 + 0.5) }
 
 /// `type="identity"`.
 pub fn transferIdentity() -> [u8; 256] {
@@ -1344,11 +1344,11 @@ impl Turbulence {
     // The conversion truncates, and converting back is exact, so these are the spec's
     // `(int)t` and `t - (int)t` without a separate trunc.
     let tx = vx + i64.toF64(PERLIN_N)
-    let mut bx0 = truncateToI64(tx)
+    let mut bx0 = f64.toI64(tx)
     let rx0 = tx - i64.toF64(bx0)
     let rx1 = rx0 - 1.0
     let ty = vy + i64.toF64(PERLIN_N)
-    let mut by0 = truncateToI64(ty)
+    let mut by0 = f64.toI64(ty)
     let ry0 = ty - i64.toF64(by0)
     let ry1 = ry0 - 1.0
     // Compared before masking (resvg and browsers do; SVG 1.1's listing masks first, which
