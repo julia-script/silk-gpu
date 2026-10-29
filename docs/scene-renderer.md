@@ -165,20 +165,20 @@ reduce it if it matters for real content.
 
 `scripts/bench-filters` (same schedule) runs nine filter primitives of
 `bench/filters/WORKLOADS.md` with `vector.filter` and with resvg 0.45.1 on a 512 x 512 source.
-First run (2026-10-29, x86_64 container, release builds; resvg's times exclude drawing the source,
-and repeat runs vary by about 20%):
+Latest run (2026-10-29, x86_64 container, release builds; resvg's times exclude drawing the
+source, and repeat runs vary by about 20%). The first run's times are in parentheses:
 
 | Filter | vector ms | resvg ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| blur4 | 19.7 | 32.4 | 0.61x | 3.0% |
-| blur16 | 19.8 | 31.9 | 0.62x | 11% |
-| saturate | 13.6 | 7.4 | 1.83x | 0% |
-| dilate3 | 24.0 | 29.0 | 0.83x | 11% |
-| gamma | 2.7 | 28.3 | 0.10x | 0% |
-| sharpen | 48.3 | 17.1 | 2.83x | 0% |
-| turbulence | 116.7 | 76.9 | 1.52x | 0% |
-| lighting | 17.7 | 10.6 | 1.67x | 0% |
-| displace | 6.5 | 6.6 | 0.99x | 96% |
+| blur4 | 19.4 (19.7) | 30.4 | 0.64x | 3.0% |
+| blur16 | 19.7 (19.8) | 29.0 | 0.68x | 11% |
+| saturate | 3.3 (13.6) | 10.0 | 0.33x | 0% |
+| dilate3 | 24.6 (24.0) | 30.3 | 0.81x | 11% |
+| gamma | 2.5 (2.7) | 29.6 | 0.08x | 0% |
+| sharpen | 14.3 (48.3) | 21.6 | 0.66x | 0% |
+| turbulence | 50.4 (116.7) | 73.9 | 0.68x | 0% |
+| lighting | 14.2 (17.7) | 10.4 | 1.36x | 0% |
+| displace | 2.0 (6.5) | 10.3 | 0.20x | 96% |
 
 Image differences on blur, dilate and displace are resvg's choices (its box sizes, a `2 r` window
 and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the details.

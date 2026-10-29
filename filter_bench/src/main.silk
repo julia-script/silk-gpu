@@ -143,7 +143,7 @@ effect fn workload(index: u32, s: &Setup, input: &Pixmap, out: &mut Pixmap) -> (
   } else if index == 5 {
     let kernel: [f32; 9] = [0.0, -1.0, 0.0, -1.0, 5.0, -1.0, 0.0, -1.0, 0.0]
     let k = Convolution { kernel: &kernel, orderX: 3, orderY: 3, divisor: 1.0, bias: 0.0, targetX: 1, targetY: 1, edgeMode: EDGE_DUPLICATE, preserveAlpha: false }
-    filtering.convolveMatrix(&mut out, input, &k, region)
+    run filtering.convolveMatrix(&mut out, input, &k, region)
   } else if index == 6 {
     let settings = TurbulenceSettings {
       baseFrequencyX: 0.02, baseFrequencyY: 0.02, octaves: 4, fractalNoise: false, stitchTiles: false, tileX: 0.0, tileY: 0.0, tileWidth: 512.0, tileHeight: 512.0,

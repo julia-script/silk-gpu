@@ -253,17 +253,22 @@ fn convolve(pixel: vec2u) -> vec4u {
       let c = edgePixel(i32(pixel.x) - i32(params.color.x) + i32(j), i32(pixel.y) - i32(params.color.y) + i32(i), edgeMode);
       let w = bitcast<f32>(data[(orderY - i - 1u) * orderX + (orderX - j - 1u)]);
       if preserveAlpha {
-        sr = sr + w * f32(unpremultiplyByte(c.x, c.w)) / 255.0;
-        sg = sg + w * f32(unpremultiplyByte(c.y, c.w)) / 255.0;
-        sb = sb + w * f32(unpremultiplyByte(c.z, c.w)) / 255.0;
+        sr = sr + w * f32(unpremultiplyByte(c.x, c.w));
+        sg = sg + w * f32(unpremultiplyByte(c.y, c.w));
+        sb = sb + w * f32(unpremultiplyByte(c.z, c.w));
       } else {
-        sr = sr + w * f32(c.x) / 255.0;
-        sg = sg + w * f32(c.y) / 255.0;
-        sb = sb + w * f32(c.z) / 255.0;
-        sa = sa + w * f32(c.w) / 255.0;
+        sr = sr + w * f32(c.x);
+        sg = sg + w * f32(c.y);
+        sb = sb + w * f32(c.z);
+        sa = sa + w * f32(c.w);
       }
     }
   }
+  // Sums are of weights times bytes; they scale to 0..=1 once, as on the CPU.
+  sr = sr / 255.0;
+  sg = sg / 255.0;
+  sb = sb / 255.0;
+  sa = sa / 255.0;
   if preserveAlpha {
     let a = bytes(first, pixel).w;
     return vec4u(div255(byte(clamp01(sr / divisor + bias)) * a), div255(byte(clamp01(sg / divisor + bias)) * a),
@@ -368,9 +373,13 @@ fn turbulence(pixel: vec2u) -> vec4u {
 }
 
 // feDiffuseLighting and feSpecularLighting: p0 bit 0 specular, bits 8.. the light kind; k the
-// surface scale, constant, exponent and cone cosine; color the lighting color; m[0] the distant
-// direction and spot exponent, m[1] the position, m[2] the spot direction.
-fn alphaAt(x: u32, y: u32) -> f32 { return f32(bytes(first, vec2u(x, y)).w) / 255.0; }
+// surface scale, constant, exponent and cone cosine; m[0] the distant direction and spot
+// exponent, m[1] the position, m[2] the spot direction, m[3] the lighting color on 0..=1.
+fn alphaAt(x: u32, y: u32) -> i32 { return i32(bytes(first, vec2u(x, y)).w); }
+
+fn normalComponent(sum: i32, span: u32, weight: i32, surfaceScale: f32) -> f32 {
+  return 0.0 - surfaceScale * 2.0 / (f32(i32(span) * weight) * 255.0) * f32(sum);
+}
 
 fn surfaceNormal(x: u32, y: u32, surfaceScale: f32) -> vec2f {
   let r = params.region;
@@ -384,31 +393,31 @@ fn surfaceNormal(x: u32, y: u32, surfaceScale: f32) -> vec2f {
   if y + 1u < r.w { bottom = y + 1u; }
   var nx = 0.0;
   if right > left {
-    var weight = 2.0;
-    var sum = 2.0 * (alphaAt(right, y) - alphaAt(left, y));
+    var weight = 2;
+    var sum = 2 * (alphaAt(right, y) - alphaAt(left, y));
     if top < y {
       sum = sum + (alphaAt(right, top) - alphaAt(left, top));
-      weight = weight + 1.0;
+      weight = weight + 1;
     }
     if bottom > y {
       sum = sum + (alphaAt(right, bottom) - alphaAt(left, bottom));
-      weight = weight + 1.0;
+      weight = weight + 1;
     }
-    nx = 0.0 - surfaceScale * 2.0 / (f32(right - left) * weight) * sum;
+    nx = normalComponent(sum, right - left, weight, surfaceScale);
   }
   var ny = 0.0;
   if bottom > top {
-    var weight = 2.0;
-    var sum = 2.0 * (alphaAt(x, bottom) - alphaAt(x, top));
+    var weight = 2;
+    var sum = 2 * (alphaAt(x, bottom) - alphaAt(x, top));
     if left < x {
       sum = sum + (alphaAt(left, bottom) - alphaAt(left, top));
-      weight = weight + 1.0;
+      weight = weight + 1;
     }
     if right > x {
       sum = sum + (alphaAt(right, bottom) - alphaAt(right, top));
-      weight = weight + 1.0;
+      weight = weight + 1;
     }
-    ny = 0.0 - surfaceScale * 2.0 / (f32(bottom - top) * weight) * sum;
+    ny = normalComponent(sum, bottom - top, weight, surfaceScale);
   }
   return vec2f(nx, ny);
 }
@@ -424,14 +433,17 @@ fn lighting(pixel: vec2u) -> vec4u {
   let kind = params.p0 >> 8u;
   let surfaceScale = params.k.x;
   let n = surfaceNormal(pixel.x, pixel.y, surfaceScale);
-  let z = surfaceScale * alphaAt(pixel.x, pixel.y);
+  let z = surfaceScale * f32(alphaAt(pixel.x, pixel.y)) / 255.0;
   let m = params.m;
   let nLength = sqrt(n.x * n.x + n.y * n.y + 1.0);
   var l = m[0].xyz;
   if kind != 0u {
     l = m[1].xyz - vec3f(f32(pixel.x), f32(pixel.y), z);
     let length = sqrt(l.x * l.x + l.y * l.y + l.z * l.z);
-    if length > 0.0 { l = l / length; }
+    if length > 0.0 {
+      let inverse = 1.0 / length;
+      l = l * inverse;
+    }
   }
   var scale = 1.0;
   if kind == 2u {
@@ -451,10 +463,9 @@ fn lighting(pixel: vec2u) -> vec4u {
     factor = params.k.y * max(nDotL, 0.0);
   }
   let k = factor * scale;
-  let color = params.color;
-  let r = clamp01(k * f32(color.x) / 255.0);
-  let g = clamp01(k * f32(color.y) / 255.0);
-  let b = clamp01(k * f32(color.z) / 255.0);
+  let r = clamp01(k * m[3].x);
+  let g = clamp01(k * m[3].y);
+  let b = clamp01(k * m[3].z);
   if !specular { return vec4u(byte(r), byte(g), byte(b), 255u); }
   let a = byte(max(r, max(g, b)));
   return vec4u(div255(byte(r) * a), div255(byte(g) * a), div255(byte(b) * a), a);
