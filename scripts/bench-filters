@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Time vector.filter against resvg's filters on the workloads of bench/filters/WORKLOADS.md.
+
+Not part of the PR gate: it builds resvg with cargo and takes a minute or two.
+"""
+import subprocess
+
+from _build import ROOT, build
+
+OUT = ROOT / ".cache" / "bench" / "filters"
+NAMES = ("blur4", "blur16", "saturate", "dilate3", "gamma", "sharpen", "turbulence", "lighting", "displace")
+
+
+def timings(command):
+    completed = subprocess.run([str(c) for c in command], cwd=OUT, check=True, capture_output=True, text=True, timeout=900)
+    result = {}
+    for line in completed.stderr.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            result[parts[0]] = float(parts[1])
+    return result
+
+
+def difference(name):
+    a = (OUT / f"vector-{name}.rgba").read_bytes()
+    b = (OUT / f"resvg-{name}.rgba").read_bytes()
+    deltas = [abs(x - y) for x, y in zip(a, b)]
+    pixels = len(a) // 4
+    over = sum(1 for i in range(pixels) if max(deltas[i * 4:i * 4 + 4]) > 8)
+    return sum(deltas) / len(deltas), max(deltas), over / pixels
+
+
+OUT.mkdir(parents=True, exist_ok=True)
+silk = build(ROOT / "filter_bench", release=True)
+crate = ROOT / "bench" / "filters" / "resvg"
+subprocess.run(["cargo", "build", "--release", "--quiet", "--manifest-path", str(crate / "Cargo.toml"),
+                "--target-dir", str(ROOT / ".cache" / "bench" / "filters-rust")], check=True)
+rust = ROOT / ".cache" / "bench" / "filters-rust" / "release" / "filter-bench-resvg"
+ours = timings([silk])
+theirs = timings([rust, 15])
+print(f"{'filter':<11} {'vector ms':>10} {'resvg ms':>9} {'ratio':>7}   image: mean |d|  max |d|  pixels > 8")
+for name in NAMES:
+    mean, worst, share = difference(name)
+    ratio = ours[name] / theirs[name] if theirs[name] > 0 else float('inf')
+    print(f"{name:<11} {ours[name]:>10.3f} {theirs[name]:>9.3f} {ratio:>6.2f}x   {mean:>13.3f} {worst:>8} {share:>10.2%}")
+print(f"(resvg times exclude its {theirs['baseline']:.3f} ms baseline draw of the source image)")

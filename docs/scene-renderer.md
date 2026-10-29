@@ -161,6 +161,28 @@ are approximate. tiny-skia supersamples four sub-scanlines and is closer there. 
 overlaps only touch the few pixels where two boundaries cross. Accumulating per sub-row would
 reduce it if it matters for real content.
 
+### Filters
+
+`scripts/bench-filters` (same schedule) runs nine filter primitives of
+`bench/filters/WORKLOADS.md` with `vector.filter` and with resvg 0.45.1 on a 512 x 512 source.
+First run (2026-10-29, x86_64 container, release builds; resvg's times exclude drawing the source,
+and repeat runs vary by about 20%):
+
+| Filter | vector ms | resvg ms | ratio | pixels differing by more than 8 |
+| --- | ---: | ---: | ---: | ---: |
+| blur4 | 19.7 | 32.4 | 0.61x | 3.0% |
+| blur16 | 19.8 | 31.9 | 0.62x | 11% |
+| saturate | 13.6 | 7.4 | 1.83x | 0% |
+| dilate3 | 24.0 | 29.0 | 0.83x | 11% |
+| gamma | 2.7 | 28.3 | 0.10x | 0% |
+| sharpen | 48.3 | 17.1 | 2.83x | 0% |
+| turbulence | 116.7 | 76.9 | 1.52x | 0% |
+| lighting | 17.7 | 10.6 | 1.67x | 0% |
+| displace | 6.5 | 6.6 | 0.99x | 96% |
+
+Image differences on blur, dilate and displace are resvg's choices (its box sizes, a `2 r` window
+and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the details.
+
 ## Choices
 
 - **Coverage on the CPU.** Flattening and coverage are branchy and data dependent; they are cheap
