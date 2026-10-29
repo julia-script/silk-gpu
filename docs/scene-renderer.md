@@ -98,6 +98,26 @@ without Dawn.
 | 5 | `gpu_scene`: strip and fill instances, paint shaders in WGSL, layer stack with offscreen targets | GPU output equals the CPU pixmap with 0 differing pixels on lavapipe |
 | 6 | Filter primitives the SVG renderer needs, then benchmarks against tiny-skia and vello_cpu | Scheduled benchmark job, not PR CI |
 
+## Benchmarks
+
+`scripts/bench-vector` (scheduled weekly in the benchmarks workflow, not in PR CI) renders the
+four scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
+frame time of each, and compares the two images. First run (2026-10-29, x86_64 container, release
+builds, 512 x 512):
+
+| Scene | vector ms | tiny-skia ms | ratio | pixels differing by more than 8 |
+| --- | ---: | ---: | ---: | ---: |
+| fills (300 translucent circles) | 21.9 | 10.0 | 2.20x | 2.3% |
+| strokes (150 round-joined stars) | 10.8 | 8.1 | 1.33x | 3.2% |
+| gradients (100 linear and radial rects) | 19.1 | 5.1 | 3.75x | 0.0% |
+| polygon (4000 edges, even-odd) | 12.6 | 23.6 | 0.54x | 30% |
+
+The polygon difference is a known limit of area accumulation: the winding is clamped (nonzero)
+or folded (even-odd) per pixel after integrating, so pixels crossed by several edges of one path
+are approximate. tiny-skia supersamples four sub-scanlines and is closer there. Ordinary
+overlaps only touch the few pixels where two boundaries cross. Accumulating per sub-row would
+reduce it if it matters for real content.
+
 ## Choices
 
 - **Coverage on the CPU.** Flattening and coverage are branchy and data dependent; they are cheap

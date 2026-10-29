@@ -1,0 +1,224 @@
+//! CPU benchmark for `vector`; the workloads are described in bench/vector/WORKLOADS.md.
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.u64
+import silk.num.i64
+import silk.num.usize
+import silk.system.monotonic_clock { MonotonicClock }
+import silk.system.monotonic_clock_native { OsMonotonicClock }
+import silk.system.system_clock { Instant, SystemClock }
+import silk.system.filesystem { FileSystem, FileError, Path as FilePath }
+import silk.system.filesystem_native { OsFileSystem }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.system.host_input_native { OsHostInput }
+import silk.platform.native.host_input { NativeHostInput }
+import silk.collections.bytes { Bytes }
+import vector.geometry { Affine, Rect }
+import vector.path { Path }
+import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
+import vector.stroke { Stroke, Stroker, JOIN_ROUND, CAP_BUTT }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.paint { Gradient, Stop, Solid, SPREAD_PAD }
+import vector.paint as painting
+
+const SIZE: u32 = 512
+const PI: f64 = 3.141592653589793
+
+struct Random {
+  state: u64,
+}
+impl Random {
+  fn make() -> Random { return Random { state: 7 } }
+  fn next(self: &mut Self) -> f64 {
+    self.state = u64.wrappingAdd(u64.wrappingMultiply(self.state, 6364136223846793005), 1442695040888963407)
+    return u64.toF64(u64.shiftRight(self.state, 11)) / 9007199254740992.0
+  }
+  fn byte(self: &mut Self) -> u8 { return f64.toU8(f64.floor(self.next() * 255.0)) }
+}
+
+struct Renderer {
+  raster: Rasterizer,
+  stroker: Stroker,
+  coverage: Coverage,
+  path: Path,
+  outline: Path,
+}
+
+effect fn circle(path: &mut Path, cx: f64, cy: f64, r: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run path.circle(cx, cy, r)
+}
+
+effect fn star(path: &mut Path, cx: f64, cy: f64, outer: f64, inner: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut i: u32 = 0
+  while i < 10 {
+    let angle = u32.toF64(i) * PI / 5.0 - PI / 2.0
+    let r = if i % 2 == 0 { outer } else { inner }
+    if i == 0 { run path.moveTo(cx + r * f64.cos(angle), cy + r * f64.sin(angle)) } else { run path.lineTo(cx + r * f64.cos(angle), cy + r * f64.sin(angle)) }
+    i = i + 1
+  }
+  run path.close()
+}
+
+effect fn fills(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut random = Random.make()
+  let id = Affine.identity()
+  let mut i: u32 = 0
+  while i < 300 {
+    let cx = random.next() * 512.0
+    let cy = random.next() * 512.0
+    let radius = 4.0 + random.next() * 60.0
+    let color = Rgba8.make(random.byte(), random.byte(), random.byte(), f64.toU8(f64.floor(128.0 + 127.0 * random.next())))
+    r.path.clear()
+    run circle(&mut r.path, cx, cy, radius)
+    run r.raster.fill(&r.path, &id, NONZERO, &mut r.coverage)
+    painting.fill(&mut target, &r.coverage, &Solid.make(color), 255)
+    i = i + 1
+  }
+}
+
+effect fn strokes(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut random = Random.make()
+  let id = Affine.identity()
+  let mut i: u32 = 0
+  while i < 150 {
+    let cx = random.next() * 512.0
+    let cy = random.next() * 512.0
+    let outer = 10.0 + random.next() * 50.0
+    let mut style = Stroke.make(1.0 + random.next() * 6.0)
+    style.join = JOIN_ROUND
+    style.cap = CAP_BUTT
+    let color = Rgba8.make(random.byte(), random.byte(), random.byte(), 255)
+    r.path.clear()
+    run star(&mut r.path, cx, cy, outer, outer * 0.4)
+    r.outline.clear()
+    run r.stroker.stroke(&r.path, &style, &id, &mut r.outline)
+    run r.raster.fill(&r.outline, &id, NONZERO, &mut r.coverage)
+    painting.fill(&mut target, &r.coverage, &Solid.make(color), 255)
+    i = i + 1
+  }
+}
+
+effect fn gradients(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut random = Random.make()
+  let id = Affine.identity()
+  let mut i: u32 = 0
+  while i < 100 {
+    let x = random.next() * 462.0
+    let y = random.next() * 462.0
+    let w = 10.0 + random.next() * 90.0
+    let h = 10.0 + random.next() * 90.0
+    let stops = [
+      Stop { offset: 0.0, color: Rgba8.make(random.byte(), random.byte(), random.byte(), 255) },
+      Stop { offset: 0.5, color: Rgba8.make(random.byte(), random.byte(), random.byte(), 255) },
+      Stop { offset: 1.0, color: Rgba8.make(random.byte(), random.byte(), random.byte(), 255) },
+    ]
+    let mut gradient = if i % 2 == 0 {
+      Gradient.linear(x, y, x + w, y + h, SPREAD_PAD, &id)
+    } else {
+      Gradient.radial(x + w * 0.5, y + h * 0.5, f64.max(w, h) * 0.5, x + w * 0.5, y + h * 0.5, 0.0, SPREAD_PAD, &id)
+    }
+    run gradient.setStops(&stops)
+    r.path.clear()
+    run r.path.rect(Rect.make(x, y, w, h))
+    run r.raster.fill(&r.path, &id, NONZERO, &mut r.coverage)
+    painting.fill(&mut target, &r.coverage, &gradient, 255)
+    i = i + 1
+  }
+}
+
+effect fn polygon(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut random = Random.make()
+  r.path.clear()
+  let mut i: u32 = 0
+  while i < 4000 {
+    let angle = 2.0 * PI * u32.toF64(i) / 4000.0 * 37.0
+    let radius = 30.0 + 220.0 * random.next()
+    let x = 256.0 + radius * f64.cos(angle)
+    let y = 256.0 + radius * f64.sin(angle)
+    if i == 0 { run r.path.moveTo(x, y) } else { run r.path.lineTo(x, y) }
+    i = i + 1
+  }
+  run r.path.close()
+  run r.raster.fill(&r.path, &Affine.identity(), EVENODD, &mut r.coverage)
+  painting.fill(&mut target, &r.coverage, &Solid.make(Rgba8.make(20, 40, 160, 255)), 255)
+}
+
+fn nanos(start: &Instant, end: &Instant) -> i64 {
+  return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000 + SystemClock.nanoseconds(end) - SystemClock.nanoseconds(start)
+}
+
+effect fn scene(r: &mut Renderer, target: &mut Pixmap, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  target.clear(Rgba8.make(255, 255, 255, 255))
+  if index == 0 { run fills(&mut r, &mut target) }
+  else if index == 1 { run strokes(&mut r, &mut target) }
+  else if index == 2 { run gradients(&mut r, &mut target) }
+  else { run polygon(&mut r, &mut target) }
+}
+
+fn name(index: u32) -> string<'static> {
+  return match index {
+    0 => "fills"
+    1 => "strokes"
+    2 => "gradients"
+    _ => "polygon"
+  }
+}
+
+fn output(index: u32) -> string<'static> {
+  return match index {
+    0 => "vector-fills.rgba"
+    1 => "vector-strokes.rgba"
+    2 => "vector-gradients.rgba"
+    _ => "vector-polygon.rgba"
+  }
+}
+
+effect fn save(fileName: string, bytes: &[u8]) -> () ! FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+  let snapshot = run unsafe NativeHostInput.environmentSnapshot()
+  let mut inputs = OsHostInput.make(move snapshot)
+  let cwd = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+  let mut system = run OsFileSystem.makeBytes(Bytes.asSlice(&cwd))
+  let root = run FilePath.root()
+  let path = run FilePath.join(&root, fileName)
+  run FileSystem.writeFile(&path, bytes) |> Effect.provideMut<FileSystem>(&mut system)
+}
+
+effect fn program() -> i32 ! OutOfMemoryError | FileError | HostInputError ? &mut Allocator | &mut MonotonicClock {
+  let frames: u32 = 20
+  let mut r = Renderer { raster: Rasterizer.make(), stroker: Stroker.make(), coverage: Coverage.make(SIZE, SIZE), path: Path.make(), outline: Path.make() }
+  let mut target = run Pixmap.make(SIZE, SIZE)
+  let mut index: u32 = 0
+  while index < 4 {
+    let mut times = List<i64>.make()
+    let mut frame: u32 = 0
+    while frame < frames {
+      let start = run MonotonicClock.now()
+      run scene(&mut r, &mut target, index)
+      let end = run MonotonicClock.now()
+      run times.append(nanos(&start, &end))
+      frame = frame + 1
+    }
+    run times.sort()
+    let median = times.asSlice()[u32.toUsize(frames / 2)]
+    StderrWriter.print("{} {}\n", &(name(index), i64.toF64(median) / 1000000.0))
+    run save(output(index), target.data())
+    index = index + 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
