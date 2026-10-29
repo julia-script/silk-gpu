@@ -11,8 +11,17 @@ import path { Path }
 import strips { Rasterizer, Coverage, NONZERO }
 import pixmap { Pixmap, Rgba8 }
 import paint {
-  Gradient, Stop, Solid, ImagePattern, SPREAD_PAD, SPREAD_REFLECT, SPREAD_REPEAT,
-  SAMPLE_NEAREST, SAMPLE_BILINEAR, EXTEND_CLAMP, EXTEND_REPEAT,
+  Gradient,
+  Stop,
+  Solid,
+  ImagePattern,
+  SPREAD_PAD,
+  SPREAD_REFLECT,
+  SPREAD_REPEAT,
+  SAMPLE_NEAREST,
+  SAMPLE_BILINEAR,
+  EXTEND_CLAMP,
+  EXTEND_REPEAT,
 }
 import paint as painting
 import paint { Shader }
@@ -36,8 +45,15 @@ effect fn canvas(width: u32, height: u32) -> Coverage
   return move coverage
 }
 
-effect fn blackToWhite(g: &mut Gradient) -> () ! OutOfMemoryError ? &mut Allocator {
-  run g.setStops(&[Stop { offset: 0.0, color: Rgba8.make(0, 0, 0, 255) }, Stop { offset: 1.0, color: Rgba8.make(255, 255, 255, 255) }])
+effect fn blackToWhite(g: &mut Gradient) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run g.setStops(
+    &[
+      Stop { offset: 0.0, color: Rgba8.make(0, 0, 0, 255) },
+      Stop { offset: 1.0, color: Rgba8.make(255, 255, 255, 255) },
+    ],
+  )
 }
 
 test effect fn linearGradientInterpolates() -> ()
@@ -52,7 +68,9 @@ test effect fn linearGradientInterpolates() -> ()
   let mut x: u32 = 0
   while x < 64 {
     let expected = f64.toU8(f64.floor((u32.toF64(x) + 0.5) / 64.0 * 255.0 + 0.5))
-    if !close(target.pixel(x, 2).r, expected, 1) || target.pixel(x, 2).a != 255 { ok = false }
+    if !close(target.pixel(x, 2).r, expected, 1) || target.pixel(x, 2).a != 255 {
+      ok = false
+    }
     x = x + 1
   }
   run Testing.expect(ok, "every column within 1 of the exact ramp")
@@ -62,6 +80,7 @@ test effect fn spreadModesExtendTheRamp() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(40, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+
   // The vector covers x 0..16; pixel 19 (center 19.5) is at t = 1.21875.
   let mut pad = Gradient.linear(0.0, 0.0, 16.0, 0.0, SPREAD_PAD, &Affine.identity())
   let mut reflect = Gradient.linear(0.0, 0.0, 16.0, 0.0, SPREAD_REFLECT, &Affine.identity())
@@ -84,52 +103,81 @@ test effect fn radialGradientUsesFocalCircle() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut centered = Gradient.radial(32.0, 32.0, 20.0, 32.0, 32.0, 0.0, SPREAD_PAD, &Affine.identity())
+  let mut centered = Gradient.radial(
+    32.0,
+    32.0,
+    20.0,
+    32.0,
+    32.0,
+    0.0,
+    SPREAD_PAD,
+    &Affine.identity(),
+  )
   run blackToWhite(&mut centered) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut a = run Pixmap.make(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut a, &c, &centered, 255)
+
   // Pixel (41, 31) has its center 9.5 from (32, 32) horizontally and 0.5 vertically.
   let t = f64.sqrt(9.5 * 9.5 + 0.25) / 20.0
-  run Testing.expect(close(a.pixel(41, 31).r, f64.toU8(f64.floor(t * 255.0 + 0.5)), 1), "distance / r")
+  run Testing.expect(
+    close(a.pixel(41, 31).r, f64.toU8(f64.floor(t * 255.0 + 0.5)), 1),
+    "distance / r",
+  )
   run Testing.expect(a.pixel(60, 32).r == 255 && a.pixel(32, 32).r < 10, "pad outside, dark center")
+
   // Focal point at (22, 32): the parameter is 0 there and 1 on the end circle.
   let mut focal = Gradient.radial(32.0, 32.0, 20.0, 22.0, 32.0, 0.0, SPREAD_PAD, &Affine.identity())
   run blackToWhite(&mut focal) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut b = run Pixmap.make(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut b, &c, &focal, 255)
-  run Testing.expect(b.pixel(21, 31).r < 20 && close(b.pixel(51, 31).r, 251, 6), "focal dark, far edge light")
+  run Testing.expect(
+    b.pixel(21, 31).r < 20 && close(b.pixel(51, 31).r, 251, 6),
+    "focal dark, far edge light",
+  )
 }
 
 test effect fn radialConeLeavesOutsideTransparent() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
+
   // A focal circle wholly outside the end circle makes a cone opening to the right.
   let mut cone = Gradient.radial(40.0, 32.0, 8.0, 8.0, 32.0, 2.0, SPREAD_PAD, &Affine.identity())
   run blackToWhite(&mut cone) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut a = run Pixmap.make(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut a, &c, &cone, 255)
-  run Testing.expect(a.pixel(20, 2).a == 0 && a.pixel(20, 32).a == 255, "outside the cone stays transparent")
+  run Testing.expect(
+    a.pixel(20, 2).a == 0 && a.pixel(20, 32).a == 255,
+    "outside the cone stays transparent",
+  )
 }
 
 test effect fn stopsAreFixedUpAndDegenerateVectorsUseLastStop() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(32, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+
   // The second offset 0.2 is raised to 0.5: a hard edge from red to green at x = 16.
   let stops = [
-    Stop { offset: 0.5, color: Rgba8.make(255, 0, 0, 255) }, Stop { offset: 0.2, color: Rgba8.make(0, 255, 0, 255) },
+    Stop { offset: 0.5, color: Rgba8.make(255, 0, 0, 255) },
+    Stop { offset: 0.2, color: Rgba8.make(0, 255, 0, 255) },
   ]
   let mut hard = Gradient.linear(0.0, 0.0, 32.0, 0.0, SPREAD_PAD, &Affine.identity())
   run hard.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut a = run Pixmap.make(32, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut a, &c, &hard, 255)
-  run Testing.expect(a.pixel(15, 0).r == 255 && a.pixel(16, 0).g == 255, "hard edge at the fixed-up offset")
+  run Testing.expect(
+    a.pixel(15, 0).r == 255 && a.pixel(16, 0).g == 255,
+    "hard edge at the fixed-up offset",
+  )
   let mut point = Gradient.linear(5.0, 5.0, 5.0, 5.0, SPREAD_PAD, &Affine.identity())
   run point.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut b = run Pixmap.make(32, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut b, &c, &point, 255)
-  run Testing.expect(b.pixel(0, 0).g == 255 && b.pixel(31, 3).g == 255, "zero-length vector paints the last stop")
+  run Testing.expect(
+    b.pixel(0, 0).g == 255 && b.pixel(31, 3).g == 255,
+    "zero-length vector paints the last stop",
+  )
   let empty = Gradient.linear(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &Affine.identity())
   run Testing.expect(!empty.isPaintable(), "no stops paints nothing")
 }
@@ -138,8 +186,12 @@ test effect fn interpolationSpaceIsSelectable() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(2, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+
   // Opaque red to transparent blue, sampled at t = 0.5 by a vector from -1 to 3.
-  let stops = [Stop { offset: 0.0, color: Rgba8.make(255, 0, 0, 255) }, Stop { offset: 1.0, color: Rgba8.make(0, 0, 255, 0) }]
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(255, 0, 0, 255) },
+    Stop { offset: 1.0, color: Rgba8.make(0, 0, 255, 0) },
+  ]
   let mut straight = Gradient.linear(-1.0, 0.0, 3.0, 0.0, SPREAD_PAD, &Affine.identity())
   run straight.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut premultiplied = Gradient.linear(-1.0, 0.0, 3.0, 0.0, SPREAD_PAD, &Affine.identity())
@@ -147,21 +199,31 @@ test effect fn interpolationSpaceIsSelectable() -> ()
   run premultiplied.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut a = run Pixmap.make(2, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut b = run Pixmap.make(2, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+
   // Pixel 0's center is at t = 0.375; pixel 1's at 0.625. Average them to probe t = 0.5.
   painting.fill(&mut a, &c, &straight, 255)
   painting.fill(&mut b, &c, &premultiplied, 255)
   let sa = a.pixel(1, 0)
   let pb = b.pixel(1, 0)
+
   // Straight: alpha 0.375, color (95.6, 0, 159.4) premultiplied by it -> (36, 0, 60, 96).
-  run Testing.expect(close(sa.r, 36, 1) && close(sa.b, 60, 1) && close(sa.a, 96, 1), "straight interpolation")
+  run Testing.expect(
+    close(sa.r, 36, 1) && close(sa.b, 60, 1) && close(sa.a, 96, 1),
+    "straight interpolation",
+  )
+
   // Premultiplied: red fades out with no blue at all.
-  run Testing.expect(close(pb.r, 96, 1) && pb.b == 0 && close(pb.a, 96, 1), "premultiplied interpolation")
+  run Testing.expect(
+    close(pb.r, 96, 1) && pb.b == 0 && close(pb.a, 96, 1),
+    "premultiplied interpolation",
+  )
 }
 
 test effect fn imagePatternsSampleAndTile() -> ()
   ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut bytes = List<u8>.make()
+
   // 2 x 1 image: black, white.
   let texels: [u8; 8] = [0, 0, 0, 255, 255, 255, 255, 255]
   run bytes.appendSlice(&texels) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -171,12 +233,20 @@ test effect fn imagePatternsSampleAndTile() -> ()
   let nearest = ImagePattern.make(&image, &scale, SAMPLE_NEAREST, EXTEND_REPEAT)
   let mut a = run Pixmap.make(8, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut a, &c, &nearest, 255)
-  run Testing.expect(a.pixel(1, 0).r == 0 && a.pixel(2, 0).r == 255 && a.pixel(5, 3).r == 0 && a.pixel(7, 2).r == 255, "nearest tiles")
+  run Testing.expect(
+    a.pixel(1, 0).r == 0 && a.pixel(2, 0).r == 255 && a.pixel(5, 3).r == 0
+      && a.pixel(7, 2).r == 255,
+    "nearest tiles",
+  )
   let smooth = ImagePattern.make(&image, &scale, SAMPLE_BILINEAR, EXTEND_CLAMP)
   let mut b = run Pixmap.make(8, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   painting.fill(&mut b, &c, &smooth, 255)
+
   // Pixel 2's center maps to image x 1.25: a quarter of the way from texel 0's center to texel 1's.
-  run Testing.expect(b.pixel(0, 0).r == 0 && close(b.pixel(2, 0).r, 191, 1) && b.pixel(7, 0).r == 255, "bilinear clamps at edges")
+  run Testing.expect(
+    b.pixel(0, 0).r == 0 && close(b.pixel(2, 0).r, 191, 1) && b.pixel(7, 0).r == 255,
+    "bilinear clamps at edges",
+  )
 }
 
 test effect fn opacityScalesCoverage() -> ()
@@ -192,10 +262,19 @@ test effect fn opacityScalesCoverage() -> ()
 struct Spanned {
   solid: Solid,
 }
+
 impl Shader for Spanned {
-  fn shade(self: &Self, x: u32, y: u32) -> Rgba8 { return self.solid.shade(x, y) }
-  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () { self.solid.shadeSpan(x, y, count, &mut out) }
-  fn isUniform(self: &Self) -> bool { return false }
+  fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
+    return self.solid.shade(x, y)
+  }
+
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    self.solid.shadeSpan(x, y, count, &mut out)
+  }
+
+  fn isUniform(self: &Self) -> bool {
+    return false
+  }
 }
 
 test effect fn uniformFillMatchesShadedSpans() -> ()
@@ -205,9 +284,11 @@ test effect fn uniformFillMatchesShadedSpans() -> ()
   run p.circle(20.3, 17.6, 13.2) |> Effect.provideMut<Allocator>(&mut allocator)
   run p.rect(Rect.make(30.5, 2.25, 9.5, 31.0)) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut raster = Rasterizer.make()
+
   // 37 rows: the last band is cut by the canvas.
   let mut coverage = Coverage.make(48, 37)
-  run raster.fill(&p, &Affine.identity(), NONZERO, &mut coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  run raster.fill(&p, &Affine.identity(), NONZERO, &mut coverage)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   let colors = [Rgba8.make(200, 40, 90, 255), Rgba8.make(10, 220, 130, 140), Rgba8.make(0, 0, 0, 0)]
   let opacities: [u8; 3] = [255, 97, 1]
   let mut ok = true
@@ -226,7 +307,9 @@ test effect fn uniformFillMatchesShadedSpans() -> ()
       let b = slow.data()
       let mut i: usize = 0
       while i < a.length {
-        if a[i] != b[i] { ok = false }
+        if a[i] != b[i] {
+          ok = false
+        }
         i = i + 1
       }
       o = o + 1
@@ -236,7 +319,8 @@ test effect fn uniformFillMatchesShadedSpans() -> ()
   run Testing.expect(ok, "uniform fills match span shading byte for byte")
 }
 
-test effect fn imageSpansMatchSinglePixels() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn imageSpansMatchSinglePixels() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut image = run Pixmap.make(5, 3) |> Effect.provideMut<Allocator>(&mut allocator)
   let d = image.dataMut()
@@ -263,7 +347,9 @@ test effect fn imageSpansMatchSinglePixels() -> () ! AssertionError<'static> | O
         pattern.shadeSpan(3, y, 23, &mut colors)
         let mut x: u32 = 0
         while x < 23 {
-          if colors[u32.toUsize(x)] != pack(pattern.shade(3 + x, y)) { ok = false }
+          if colors[u32.toUsize(x)] != pack(pattern.shade(3 + x, y)) {
+            ok = false
+          }
           x = x + 1
         }
         y = y + 1
@@ -273,4 +359,89 @@ test effect fn imageSpansMatchSinglePixels() -> () ! AssertionError<'static> | O
     t = t + 1
   }
   run Testing.expect(ok, "four-pixel image spans match single-pixel sampling")
+}
+
+// SVG 2 https://www.w3.org/TR/2018/CR-SVG2-20181004/painting.html#ColorInterpolationProperty
+// CSS Color 4 https://www.w3.org/TR/css-color-4/#color-conversion-code
+test effect fn linearRgbRampEncodesLightWithoutByteQuantization() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut g = Gradient.linear(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &Affine.identity())
+  g.setLinearRgbInterpolation(true)
+  run blackToWhite(&mut g) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    g.rampBytes()[512 * 4] == 188,
+    "linear-light half white encodes to sRGB 188, not 128",
+  )
+  let dark = [
+    Stop { offset: 0.0, color: Rgba8.make(1, 1, 1, 255) },
+    Stop { offset: 1.0, color: Rgba8.make(9, 9, 9, 255) },
+  ]
+  run g.setStops(&dark) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    g.rampBytes()[512 * 4] == 5,
+    "dark channels survive the full-precision transfer",
+  )
+  run Testing.expect(
+    g.rampBytes()[0] == 1 && g.rampBytes()[1023 * 4] == 9,
+    "encoded endpoints are unchanged",
+  )
+}
+
+// SVG 2 https://www.w3.org/TR/2018/CR-SVG2-20181004/pservers.html#StopNotes
+// CSS Images 3 https://www.w3.org/TR/css-images-3/#color-stop-syntax
+test effect fn linearRgbRampKeepsAlphaInterpolationIndependent() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(255, 0, 0, 255) },
+    Stop { offset: 1.0, color: Rgba8.make(0, 0, 255, 0) },
+  ]
+  let mut g = Gradient.linear(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &Affine.identity())
+  g.setLinearRgbInterpolation(true)
+  run g.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    g.rampBytes()[2048] == 94 && g.rampBytes()[2050] == 94 && g.rampBytes()[2051] == 127,
+    "straight interpolation retains transparent stop hue, then encodes and premultiplies",
+  )
+  g.setPremultipliedInterpolation(true)
+  run g.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    g.rampBytes()[2048] == 127 && g.rampBytes()[2050] == 0 && g.rampBytes()[2051] == 127,
+    "premultiplied linear interpolation excludes transparent stop hue",
+  )
+  run Testing.expect(
+    g.rampBytes()[4092] == 0 && g.rampBytes()[4094] == 0 && g.rampBytes()[4095] == 0,
+    "zero alpha is transparent black",
+  )
+}
+
+// SVG 2 https://www.w3.org/TR/2018/CR-SVG2-20181004/painting.html#ColorInterpolationProperty
+test effect fn explicitSrgbRampMatchesBothLegacyAlphaModes() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(17, 99, 220, 180) },
+    Stop { offset: 1.0, color: Rgba8.make(241, 5, 60, 13) },
+  ]
+  let mut mode: u32 = 0
+  while mode < 2 {
+    let mut original = Gradient.linear(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &Affine.identity())
+    let mut explicit = Gradient.linear(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &Affine.identity())
+    original.setPremultipliedInterpolation(mode != 0)
+    explicit.setPremultipliedInterpolation(mode != 0)
+    explicit.setLinearRgbInterpolation(true)
+    explicit.setLinearRgbInterpolation(false)
+    run original.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+    run explicit.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut i: usize = 0
+    while i < original.rampBytes().length {
+      run Testing.expect(
+        original.rampBytes()[i] == explicit.rampBytes()[i],
+        "disabling linearRGB preserves every legacy ramp byte",
+      )
+      i = i + 1
+    }
+    mode = mode + 1
+  }
 }

@@ -125,6 +125,10 @@ without Dawn.
    become a `Fill`, which carries no alphas. Every line is accumulated once into an area buffer
    covering the path's bounding box; each band then resolves only the columns a line touched (an
    untouched column repeats the one before it) and zeroes the cells it read for the next path.
+   `Coverage.binarize()` disables antialiasing by snapping alpha bytes below 128 to 0 and
+   bytes at or above 128 to 255. It is allocation-free and idempotent, preserving strip
+   indices, solid fills and the shared CPU/GPU alpha payload. This threshold is the library's
+   rendering-hint policy, not a claim that SVG prescribes a particular no-AA rasterization.
 6. **Paint and composite** (CPU: `vector.pixmap` and `vector.paint`; GPU: `gpu_scene`): each
    strip or fill is drawn with its paint, a `Shader` that returns the premultiplied color at a
    device pixel center. Paints carry one transform from their own space to device space (callers
@@ -136,7 +140,11 @@ without Dawn.
      non-decreasing; equal offsets give hard edges; a zero-length vector or zero radius paints
      the last stop. Colors are tabulated into a 1024-entry premultiplied ramp; interpolation is in
      straight alpha by default (resvg and Skia's SVG behaviour) or premultiplied (CSS Images 3).
-     Color-space choice (`color-interpolation: linearRGB`) is the caller's, by converting stops.
+     `Gradient.setLinearRgbInterpolation(true)` before `setStops` decodes straight sRGB stop
+     channels to linear light in f64, interpolates in the selected alpha mode, then encodes
+     back to sRGB and premultiplies. No intermediate linear RGBA8 quantization loses dark
+     channels. Both interpolation choices default to false; disabling linearRGB retains the
+     existing sRGB ramp bytes. The ramp stays the same sRGB RGBA8 payload on CPU and GPU.
    - Image patterns: nearest or bilinear sampling of a premultiplied pixmap, clamped (for
      `image`, clipped by its rectangle) or repeated (pattern tiles). Affine CPU sampling is f32
      with separately rounded operations on the inverse rounded to f32, four pixels per step.
@@ -150,9 +158,13 @@ without Dawn.
      WGSL. This shared rounding contract is necessary even with native strict math: implicit
      contraction otherwise changed one bilinear image channel by one byte.
    - Opacity (`fill-opacity`, `stroke-opacity`) scales the coverage mask.
-   The target is premultiplied RGBA8. Every blend uses the exact integer
+   The target is premultiplied RGBA8 in sRGB. The default source-over path uses exact integer
    `div255(x) = (x + 128 + ((x + 128) >> 8)) >> 8`, which equals `round(x / 255)` for all
-   products of two bytes, so CPU and GPU can agree byte for byte.
+   products of two bytes, so CPU and GPU can agree byte for byte. CPU `paint.fillLinearRgb`
+   instead decodes the shader and destination's straight sRGB channels, composites in f64
+   linear light, then encodes and premultiplies once at the output. Coverage and opacity retain
+   the existing byte-mask rounding contract; source alpha is scaled without quantizing source
+   color first. The shader interface and target storage do not change.
 
 7. **Layers** (`vector.layer`): a group that needs isolation (opacity below 1, a mask, a clip,
    a filter or a non-normal blend mode) is drawn into its own transparent pixmap and composited
@@ -162,6 +174,18 @@ without Dawn.
    paths become masks from coverage and intersect by multiplication; `mask` content becomes a
    mask from its alpha or its luminance (CSS Masking coefficients 0.2125, 0.7154, 0.0721 on
    premultiplied values). `fillClipped` draws a path through a clip without a layer.
+   CPU `compositeLinearRgb`, `compositeMaskedLinearRgb`, `compositeWithinLinearRgb`, and
+   `fillClippedLinearRgb` are explicit linear-light counterparts with identical arguments.
+   They operate on premultiplied sRGB RGBA8 inputs/output, reuse the existing f32 blend
+   functions on decoded straight channels, and use f64 transfer and compositing arithmetic
+   without linear-byte intermediate images or per-pixel allocation. Default entry points
+   retain their fast sRGB behavior. Shared transfer/scalar math lives in `vector.color_space`;
+   the existing filter conversion APIs still deliberately produce linear RGBA8 images.
+   These are **CPU compositing APIs only**: `gpu_scene` has no color-space selection on
+   draw/layer commands. Supporting linearRGB scene composition requires an explicit command
+   flag and a destination-reading composition pass; ordinary RGBA8Unorm fixed-function
+   source-over cannot implement it. Shared linearRGB gradient ramps and binary coverage
+   already use the existing GPU payloads without such changes.
 
 8. **GPU** (`gpu_scene`): a `Scene` records each coverage as runs (one instance per strip or fill:
    x, y, width, alpha word index or solid, paint index, opacity) plus the coverage alphas (one
@@ -306,5 +330,5 @@ and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the deta
   emits fewer alpha bytes than tile-aligned strips for thin shapes and keeps solid runs exact.
 - **f32 coverage, f64 geometry.** User-space math is f64 so large transforms keep precision;
   device-space lines, area accumulation and image sampling are f32 like the GPU.
-- **Antialiasing only by area.** No MSAA. `shape-rendering: crispEdges` can be served later by
-  snapping coverage to 0 or 255.
+- **Antialiasing by area or binary coverage.** No MSAA. Call `Coverage.binarize()` after
+  rasterization for rendering hints that disable AA, such as `shape-rendering: crispEdges`.

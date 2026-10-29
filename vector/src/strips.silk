@@ -29,7 +29,9 @@ import flatten { Line, TOLERANCE }
 import flatten as flattening
 
 pub const BAND: u32 = 4
+
 pub const NONZERO: u8 = 0
+
 pub const EVENODD: u8 = 1
 
 /// Partly covered columns `x .. x + width` of the band at row `y`; its alphas start at
@@ -40,6 +42,7 @@ pub struct Strip {
   pub width: u32,
   pub alphaOffset: u32,
 }
+
 impl Copy for Strip {}
 
 /// Fully covered columns `x .. x + width` of the band at row `y`, clipped to the canvas height.
@@ -48,6 +51,7 @@ pub struct Fill {
   pub y: u32,
   pub width: u32,
 }
+
 impl Copy for Fill {}
 
 /// The coverage of one path on a `width` x `height` canvas, in band order.
@@ -58,20 +62,59 @@ pub struct Coverage {
   fillList: List<Fill>,
   alphaList: List<u8>,
 }
+
 impl Coverage {
   pub fn make(width: u32, height: u32) -> Coverage {
-    return Coverage { canvasWidth: width, canvasHeight: height, stripList: List<Strip>.make(), fillList: List<Fill>.make(), alphaList: List<u8>.make() }
+    return Coverage {
+      canvasWidth: width,
+      canvasHeight: height,
+      stripList: List<Strip>.make(),
+      fillList: List<Fill>.make(),
+      alphaList: List<u8>.make(),
+    }
   }
-  pub fn width(self: &Self) -> u32 { return self.canvasWidth }
-  pub fn height(self: &Self) -> u32 { return self.canvasHeight }
-  pub fn strips(self: &Self) -> &[Strip] { return self.stripList.asSlice() }
-  pub fn fills(self: &Self) -> &[Fill] { return self.fillList.asSlice() }
-  pub fn alphas(self: &Self) -> &[u8] { return self.alphaList.asSlice() }
+
+  pub fn width(self: &Self) -> u32 {
+    return self.canvasWidth
+  }
+
+  pub fn height(self: &Self) -> u32 {
+    return self.canvasHeight
+  }
+
+  pub fn strips(self: &Self) -> &[Strip] {
+    return self.stripList.asSlice()
+  }
+
+  pub fn fills(self: &Self) -> &[Fill] {
+    return self.fillList.asSlice()
+  }
+
+  pub fn alphas(self: &Self) -> &[u8] {
+    return self.alphaList.asSlice()
+  }
+
   pub fn clear(self: &mut Self) -> () {
     self.stripList.clear()
     self.fillList.clear()
     self.alphaList.clear()
   }
+
+  /// Disable antialiasing by snapping coverage bytes below 128 to 0 and all others to 255.
+  /// Idempotent and allocation-free; strip offsets and solid fills remain valid on CPU/GPU.
+  pub fn binarize(self: &mut Self) -> () {
+    let alphas = self.alphaList.asMutSlice()
+    let mut i: usize = 0
+    while i < alphas.length {
+      alphas[i] = if alphas[i] < 128 {
+        0
+      } else {
+        255
+      }
+      i = i + 1
+    }
+  }
+
   /// The coverage of pixel `(x, y)` in 0..=255, for tests and debugging (linear scan).
   pub fn alphaAt(self: &Self, x: u32, y: u32) -> u8 {
     let band = y - y % BAND
@@ -89,7 +132,9 @@ impl Coverage {
     let mut j: usize = 0
     while j < fills.length {
       let fill = fills[j]
-      if fill.y == band && x >= fill.x && x < fill.x + fill.width { return 255 }
+      if fill.y == band && x >= fill.x && x < fill.x + fill.width {
+        return 255
+      }
       j = j + 1
     }
     return 0
@@ -118,21 +163,45 @@ fn lerpX(line: Line, x: f32) -> f32 {
   return line.y0 + (x - line.x0) * (line.y1 - line.y0) / (line.x1 - line.x0)
 }
 
-pub fn minU32(a: u32, b: u32) -> u32 { return if a < b { a } else { b } }
+pub fn minU32(a: u32, b: u32) -> u32 {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
 
 // LIMITATION-7 (silk-lang/silk#2566): `f32.min` and `f32.max` order NaNs and signed zeros with a
 // chain of branches. Lines here are finite, so plain selects (one `minss`/`maxss`) give the same
 // values.
-fn minF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() { return if a < b { a } else { b } }
-fn maxF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() { return if a > b { a } else { b } }
+fn minF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() {
+  return if a < b {
+    a
+  } else {
+    b
+  }
+}
 
-fn clampX(value: f32, low: f32, high: f32) -> f32 { return minF32(maxF32(value, low), high) }
+fn maxF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn clampX(value: f32, low: f32, high: f32) -> f32 {
+  return minF32(maxF32(value, low), high)
+}
 
 impl Rasterizer {
   pub fn make() -> Rasterizer {
     return Rasterizer {
-      lines: List<Line>.make(), clipped: List<Line>.make(),
-      area: List<f32>.make(), bandAlphas: List<u8>.make(), columnKinds: List<u8>.make(),
+      lines: List<Line>.make(),
+      clipped: List<Line>.make(),
+      area: List<f32>.make(),
+      bandAlphas: List<u8>.make(),
+      columnKinds: List<u8>.make(),
       touched: List<u8>.make(),
     }
   }
@@ -156,7 +225,8 @@ impl Rasterizer {
 
   /// Replaces `out` with the coverage of closed device-space `lines` (as [`flattening.fill`] makes).
   pub effect fn fillPolylines(self: &mut Self, lines: &[Line], rule: u8, out: &mut Coverage) -> ()
-    ! OutOfMemoryError ? &mut Allocator {
+    ! OutOfMemoryError
+    ? &mut Allocator {
     out.clear()
     self.lines.clear()
     run self.lines.appendSlice(lines)
@@ -164,9 +234,17 @@ impl Rasterizer {
   }
 
   effect fn pushClipped(self: &mut Self, line: Line, width: f32, bounds: &mut Bounds) -> ()
-    ! OutOfMemoryError ? &mut Allocator {
-    let clamped = Line { x0: clampX(line.x0, 0.0, width), y0: line.y0, x1: clampX(line.x1, 0.0, width), y1: line.y1 }
-    if clamped.y0 == clamped.y1 { return }
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let clamped = Line {
+      x0: clampX(line.x0, 0.0, width),
+      y0: line.y0,
+      x1: clampX(line.x1, 0.0, width),
+      y1: line.y1,
+    }
+    if clamped.y0 == clamped.y1 {
+      return
+    }
     bounds.x0 = minF32(bounds.x0, minF32(clamped.x0, clamped.x1))
     bounds.x1 = maxF32(bounds.x1, maxF32(clamped.x0, clamped.x1))
     bounds.y0 = minF32(bounds.y0, minF32(clamped.y0, clamped.y1))
@@ -175,8 +253,16 @@ impl Rasterizer {
   }
 
   /// Splits `line` where it crosses x = `edge`, so clamping each piece keeps visible winding.
-  effect fn splitAt(self: &mut Self, line: Line, edge: f32, next: f32, width: f32, bounds: &mut Bounds) -> ()
-    ! OutOfMemoryError ? &mut Allocator {
+  effect fn splitAt(
+    self: &mut Self,
+    line: Line,
+    edge: f32,
+    next: f32,
+    width: f32,
+    bounds: &mut Bounds,
+  ) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
     if (line.x0 < edge && line.x1 > edge) || (line.x0 > edge && line.x1 < edge) {
       let y = lerpX(line, edge)
       let first = Line { x0: line.x0, y0: line.y0, x1: edge, y1: y }
@@ -195,10 +281,14 @@ impl Rasterizer {
     }
   }
 
-  effect fn fillLines(self: &mut Self, rule: u8, out: &mut Coverage) -> () ! OutOfMemoryError ? &mut Allocator {
+  effect fn fillLines(self: &mut Self, rule: u8, out: &mut Coverage) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let canvasWidth = out.canvasWidth
     let canvasHeight = out.canvasHeight
-    if canvasWidth == 0 || canvasHeight == 0 { return }
+    if canvasWidth == 0 || canvasHeight == 0 {
+      return
+    }
     let widthF = u32.toF32(canvasWidth)
     let heightF = u32.toF32(canvasHeight)
     self.clipped.clear()
@@ -206,18 +296,23 @@ impl Rasterizer {
     let mut i: usize = 0
     while i < self.lines.length() {
       let line = self.lines.asSlice()[i]
+
       // Lines entirely above or below the canvas cover no visible row.
       if !(maxF32(line.y0, line.y1) <= 0.0 || minF32(line.y0, line.y1) >= heightF) {
         run self.splitAt(line, 0.0, widthF, widthF, &mut bounds)
       }
       i = i + 1
     }
-    if self.clipped.length() == 0 { return }
+    if self.clipped.length() == 0 {
+      return
+    }
     let bx0 = f32.toU32(f32.floor(bounds.x0))
     let bx1 = minU32(f32.toU32(f32.ceil(bounds.x1)), canvasWidth)
     let by0 = f32.toU32(f32.floor(maxF32(bounds.y0, 0.0)))
     let by1 = minU32(f32.toU32(f32.ceil(minF32(bounds.y1, heightF))), canvasHeight)
-    if bx0 >= bx1 || by0 >= by1 { return }
+    if bx0 >= bx1 || by0 >= by1 {
+      return
+    }
     let firstBand = by0 / BAND
     let bandCount = (by1 - 1) / BAND - firstBand + 1
 
@@ -225,25 +320,44 @@ impl Rasterizer {
     let stride = u32.toUsize(localWidth) + 2
     let top = firstBand * BAND
     let bandCells = stride * u32.toUsize(BAND)
+
     // The cells of every band at once. Both buffers are all zero between calls: resolving zeroes
     // what it reads, so only growth needs filling.
     let cells = bandCells * u32.toUsize(bandCount)
     let haveCells = self.area.length()
-    if haveCells < cells { run self.area.appendRepeated(0.0, cells - haveCells) }
+    if haveCells < cells {
+      run self.area.appendRepeated(0.0, cells - haveCells)
+    }
     let flags = stride * u32.toUsize(bandCount)
     let haveFlags = self.touched.length()
-    if haveFlags < flags { run self.touched.appendRepeated(0, flags - haveFlags) }
+    if haveFlags < flags {
+      run self.touched.appendRepeated(0, flags - haveFlags)
+    }
+
     // `resolve` writes every column's kind and every partial column's alphas before
     // `emitBand` reads them, so these only need to be long enough.
     let haveAlphas = self.bandAlphas.length()
-    if haveAlphas < u32.toUsize(localWidth * BAND) { run self.bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND) - haveAlphas) }
+    if haveAlphas < u32.toUsize(localWidth * BAND) {
+      run self.bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND) - haveAlphas)
+    }
     let haveKinds = self.columnKinds.length()
-    if haveKinds < u32.toUsize(localWidth) { run self.columnKinds.appendRepeated(0, u32.toUsize(localWidth) - haveKinds) }
+    if haveKinds < u32.toUsize(localWidth) {
+      run self.columnKinds.appendRepeated(0, u32.toUsize(localWidth) - haveKinds)
+    }
     let originX = u32.toF32(bx0)
     let lines = self.clipped.asSlice()
     let mut k: usize = 0
     while k < lines.length {
-      accumulate(self.area.asMutSlice(), self.touched.asMutSlice(), stride, lines[k], originX, u32.toF32(localWidth), top, by1)
+      accumulate(
+        self.area.asMutSlice(),
+        self.touched.asMutSlice(),
+        stride,
+        lines[k],
+        originX,
+        u32.toF32(localWidth),
+        top,
+        by1,
+      )
       k = k + 1
     }
     let mut band: u32 = 0
@@ -251,9 +365,24 @@ impl Rasterizer {
       let bandTop = top + band * BAND
       let rows = minU32(BAND, canvasHeight - bandTop)
       let at = u32.toUsize(band)
-      resolve(Slice.viewMut(self.area.asMutSlice(), at * bandCells, bandCells), Slice.viewMut(self.touched.asMutSlice(), at * stride, stride),
-        stride, localWidth, rows, rule, self.bandAlphas.asMutSlice(), self.columnKinds.asMutSlice())
-      run emitBand(self.bandAlphas.asSlice(), self.columnKinds.asSlice(), localWidth, bx0, bandTop, &mut out)
+      resolve(
+        Slice.viewMut(self.area.asMutSlice(), at * bandCells, bandCells),
+        Slice.viewMut(self.touched.asMutSlice(), at * stride, stride),
+        stride,
+        localWidth,
+        rows,
+        rule,
+        self.bandAlphas.asMutSlice(),
+        self.columnKinds.asMutSlice(),
+      )
+      run emitBand(
+        self.bandAlphas.asSlice(),
+        self.columnKinds.asSlice(),
+        localWidth,
+        bx0,
+        bandTop,
+        &mut out,
+      )
       band = band + 1
     }
   }
@@ -264,7 +393,16 @@ impl Rasterizer {
 /// `area[band * stride * BAND + c * BAND + (r - top) % BAND]` with `band = (r - top) / BAND`, in
 /// coordinates relative to `originX`, so a column's rows load as one vector. `touched` flags each
 /// column of each band that received area.
-fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, originX: f32, localWidth: f32, top: u32, bottom: u32) -> () {
+fn accumulate(
+  area: &mut [f32],
+  touched: &mut [u8],
+  stride: usize,
+  line: Line,
+  originX: f32,
+  localWidth: f32,
+  top: u32,
+  bottom: u32,
+) -> () {
   let mut dir: f32 = 1.0
   let mut ax = line.x0 - originX
   let mut ay = line.y0
@@ -280,12 +418,19 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
   let dxdy = (bx - ax) / (by - ay)
   let topF = u32.toF32(top)
   let bottomF = u32.toF32(bottom)
-  if by <= topF || ay >= bottomF { return }
+  if by <= topF || ay >= bottomF {
+    return
+  }
+
   // Both are in top ..= bottom, so the conversions need no check.
   let firstRow = Intrinsic.f32ToU32(maxF32(ay, topF))
   let lastBottom = minF32(by, bottomF)
   let lastTruncated = Intrinsic.f32ToU32(lastBottom)
-  let lastRow = if u32.toF32(lastTruncated) < lastBottom { lastTruncated + 1 } else { lastTruncated }
+  let lastRow = if u32.toF32(lastTruncated) < lastBottom {
+    lastTruncated + 1
+  } else {
+    lastTruncated
+  }
   let mut y = firstRow
   while y < lastRow {
     let rowTop = maxF32(u32.toF32(y), ay)
@@ -299,6 +444,7 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
     let flags = Slice.viewMut(&mut touched, band * stride, stride)
     let x0 = minF32(xa, xb)
     let x1 = maxF32(xa, xb)
+
     // x0 and x1 are in 0 ..= localWidth, so truncating is the floor, and converting back is
     // exact (silk-lang/silk#2561: f32.floor and ceil are software). Through u32, which converts
     // in one instruction where usize needs the unsigned 64-bit sequence.
@@ -306,7 +452,11 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
     let x0i = u32.toUsize(x0u)
     let x0floor = u32.toF32(x0u)
     let x1t = Intrinsic.f32ToU32(x1)
-    let x1u = if u32.toF32(x1t) < x1 { x1t + 1 } else { x1t }
+    let x1u = if u32.toF32(x1t) < x1 {
+      x1t + 1
+    } else {
+      x1t
+    }
     let x1i = u32.toUsize(x1u)
     let x1ceil = u32.toF32(x1u)
     if x1i <= x0i + 1 {
@@ -350,11 +500,25 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
 /// cells and `touched` flags it reads. Rows past `rows` have no area (lines were clipped to the
 /// canvas), so they resolve to zero. A column no line touched repeats the column before it. The
 /// four rows of a column are one vector (see [`accumulate`]).
-fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32, rows: u32, rule: u8, alphas: &mut [u8], kinds: &mut [u8]) -> () {
+fn resolve(
+  area: &mut [f32],
+  touched: &mut [u8],
+  stride: usize,
+  localWidth: u32,
+  rows: u32,
+  rule: u8,
+  alphas: &mut [u8],
+  kinds: &mut [u8],
+) -> () {
   let width = u32.toUsize(localWidth)
+
   // The packed column word of a fully covered column: 255 in each row inside the canvas.
   let all: u32 = 0xffffffff
-  let full = if rows >= BAND { all } else { u32.shiftLeft(1, rows * 8) - 1 }
+  let full = if rows >= BAND {
+    all
+  } else {
+    u32.shiftLeft(1, rows * 8) - 1
+  }
   let zero = f32x4.splat(0.0)
   let mut sum = zero
   let mut word: u32 = 0
@@ -366,7 +530,13 @@ fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32,
       sum = sum + f32x4.load(&area, c * 4)
       f32x4.store(&mut area, c * 4, zero)
       word = alphaWord(sum, rule)
-      kind = if word == 0 { EMPTY } else if word == full { SOLID } else { PARTIAL }
+      kind = if word == 0 {
+        EMPTY
+      } else if word == full {
+        SOLID
+      } else {
+        PARTIAL
+      }
     }
     kinds[c] = kind
     if kind == PARTIAL {
@@ -377,6 +547,7 @@ fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32,
     }
     c = c + 1
   }
+
   // Cells right of the canvas collect area that no column reads.
   while c < stride {
     touched[c] = 0
@@ -388,8 +559,7 @@ fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32,
 /// The 0..=255 coverages of four accumulated winding areas, packed one byte per lane (lane 0 in
 /// the low byte). The same values as the scalar `round(min(|coverage|, 1) * 255)` with the
 /// nonzero or even-odd fold.
-fn alphaWord(sum: simd<f32, 4>, rule: u8) -> u32
-with Intrinsic.inlineAlways() {
+fn alphaWord(sum: simd<f32, 4>, rule: u8) -> u32 with Intrinsic.inlineAlways() {
   let zero = f32x4.splat(0.0)
   let one = f32x4.splat(1.0)
   let mut coverage = f32x4.select(f32x4.lanesLess(sum, zero), zero - sum, sum)
@@ -404,6 +574,7 @@ with Intrinsic.inlineAlways() {
     coverage = f32x4.select(f32x4.lanesLess(folded, zero), zero - folded, folded)
   }
   let clamped = f32x4.select(f32x4.lanesLess(coverage, one), coverage, one)
+
   // In range by construction (0 <= clamped * 255 + 0.5 < 256).
   let bytes = i32x4.bitcastToU8x16(f32x4.toI32x4(clamped * f32x4.splat(255.0) + f32x4.splat(0.5)))
   let packed = u8x16.shuffle(bytes, bytes, [0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12])
@@ -411,18 +582,30 @@ with Intrinsic.inlineAlways() {
 }
 
 const EMPTY: u8 = 0
+
 const PARTIAL: u8 = 1
+
 const SOLID: u8 = 2
 
-effect fn emitBand(alphas: &[u8], kinds: &[u8], localWidth: u32, originX: u32, top: u32, out: &mut Coverage) -> ()
-  ! OutOfMemoryError ? &mut Allocator {
+effect fn emitBand(
+  alphas: &[u8],
+  kinds: &[u8],
+  localWidth: u32,
+  originX: u32,
+  top: u32,
+  out: &mut Coverage,
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
   let width = u32.toUsize(localWidth)
   let band = u32.toUsize(BAND)
   let mut c: usize = 0
   while c < width {
     let kind = kinds[c]
     let mut end = c + 1
-    while end < width && kinds[end] == kind { end = end + 1 }
+    while end < width && kinds[end] == kind {
+      end = end + 1
+    }
     let x = originX + usize.toU32(c)
     let runWidth = usize.toU32(end - c)
     if kind == PARTIAL {

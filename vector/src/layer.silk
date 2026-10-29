@@ -9,28 +9,45 @@ import silk.core.ownership { Copy }
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
+import silk.num.f64
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import strips { Coverage, BAND, minU32 }
 import pixmap { Pixmap, Rgba8, div255, over, truncateToU8 }
 import paint { Shader }
+import color_space as colorSpace
 
 pub const BLEND_NORMAL: u8 = 0
+
 pub const BLEND_MULTIPLY: u8 = 1
+
 pub const BLEND_SCREEN: u8 = 2
+
 pub const BLEND_OVERLAY: u8 = 3
+
 pub const BLEND_DARKEN: u8 = 4
+
 pub const BLEND_LIGHTEN: u8 = 5
+
 pub const BLEND_COLOR_DODGE: u8 = 6
+
 pub const BLEND_COLOR_BURN: u8 = 7
+
 pub const BLEND_HARD_LIGHT: u8 = 8
+
 pub const BLEND_SOFT_LIGHT: u8 = 9
+
 pub const BLEND_DIFFERENCE: u8 = 10
+
 pub const BLEND_EXCLUSION: u8 = 11
+
 pub const BLEND_HUE: u8 = 12
+
 pub const BLEND_SATURATION: u8 = 13
+
 pub const BLEND_COLOR: u8 = 14
+
 pub const BLEND_LUMINOSITY: u8 = 15
 
 /// One coverage byte per pixel, row major.
@@ -39,22 +56,37 @@ pub struct Mask {
   maskHeight: u32,
   bytes: List<u8>,
 }
+
 impl Mask {
   /// A mask with every pixel set to `value`.
-  pub effect fn make(width: u32, height: u32, value: u8) -> Mask ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn make(width: u32, height: u32, value: u8) -> Mask
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let mut bytes = List<u8>.make()
     run bytes.appendRepeated(value, u32.toUsize(width) * u32.toUsize(height))
     return Mask { maskWidth: width, maskHeight: height, bytes: move bytes }
   }
-  pub fn width(self: &Self) -> u32 { return self.maskWidth }
-  pub fn height(self: &Self) -> u32 { return self.maskHeight }
-  pub fn data(self: &Self) -> &[u8] { return self.bytes.asSlice() }
+
+  pub fn width(self: &Self) -> u32 {
+    return self.maskWidth
+  }
+
+  pub fn height(self: &Self) -> u32 {
+    return self.maskHeight
+  }
+
+  pub fn data(self: &Self) -> &[u8] {
+    return self.bytes.asSlice()
+  }
+
   pub fn at(self: &Self, x: u32, y: u32) -> u8 {
     return self.bytes.asSlice()[u32.toUsize(y) * u32.toUsize(self.maskWidth) + u32.toUsize(x)]
   }
 
   /// The coverage of a clip path (rasterized with its `clip-rule`).
-  pub effect fn fromCoverage(coverage: &Coverage) -> Mask ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn fromCoverage(coverage: &Coverage) -> Mask
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let mut mask = run Mask.make(coverage.width(), coverage.height(), 0)
     let width = u32.toUsize(coverage.width())
     let height = coverage.height()
@@ -84,7 +116,8 @@ impl Mask {
         let base = u32.toUsize(strip.alphaOffset + column * BAND)
         let mut row: u32 = 0
         while row < BAND && strip.y + row < height {
-          d[u32.toUsize(strip.y + row) * width + u32.toUsize(strip.x + column)] = alphas[base + u32.toUsize(row)]
+          d[u32.toUsize(strip.y + row) * width + u32.toUsize(strip.x + column)] = alphas[base
+            + u32.toUsize(row)]
           row = row + 1
         }
         column = column + 1
@@ -95,7 +128,9 @@ impl Mask {
   }
 
   /// `mask-type: alpha`: the rendered mask content's alpha.
-  pub effect fn fromAlpha(content: &Pixmap) -> Mask ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn fromAlpha(content: &Pixmap) -> Mask
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let mut mask = run Mask.make(content.width(), content.height(), 0)
     let source = content.data()
     let d = mask.bytes.asMutSlice()
@@ -110,14 +145,17 @@ impl Mask {
   /// `mask-type: luminance` (the SVG default): the luminance of the premultiplied content with
   /// the CSS Masking coefficients 0.2125, 0.7154, 0.0721, which also folds in its alpha. Content
   /// rendered with `color-interpolation: linearRGB` must be converted by the caller first.
-  pub effect fn fromLuminance(content: &Pixmap) -> Mask ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn fromLuminance(content: &Pixmap) -> Mask
+    ! OutOfMemoryError
+    ? &mut Allocator {
     let mut mask = run Mask.make(content.width(), content.height(), 0)
     let source = content.data()
     let d = mask.bytes.asMutSlice()
     let mut i: usize = 0
     while i < d.length {
       // Fixed point with weights summing to 65536: 13926 + 46884 + 4726.
-      let l = 13926 * u8.toU32(source[i * 4]) + 46884 * u8.toU32(source[i * 4 + 1]) + 4726 * u8.toU32(source[i * 4 + 2])
+      let l = 13926 * u8.toU32(source[i * 4]) + 46884 * u8.toU32(source[i * 4 + 1])
+        + 4726 * u8.toU32(source[i * 4 + 2])
       d[i] = u32.toU8(u32.shiftRight(l + 32768, 16))
       i = i + 1
     }
@@ -150,8 +188,16 @@ impl Mask {
 }
 
 /// Like [`paint.fill`], with the coverage also multiplied by `clip`.
-pub fn fillClipped<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opacity: u8, clip: &Mask) -> () {
-  if opacity == 0 { return }
+pub fn fillClipped<S: Shader>(
+  target: &mut Pixmap,
+  coverage: &Coverage,
+  shader: &S,
+  opacity: u8,
+  clip: &Mask,
+) -> () {
+  if opacity == 0 {
+    return
+  }
   let width = minU32(minU32(target.width(), coverage.width()), clip.width())
   let height = minU32(minU32(target.height(), coverage.height()), clip.height())
   let stride = u32.toUsize(target.width()) * 4
@@ -166,7 +212,13 @@ pub fn fillClipped<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: 
       let mut x = span.x
       while x < span.x + span.width && x < width {
         let mask = div255(u8.toU32(clip.at(x, y)) * level)
-        if mask != 0 { over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, scale(shader.shade(x, y), mask)) }
+        if mask != 0 {
+          over(
+            &mut d,
+            u32.toUsize(y) * stride + u32.toUsize(x) * 4,
+            scale(shader.shade(x, y), mask),
+          )
+        }
         x = x + 1
       }
       y = y + 1
@@ -185,8 +237,16 @@ pub fn fillClipped<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: 
       while row < BAND && strip.y + row < height {
         let x = strip.x + column
         let y = strip.y + row
-        let mask = div255(div255(u8.toU32(alphas[base + u32.toUsize(row)]) * level) * u8.toU32(clip.at(x, y)))
-        if mask != 0 { over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, scale(shader.shade(x, y), mask)) }
+        let mask = div255(
+          div255(u8.toU32(alphas[base + u32.toUsize(row)]) * level) * u8.toU32(clip.at(x, y)),
+        )
+        if mask != 0 {
+          over(
+            &mut d,
+            u32.toUsize(y) * stride + u32.toUsize(x) * 4,
+            scale(shader.shade(x, y), mask),
+          )
+        }
         row = row + 1
       }
       column = column + 1
@@ -196,15 +256,25 @@ pub fn fillClipped<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: 
 }
 
 fn scale(color: Rgba8, mask: u32) -> Rgba8 {
-  if mask == 255 { return color }
+  if mask == 255 {
+    return color
+  }
   return Rgba8 {
-    r: u32.toU8(div255(u8.toU32(color.r) * mask)), g: u32.toU8(div255(u8.toU32(color.g) * mask)),
-    b: u32.toU8(div255(u8.toU32(color.b) * mask)), a: u32.toU8(div255(u8.toU32(color.a) * mask)),
+    r: u32.toU8(div255(u8.toU32(color.r) * mask)),
+    g: u32.toU8(div255(u8.toU32(color.g) * mask)),
+    b: u32.toU8(div255(u8.toU32(color.b) * mask)),
+    a: u32.toU8(div255(u8.toU32(color.a) * mask)),
   }
 }
 
 /// [`composite`] through `mask` as well (masks and clip paths on the group).
-pub fn compositeMasked(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u8, mask: &Mask) -> () {
+pub fn compositeMasked(
+  target: &mut Pixmap,
+  layer: &Pixmap,
+  mode: u8,
+  opacity: u8,
+  mask: &Mask,
+) -> () {
   let width = minU32(minU32(target.width(), layer.width()), mask.width())
   let height = minU32(minU32(target.height(), layer.height()), mask.height())
   let stride = u32.toUsize(target.width()) * 4
@@ -219,7 +289,10 @@ pub fn compositeMasked(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u
       let m = div255(u8.toU32(mask.at(x, y)) * level)
       if m != 0 {
         let j = u32.toUsize(y) * layerStride + u32.toUsize(x) * 4
-        let s = scale(Rgba8 { r: source[j], g: source[j + 1], b: source[j + 2], a: source[j + 3] }, m)
+        let s = scale(
+          Rgba8 { r: source[j], g: source[j + 1], b: source[j + 2], a: source[j + 3] },
+          m,
+        )
         blendPixel(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, s, mode)
       }
       x = x + 1
@@ -236,8 +309,19 @@ pub fn composite(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u8) -> 
 }
 
 /// [`composite`] limited to pixels `x0 .. x1` by `y0 .. y1`.
-pub fn compositeWithin(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u8, x0: u32, y0: u32, x1: u32, y1: u32) -> () {
-  if opacity == 0 { return }
+pub fn compositeWithin(
+  target: &mut Pixmap,
+  layer: &Pixmap,
+  mode: u8,
+  opacity: u8,
+  x0: u32,
+  y0: u32,
+  x1: u32,
+  y1: u32,
+) -> () {
+  if opacity == 0 {
+    return
+  }
   let width = minU32(minU32(target.width(), layer.width()), x1)
   let height = minU32(minU32(target.height(), layer.height()), y1)
   let stride = u32.toUsize(target.width()) * 4
@@ -251,7 +335,10 @@ pub fn compositeWithin(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u
     while x < width {
       let j = u32.toUsize(y) * layerStride + u32.toUsize(x) * 4
       if source[j + 3] != 0 {
-        let s = scale(Rgba8 { r: source[j], g: source[j + 1], b: source[j + 2], a: source[j + 3] }, level)
+        let s = scale(
+          Rgba8 { r: source[j], g: source[j + 1], b: source[j + 2], a: source[j + 3] },
+          level,
+        )
         blendPixel(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, s, mode)
       }
       x = x + 1
@@ -269,45 +356,44 @@ fn blendPixel(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
   }
   let sa = u8.toF32(s.a) / 255.0
   let ba = u8.toF32(d[i + 3]) / 255.0
-  if sa == 0.0 { return }
+  if sa == 0.0 {
+    return
+  }
   let sr = u8.toF32(s.r) / 255.0
   let sg = u8.toF32(s.g) / 255.0
   let sb = u8.toF32(s.b) / 255.0
   let br = u8.toF32(d[i]) / 255.0
   let bg = u8.toF32(d[i + 1]) / 255.0
   let bb = u8.toF32(d[i + 2]) / 255.0
+
   // Unpremultiplied colors for B.
   let csr = sr / sa
   let csg = sg / sa
   let csb = sb / sa
   let zero: f32 = 0.0
-  let cbr = if ba > 0.0 { br / ba } else { zero }
-  let cbg = if ba > 0.0 { bg / ba } else { zero }
-  let cbb = if ba > 0.0 { bb / ba } else { zero }
-  let mut rr: f32 = 0.0
-  let mut rg: f32 = 0.0
-  let mut rb: f32 = 0.0
-  if mode >= BLEND_HUE {
-    let mut c = Color3 { r: 0.0, g: 0.0, b: 0.0 }
-    let backdrop = Color3 { r: cbr, g: cbg, b: cbb }
-    let source = Color3 { r: csr, g: csg, b: csb }
-    if mode == BLEND_HUE {
-      c = setLum(setSat(source, sat(backdrop)), lum(backdrop))
-    } else if mode == BLEND_SATURATION {
-      c = setLum(setSat(backdrop, sat(source)), lum(backdrop))
-    } else if mode == BLEND_COLOR {
-      c = setLum(source, lum(backdrop))
-    } else {
-      c = setLum(backdrop, lum(source))
-    }
-    rr = c.r
-    rg = c.g
-    rb = c.b
+  let cbr = if ba > 0.0 {
+    br / ba
   } else {
-    rr = separable(cbr, csr, mode)
-    rg = separable(cbg, csg, mode)
-    rb = separable(cbb, csb, mode)
+    zero
   }
+  let cbg = if ba > 0.0 {
+    bg / ba
+  } else {
+    zero
+  }
+  let cbb = if ba > 0.0 {
+    bb / ba
+  } else {
+    zero
+  }
+  let result = blendColor(
+    Color3 { r: cbr, g: cbg, b: cbb },
+    Color3 { r: csr, g: csg, b: csb },
+    mode,
+  )
+  let rr = result.r
+  let rg = result.g
+  let rb = result.b
   let k = sa * ba
   d[i] = toByte(sr * (1.0 - ba) + br * (1.0 - sa) + k * rr)
   d[i + 1] = toByte(sg * (1.0 - ba) + bg * (1.0 - sa) + k * rg)
@@ -315,37 +401,71 @@ fn blendPixel(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
   d[i + 3] = toByte(sa + ba * (1.0 - sa))
 }
 
-fn toByte(value: f32) -> u8 { return truncateToU8(f32.min(f32.max(value, 0.0), 1.0) * 255.0 + 0.5) }
+fn toByte(value: f32) -> u8 {
+  return truncateToU8(f32.min(f32.max(value, 0.0), 1.0) * 255.0 + 0.5)
+}
 
 fn separable(cb: f32, cs: f32, mode: u8) -> f32 {
-  if mode == BLEND_MULTIPLY { return cb * cs }
-  if mode == BLEND_SCREEN { return cb + cs - cb * cs }
-  if mode == BLEND_OVERLAY { return hardLight(cs, cb) }
-  if mode == BLEND_DARKEN { return f32.min(cb, cs) }
-  if mode == BLEND_LIGHTEN { return f32.max(cb, cs) }
+  if mode == BLEND_MULTIPLY {
+    return cb * cs
+  }
+  if mode == BLEND_SCREEN {
+    return cb + cs - cb * cs
+  }
+  if mode == BLEND_OVERLAY {
+    return hardLight(cs, cb)
+  }
+  if mode == BLEND_DARKEN {
+    return f32.min(cb, cs)
+  }
+  if mode == BLEND_LIGHTEN {
+    return f32.max(cb, cs)
+  }
   if mode == BLEND_COLOR_DODGE {
-    if cb == 0.0 { return 0.0 }
-    if cs >= 1.0 { return 1.0 }
+    if cb == 0.0 {
+      return 0.0
+    }
+    if cs >= 1.0 {
+      return 1.0
+    }
     return f32.min(1.0, cb / (1.0 - cs))
   }
   if mode == BLEND_COLOR_BURN {
-    if cb >= 1.0 { return 1.0 }
-    if cs <= 0.0 { return 0.0 }
+    if cb >= 1.0 {
+      return 1.0
+    }
+    if cs <= 0.0 {
+      return 0.0
+    }
     return 1.0 - f32.min(1.0, (1.0 - cb) / cs)
   }
-  if mode == BLEND_HARD_LIGHT { return hardLight(cb, cs) }
+  if mode == BLEND_HARD_LIGHT {
+    return hardLight(cb, cs)
+  }
   if mode == BLEND_SOFT_LIGHT {
-    if cs <= 0.5 { return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb) }
-    let d = if cb <= 0.25 { ((16.0 * cb - 12.0) * cb + 4.0) * cb } else { f32.sqrt(cb) }
+    if cs <= 0.5 {
+      return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb)
+    }
+    let d = if cb <= 0.25 {
+      ((16.0 * cb - 12.0) * cb + 4.0) * cb
+    } else {
+      f32.sqrt(cb)
+    }
     return cb + (2.0 * cs - 1.0) * (d - cb)
   }
-  if mode == BLEND_DIFFERENCE { return f32.abs(cb - cs) }
-  if mode == BLEND_EXCLUSION { return cb + cs - 2.0 * cb * cs }
+  if mode == BLEND_DIFFERENCE {
+    return f32.abs(cb - cs)
+  }
+  if mode == BLEND_EXCLUSION {
+    return cb + cs - 2.0 * cb * cs
+  }
   return cs
 }
 
 fn hardLight(cb: f32, cs: f32) -> f32 {
-  if cs <= 0.5 { return cb * 2.0 * cs }
+  if cs <= 0.5 {
+    return cb * 2.0 * cs
+  }
   let s = 2.0 * cs - 1.0
   return cb + s - cb * s
 }
@@ -355,9 +475,32 @@ struct Color3 {
   g: f32,
   b: f32,
 }
+
 impl Copy for Color3 {}
 
-fn lum(c: Color3) -> f32 { return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b }
+fn blendColor(backdrop: Color3, source: Color3, mode: u8) -> Color3 {
+  if mode >= BLEND_HUE {
+    if mode == BLEND_HUE {
+      return setLum(setSat(source, sat(backdrop)), lum(backdrop))
+    }
+    if mode == BLEND_SATURATION {
+      return setLum(setSat(backdrop, sat(source)), lum(backdrop))
+    }
+    if mode == BLEND_COLOR {
+      return setLum(source, lum(backdrop))
+    }
+    return setLum(backdrop, lum(source))
+  }
+  return Color3 {
+    r: separable(backdrop.r, source.r, mode),
+    g: separable(backdrop.g, source.g, mode),
+    b: separable(backdrop.b, source.b, mode),
+  }
+}
+
+fn lum(c: Color3) -> f32 {
+  return 0.3 * c.r + 0.59 * c.g + 0.11 * c.b
+}
 
 fn clipColor(c: Color3) -> Color3 {
   let l = lum(c)
@@ -384,12 +527,207 @@ fn setLum(c: Color3, l: f32) -> Color3 {
   return clipColor(Color3 { r: c.r + d, g: c.g + d, b: c.b + d })
 }
 
-fn sat(c: Color3) -> f32 { return f32.max(c.r, f32.max(c.g, c.b)) - f32.min(c.r, f32.min(c.g, c.b)) }
+fn sat(c: Color3) -> f32 {
+  return f32.max(c.r, f32.max(c.g, c.b)) - f32.min(c.r, f32.min(c.g, c.b))
+}
 
 /// The spec's SetSat: the largest channel becomes `s`, the smallest 0, the middle scales.
 fn setSat(c: Color3, s: f32) -> Color3 {
   let mx = f32.max(c.r, f32.max(c.g, c.b))
   let mn = f32.min(c.r, f32.min(c.g, c.b))
-  if mx <= mn { return Color3 { r: 0.0, g: 0.0, b: 0.0 } }
-  return Color3 { r: (c.r - mn) * s / (mx - mn), g: (c.g - mn) * s / (mx - mn), b: (c.b - mn) * s / (mx - mn) }
+  if mx <= mn {
+    return Color3 { r: 0.0, g: 0.0, b: 0.0 }
+  }
+  return Color3 {
+    r: (c.r - mn) * s / (mx - mn),
+    g: (c.g - mn) * s / (mx - mn),
+    b: (c.b - mn) * s / (mx - mn),
+  }
+}
+
+/// Like `fillClipped`, with source-over arithmetic in linear light. Inputs and output remain
+/// premultiplied sRGB RGBA8; clip and opacity use the existing coverage-byte rounding contract.
+pub fn fillClippedLinearRgb<S: Shader>(
+  target: &mut Pixmap,
+  coverage: &Coverage,
+  shader: &S,
+  opacity: u8,
+  clip: &Mask,
+) -> () {
+  if opacity == 0 {
+    return
+  }
+  let width = minU32(minU32(target.width(), coverage.width()), clip.width())
+  let height = minU32(minU32(target.height(), coverage.height()), clip.height())
+  let stride = u32.toUsize(target.width()) * 4
+  let level = u8.toU32(opacity)
+  let uniform = shader.isUniform()
+  let solid = if uniform {
+    shader.shade(0, 0)
+  } else {
+    Rgba8.make(0, 0, 0, 0)
+  }
+  let d = target.dataMut()
+  let fills = coverage.fills()
+  let mut f: usize = 0
+  while f < fills.length {
+    let span = fills[f]
+    let mut y = span.y
+    while y < span.y + BAND && y < height {
+      let mut x = span.x
+      while x < span.x + span.width && x < width {
+        let mask = div255(u8.toU32(clip.at(x, y)) * level)
+        if mask != 0 {
+          let source = if uniform {
+            solid
+          } else {
+            shader.shade(x, y)
+          }
+          colorSpace.over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, source, mask)
+        }
+        x = x + 1
+      }
+      y = y + 1
+    }
+    f = f + 1
+  }
+  let alphas = coverage.alphas()
+  let strips = coverage.strips()
+  let mut s: usize = 0
+  while s < strips.length {
+    let strip = strips[s]
+    let mut column: u32 = 0
+    while column < strip.width && strip.x + column < width {
+      let base = u32.toUsize(strip.alphaOffset + column * BAND)
+      let mut row: u32 = 0
+      while row < BAND && strip.y + row < height {
+        let x = strip.x + column
+        let y = strip.y + row
+        let mask = div255(
+          div255(u8.toU32(alphas[base + u32.toUsize(row)]) * level) * u8.toU32(clip.at(x, y)),
+        )
+        if mask != 0 {
+          let source = if uniform {
+            solid
+          } else {
+            shader.shade(x, y)
+          }
+          colorSpace.over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, source, mask)
+        }
+        row = row + 1
+      }
+      column = column + 1
+    }
+    s = s + 1
+  }
+}
+
+/// Like `composite`, but decode straight sRGB channels before blending/compositing and encode
+/// back afterwards. No intermediate linear RGBA8 image or per-pixel allocation is used.
+pub fn compositeLinearRgb(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u8) -> () {
+  let width = target.width()
+  let height = target.height()
+  compositeWithinLinearRgb(&mut target, layer, mode, opacity, 0, 0, width, height)
+}
+
+/// Bounded `compositeLinearRgb`, with the same half-open bounds as `compositeWithin`.
+pub fn compositeWithinLinearRgb(
+  target: &mut Pixmap,
+  layer: &Pixmap,
+  mode: u8,
+  opacity: u8,
+  x0: u32,
+  y0: u32,
+  x1: u32,
+  y1: u32,
+) -> () {
+  if opacity == 0 {
+    return
+  }
+  let width = minU32(minU32(target.width(), layer.width()), x1)
+  let height = minU32(minU32(target.height(), layer.height()), y1)
+  let stride = u32.toUsize(target.width()) * 4
+  let layerStride = u32.toUsize(layer.width()) * 4
+  let level = u8.toU32(opacity)
+  let source = layer.data()
+  let d = target.dataMut()
+  let mut y = y0
+  while y < height {
+    let mut x = x0
+    while x < width {
+      let j = u32.toUsize(y) * layerStride + u32.toUsize(x) * 4
+      let s = Rgba8 { r: source[j], g: source[j + 1], b: source[j + 2], a: source[j + 3] }
+      blendLinearPixel(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, s, mode, level)
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+/// Masked `compositeLinearRgb`; mask/opacity multiply with the same rounding as `compositeMasked`.
+pub fn compositeMaskedLinearRgb(
+  target: &mut Pixmap,
+  layer: &Pixmap,
+  mode: u8,
+  opacity: u8,
+  mask: &Mask,
+) -> () {
+  if opacity == 0 {
+    return
+  }
+  let width = minU32(minU32(target.width(), layer.width()), mask.width())
+  let height = minU32(minU32(target.height(), layer.height()), mask.height())
+  let stride = u32.toUsize(target.width()) * 4
+  let layerStride = u32.toUsize(layer.width()) * 4
+  let level = u8.toU32(opacity)
+  let source = layer.data()
+  let d = target.dataMut()
+  let mut y: u32 = 0
+  while y < height {
+    let mut x: u32 = 0
+    while x < width {
+      let m = div255(u8.toU32(mask.at(x, y)) * level)
+      if m != 0 {
+        let j = u32.toUsize(y) * layerStride + u32.toUsize(x) * 4
+        let s = Rgba8 { r: source[j], g: source[j + 1], b: source[j + 2], a: source[j + 3] }
+        blendLinearPixel(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, s, mode, m)
+      }
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+fn blendLinearPixel(d: &mut [u8], i: usize, source: Rgba8, mode: u8, mask: u32) -> () {
+  if source.a == 0 || mask == 0 {
+    return
+  }
+  if mode == BLEND_NORMAL {
+    colorSpace.over(&mut d, i, source, mask)
+    return
+  }
+  let sa = u8.toF64(source.a) / 255.0 * u32.toF64(mask) / 255.0
+  let ba = u8.toF64(d[i + 3]) / 255.0
+  let sr = colorSpace.decode(source.r, source.a)
+  let sg = colorSpace.decode(source.g, source.a)
+  let sb = colorSpace.decode(source.b, source.a)
+  let br = colorSpace.decode(d[i], d[i + 3])
+  let bg = colorSpace.decode(d[i + 1], d[i + 3])
+  let bb = colorSpace.decode(d[i + 2], d[i + 3])
+
+  // Reuse the existing f32 separable and nonseparable blend formulas; channels are never bytes
+  // in linear space. Transfer and the surrounding premultiplied arithmetic retain f64 precision.
+  let result = blendColor(
+    Color3 { r: f64.toF32(br), g: f64.toF32(bg), b: f64.toF32(bb) },
+    Color3 { r: f64.toF32(sr), g: f64.toF32(sg), b: f64.toF32(sb) },
+    mode,
+  )
+  let alpha = sa + ba * (1.0 - sa)
+  let s = sa * (1.0 - ba)
+  let b = ba * (1.0 - sa)
+  let k = sa * ba
+  d[i] = colorSpace.encode(sr * s + br * b + k * f32.toF64(result.r), alpha)
+  d[i + 1] = colorSpace.encode(sg * s + bg * b + k * f32.toF64(result.g), alpha)
+  d[i + 2] = colorSpace.encode(sb * s + bb * b + k * f32.toF64(result.b), alpha)
+  d[i + 3] = colorSpace.byte(alpha)
 }
