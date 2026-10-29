@@ -611,7 +611,7 @@ effect fn program() -> i32 ! GpuError | OutOfMemoryError {
   let instance = run Instance.create()
   let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
   let device = run adapter.requestDevice(
-    &DeviceDescriptor.default().withRequiredFeatures(SceneRenderer.requiredFeatures()),
+    &DeviceDescriptor.default().withRequiredFeatures(SceneRenderer.requiredFeatures(&adapter)),
   )
   let queue = run gpu.getQueue(&device)
   let mut renderer = run SceneRenderer.make(&device)

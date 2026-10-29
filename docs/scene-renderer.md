@@ -89,12 +89,12 @@ without Dawn.
    `s + div255(d (255 - as))`, so solid fills match the CPU pixmap byte for byte. Gradients use
    the same formulas in f32. Image paints (`Scene.fillImage`) append the image's texels to the
    ramp buffer and sample them like `ImagePattern` (nearest or bilinear, clamp or repeat). Buffers
-   are recreated per frame for now. Request `SceneRenderer.requiredFeatures()` through
-   `DeviceDescriptor.withRequiredFeatures` when creating the scene's device. On native Dawn this
-   enables `ShaderModuleCompilationOptions`; only the scene paint module is created with
-   `strictMath = true`. A native device without the enabled feature fails renderer creation with
-   `webgpu.resources.STRICT_MATH_UNAVAILABLE`, rather than silently rendering nonexact images.
-   Ordinary WebGPU shader modules, composition, and filters retain their existing math mode.
+   are recreated per frame for now. Request `SceneRenderer.requiredFeatures(&adapter)` through
+   `DeviceDescriptor.withRequiredFeatures` when creating the scene's device. Where the adapter
+   offers Dawn's `ShaderModuleCompilationOptions` (Metal), this enables it and only the scene
+   paint module is created with `strictMath = true`. Vulkan (lavapipe in CI) and D3D compile WGSL
+   without fast-math contraction and do not offer the feature, so they use the ordinary module
+   and still match the CPU exactly. Composition and filters keep their existing math mode.
 
    This is necessary on Metal: relaxed arithmetic changed the image fixture's device column
    `x = 21` from source texel 1 to texel 2 (242 differing channels, maximum delta 130). The
