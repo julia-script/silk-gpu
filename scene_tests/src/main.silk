@@ -266,7 +266,7 @@ fn extent(width: u32, height: u32) -> Extent3D {
   return size
 }
 
-effect fn renderOnGpu(device: &Device, queue: &Queue, renderer: &SceneRenderer, scene: &Scene) -> List<u8> ! GpuError | OutOfMemoryError ? &mut Allocator {
+effect fn renderOnGpu(device: &Device, queue: &Queue, renderer: &mut SceneRenderer, scene: &Scene) -> List<u8> ! GpuError | OutOfMemoryError ? &mut Allocator {
   let mut descriptor = TextureDescriptor.default().withLabel(b"scene target")
   descriptor.setSize(extent(WIDTH, HEIGHT))
   descriptor.setFormat(FORMAT)
@@ -603,24 +603,27 @@ effect fn program() -> i32 ! GpuError | OutOfMemoryError {
   let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
   let device = run adapter.requestDevice(&DeviceDescriptor.default())
   let queue = run gpu.getQueue(&device)
-  let renderer = run SceneRenderer.make(&device)
+  let mut renderer = run SceneRenderer.make(&device)
   let solid = run solids() |> Effect.provideMut<Allocator>(&mut allocator)
-  let solidGpu = run renderOnGpu(&device, &queue, &renderer, &solid.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  let solidGpu = run renderOnGpu(&device, &queue, &mut renderer, &solid.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   let gradient = run gradients() |> Effect.provideMut<Allocator>(&mut allocator)
-  let gradientGpu = run renderOnGpu(&device, &queue, &renderer, &gradient.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  let gradientGpu = run renderOnGpu(&device, &queue, &mut renderer, &gradient.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   let solidOk = compare("solids", solid.cpu.data(), solidGpu.asSlice(), 0)
   let gradientOk = compare("gradients", gradient.cpu.data(), gradientGpu.asSlice(), 2)
   let layered = run layers() |> Effect.provideMut<Allocator>(&mut allocator)
-  let layeredGpu = run renderOnGpu(&device, &queue, &renderer, &layered.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  let layeredGpu = run renderOnGpu(&device, &queue, &mut renderer, &layered.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   // Non-separable and other non-normal modes run in f32 on both sides; allow one level.
   let layersOk = compare("layers", layered.cpu.data(), layeredGpu.asSlice(), 1)
   let imaged = run images() |> Effect.provideMut<Allocator>(&mut allocator)
-  let imagedGpu = run renderOnGpu(&device, &queue, &renderer, &imaged.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  let imagedGpu = run renderOnGpu(&device, &queue, &mut renderer, &imaged.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   let imagesOk = compare("images", imaged.cpu.data(), imagedGpu.asSlice(), 0)
+  // The renderer keeps its layer textures; a second render must not see the first one's pixels.
+  let againGpu = run renderOnGpu(&device, &queue, &mut renderer, &layered.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  let againOk = compare("layers again", layered.cpu.data(), againGpu.asSlice(), 1)
   let drawn = painted("solids", solid.cpu.data(), 4000) && painted("gradients", gradient.cpu.data(), 8000) && painted("layers", layered.cpu.data(), 9000)
     && painted("images", imaged.cpu.data(), 6000)
   let filtersOk = run filters(&device, &queue) |> Effect.provideMut<Allocator>(&mut allocator)
-  return if solidOk && gradientOk && layersOk && imagesOk && drawn && filtersOk { 0 } else { 1 }
+  return if solidOk && gradientOk && layersOk && imagesOk && againOk && drawn && filtersOk { 0 } else { 1 }
 }
 
 effect fn failed<E>(error: E) -> i32 {
