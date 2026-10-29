@@ -4,3 +4,4 @@ import path
 import flatten
 import strips
 import pixmap
+import stroke

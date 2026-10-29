@@ -1,0 +1,582 @@
+//! Strokes a path into a fill outline, following SVG 2 §13.5 (stroke shape).
+//!
+//! The centerline is flattened in user space with the device tolerance divided by the
+//! transform's largest scale, so the outline is accurate after `transform`. Each subpath becomes
+//! closed outlines (both sides of a closed subpath, or one loop with caps for an open one) that
+//! must be filled with [`strips.NONZERO`]: overlaps add up instead of cancelling. Dashes are cut
+//! from the flattened centerline before stroking. Vertices inside a flattened curve always get a
+//! round join, so curves stay smooth whatever `stroke-linejoin` says.
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u32
+import silk.num.usize
+import geometry { Point, Affine }
+import path { Path, MOVE, LINE, QUAD, CUBIC, CLOSE }
+import flatten { TOLERANCE, segments }
+
+pub const JOIN_MITER: u8 = 0
+pub const JOIN_MITER_CLIP: u8 = 1
+pub const JOIN_ROUND: u8 = 2
+pub const JOIN_BEVEL: u8 = 3
+/// SVG 2 `arcs`. On flattened (zero-curvature) segments the arcs extend as straight lines, so
+/// this behaves as `miter-clip`; using the source curvature is future work.
+pub const JOIN_ARCS: u8 = 4
+
+pub const CAP_BUTT: u8 = 0
+pub const CAP_ROUND: u8 = 1
+pub const CAP_SQUARE: u8 = 2
+
+const CORNER: u8 = 0
+const SMOOTH: u8 = 1
+
+/// The computed stroke properties, in user units.
+pub struct Stroke {
+  pub width: f64,
+  pub join: u8,
+  pub cap: u8,
+  pub miterLimit: f64,
+  pub dashOffset: f64,
+  dashes: List<f64>,
+}
+impl Stroke {
+  /// SVG initial values: width 1, miter join, butt cap, miter limit 4, no dashes.
+  pub fn make(width: f64) -> Stroke {
+    return Stroke { width: width, join: JOIN_MITER, cap: CAP_BUTT, miterLimit: 4.0, dashOffset: 0.0, dashes: List<f64>.make() }
+  }
+  pub fn dashArray(self: &Self) -> &[f64] { return self.dashes.asSlice() }
+  /// Sets `stroke-dasharray`. An odd count repeats the list; a negative value or an all-zero
+  /// list disables dashing (SVG 2 §13.5.6).
+  pub effect fn setDashes(self: &mut Self, values: &[f64]) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.dashes.clear()
+    let mut sum: f64 = 0.0
+    let mut i: usize = 0
+    while i < values.length {
+      if !(values[i] >= 0.0) || !f64.isFinite(values[i]) {
+        self.dashes.clear()
+        return
+      }
+      sum = sum + values[i]
+      i = i + 1
+    }
+    if !(sum > 0.0) { return }
+    run self.dashes.appendSlice(values)
+    if values.length % 2 == 1 { run self.dashes.appendSlice(values) }
+  }
+}
+
+struct Subpath {
+  start: usize,
+  count: usize,
+  closed: bool,
+}
+impl Copy for Subpath {}
+
+struct Vec2 {
+  x: f64,
+  y: f64,
+}
+impl Copy for Vec2 {}
+
+fn add(p: Point, v: Vec2, s: f64) -> Point { return Point { x: p.x + v.x * s, y: p.y + v.y * s } }
+fn unit(from: Point, to: Point) -> Vec2 {
+  let dx = to.x - from.x
+  let dy = to.y - from.y
+  let l = f64.sqrt(dx * dx + dy * dy)
+  return Vec2 { x: dx / l, y: dy / l }
+}
+/// The side normal: the direction rotated by +90 degrees.
+fn normal(d: Vec2) -> Vec2 { return Vec2 { x: 0.0 - d.y, y: d.x } }
+fn dot(a: Vec2, b: Vec2) -> f64 { return a.x * b.x + a.y * b.y }
+fn cross(a: Vec2, b: Vec2) -> f64 { return a.x * b.y - a.y * b.x }
+fn rotate(v: Vec2, c: f64, s: f64) -> Vec2 { return Vec2 { x: v.x * c - v.y * s, y: v.x * s + v.y * c } }
+
+/// The largest singular value of the linear part of `m`: how much it can stretch a length.
+fn maxScale(m: &Affine) -> f64 {
+  let t = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d
+  let det = m.a * m.d - m.b * m.c
+  let disc = f64.max(t * t - 4.0 * det * det, 0.0)
+  return f64.sqrt((t + f64.sqrt(disc)) * 0.5)
+}
+
+/// Reusable scratch for stroking; keep one per thread.
+pub struct Stroker {
+  points: List<Point>,
+  kinds: List<u8>,
+  subpaths: List<Subpath>,
+  dashPoints: List<Point>,
+  dashKinds: List<u8>,
+  dashSubpaths: List<Subpath>,
+}
+
+struct Pen {
+  half: f64,
+  join: u8,
+  cap: u8,
+  miterLimit: f64,
+  tolerance: f64,
+}
+impl Copy for Pen {}
+
+impl Stroker {
+  pub fn make() -> Stroker {
+    return Stroker {
+      points: List<Point>.make(), kinds: List<u8>.make(), subpaths: List<Subpath>.make(),
+      dashPoints: List<Point>.make(), dashKinds: List<u8>.make(), dashSubpaths: List<Subpath>.make(),
+    }
+  }
+
+  /// Appends the outline of `path` stroked with `style` to `out`, in user space. Fill `out` with
+  /// `transform` and the nonzero rule; `transform` here only sets the flattening tolerance.
+  pub effect fn stroke(self: &mut Self, path: &Path, style: &Stroke, transform: &Affine, out: &mut Path) -> ()
+    ! OutOfMemoryError ? &mut Allocator {
+    if !(style.width > 0.0) || !f64.isFinite(style.width) { return }
+    let scale = maxScale(transform)
+    if !(scale > 0.0) || !f64.isFinite(scale) { return }
+    let tolerance = TOLERANCE / scale
+    run self.flattenCenterline(path, tolerance)
+    let pen = Pen { half: style.width * 0.5, join: style.join, cap: style.cap, miterLimit: f64.max(style.miterLimit, 1.0), tolerance: tolerance }
+    if style.dashes.length() > 0 {
+      run self.dash(style.dashes.asSlice(), style.dashOffset)
+      let mut i: usize = 0
+      while i < self.dashSubpaths.length() {
+        let sub = self.dashSubpaths.asSlice()[i]
+        run strokeSubpath(Slice3 { points: self.dashPoints.asSlice(), kinds: self.dashKinds.asSlice() }, sub, pen, &mut out)
+        i = i + 1
+      }
+    } else {
+      let mut i: usize = 0
+      while i < self.subpaths.length() {
+        let sub = self.subpaths.asSlice()[i]
+        run strokeSubpath(Slice3 { points: self.points.asSlice(), kinds: self.kinds.asSlice() }, sub, pen, &mut out)
+        i = i + 1
+      }
+    }
+  }
+
+  effect fn push(self: &mut Self, p: Point, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !p.isFinite() { return }
+    let n = self.points.length()
+    let sub = self.subpaths.asSlice()[self.subpaths.length() - 1]
+    if sub.count > 0 {
+      let last = self.points.asSlice()[n - 1]
+      if last.x == p.x && last.y == p.y { return }
+    }
+    run self.points.append(p)
+    run self.kinds.append(kind)
+    let index = self.subpaths.length() - 1
+    self.subpaths.set(index, Subpath { start: sub.start, count: sub.count + 1, closed: false })
+  }
+
+  effect fn begin(self: &mut Self, p: Point) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.subpaths.append(Subpath { start: self.points.length(), count: 0, closed: false })
+    run self.push(p, CORNER)
+  }
+
+  fn closeCurrent(self: &mut Self) -> () {
+    let index = self.subpaths.length() - 1
+    let sub = self.subpaths.asSlice()[index]
+    let mut count = sub.count
+    // A closing point equal to the start is dropped; the closing segment supplies it.
+    if count > 1 {
+      let first = self.points.asSlice()[sub.start]
+      let last = self.points.asSlice()[sub.start + count - 1]
+      if first.x == last.x && first.y == last.y {
+        count = count - 1
+        self.points.truncate(sub.start + count)
+        self.kinds.truncate(sub.start + count)
+      }
+    }
+    self.subpaths.set(index, Subpath { start: sub.start, count: count, closed: count > 1 })
+  }
+
+  /// Flattens `path` in user space into subpaths of distinct consecutive points.
+  effect fn flattenCenterline(self: &mut Self, path: &Path, tolerance: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.points.clear()
+    self.kinds.clear()
+    self.subpaths.clear()
+    let verbs = path.verbList()
+    let pts = path.pointList()
+    let mut start = Point.make(0.0, 0.0)
+    let mut current = start
+    let mut open = false
+    let mut p: usize = 0
+    let mut i: usize = 0
+    while i < verbs.length {
+      let verb = verbs[i]
+      if verb == MOVE {
+        start = pts[p]
+        current = start
+        run self.begin(start)
+        open = true
+        p = p + 1
+      } else if verb == CLOSE {
+        if open {
+          self.closeCurrent()
+          open = false
+        }
+        // A segment after `Z` starts a new subpath at the same point.
+        current = start
+      } else {
+        if !open {
+          run self.begin(current)
+          open = true
+        }
+        if verb == LINE {
+          current = pts[p]
+          run self.push(current, CORNER)
+          p = p + 1
+        } else if verb == QUAD {
+          let p0 = current
+          let p1 = pts[p]
+          let p2 = pts[p + 1]
+          let n = segments(f64.sqrt(sq(p0.x - 2.0 * p1.x + p2.x) + sq(p0.y - 2.0 * p1.y + p2.y)), 0.25, tolerance)
+          let mut k: u32 = 1
+          while k < n {
+            let t = u32.toF64(k) / u32.toF64(n)
+            let u = 1.0 - t
+            run self.push(Point.make(u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x, u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y), SMOOTH)
+            k = k + 1
+          }
+          current = p2
+          run self.push(current, CORNER)
+          p = p + 2
+        } else if verb == CUBIC {
+          let p0 = current
+          let p1 = pts[p]
+          let p2 = pts[p + 1]
+          let p3 = pts[p + 2]
+          let m = f64.max(f64.sqrt(sq(p0.x - 2.0 * p1.x + p2.x) + sq(p0.y - 2.0 * p1.y + p2.y)),
+            f64.sqrt(sq(p1.x - 2.0 * p2.x + p3.x) + sq(p1.y - 2.0 * p2.y + p3.y)))
+          let n = segments(m, 0.75, tolerance)
+          let mut k: u32 = 1
+          while k < n {
+            let t = u32.toF64(k) / u32.toF64(n)
+            let u = 1.0 - t
+            let a = u * u * u
+            let b = 3.0 * u * u * t
+            let c = 3.0 * u * t * t
+            let d = t * t * t
+            run self.push(Point.make(a * p0.x + b * p1.x + c * p2.x + d * p3.x, a * p0.y + b * p1.y + c * p2.y + d * p3.y), SMOOTH)
+            k = k + 1
+          }
+          current = p3
+          run self.push(current, CORNER)
+          p = p + 3
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  effect fn dashPush(self: &mut Self, p: Point, kind: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    let index = self.dashSubpaths.length() - 1
+    let sub = self.dashSubpaths.asSlice()[index]
+    if sub.count > 0 {
+      let last = self.dashPoints.asSlice()[self.dashPoints.length() - 1]
+      if last.x == p.x && last.y == p.y { return }
+    }
+    run self.dashPoints.append(p)
+    run self.dashKinds.append(kind)
+    self.dashSubpaths.set(index, Subpath { start: sub.start, count: sub.count + 1, closed: false })
+  }
+
+  effect fn dashBegin(self: &mut Self, p: Point) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.dashSubpaths.append(Subpath { start: self.dashPoints.length(), count: 0, closed: false })
+    run self.dashPush(p, CORNER)
+  }
+
+  /// Cuts every centerline subpath into open dashes; the pattern restarts at each subpath.
+  effect fn dash(self: &mut Self, pattern: &[f64], offset: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.dashPoints.clear()
+    self.dashKinds.clear()
+    self.dashSubpaths.clear()
+    let mut total: f64 = 0.0
+    let mut i: usize = 0
+    while i < pattern.length {
+      total = total + pattern[i]
+      i = i + 1
+    }
+    let mut s: usize = 0
+    while s < self.subpaths.length() {
+      let sub = self.subpaths.asSlice()[s]
+      // Locate the dash that contains distance `offset` along the pattern.
+      let mut phase = offset - total * f64.floor(offset / total)
+      let mut index: usize = 0
+      while phase >= pattern[index] {
+        phase = phase - pattern[index]
+        index = (index + 1) % pattern.length
+      }
+      let mut remaining = pattern[index] - phase
+      let mut on = index % 2 == 0
+      let first = self.points.asSlice()[sub.start]
+      if on { run self.dashBegin(first) }
+      let segmentCount = if sub.closed { sub.count } else { sub.count - 1 }
+      let mut k: usize = 0
+      while k < segmentCount {
+        let a = self.points.asSlice()[sub.start + k]
+        let bIndex = if k + 1 == sub.count { sub.start } else { sub.start + k + 1 }
+        let b = self.points.asSlice()[bIndex]
+        let bKind = if k + 1 == sub.count { CORNER } else { self.kinds.asSlice()[bIndex] }
+        let length = f64.sqrt(sq(b.x - a.x) + sq(b.y - a.y))
+        let mut done: f64 = 0.0
+        while length - done > remaining {
+          done = done + remaining
+          let t = done / length
+          let cut = Point.make(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+          if on { run self.dashPush(cut, CORNER) } else { run self.dashBegin(cut) }
+          on = !on
+          index = (index + 1) % pattern.length
+          remaining = pattern[index]
+        }
+        remaining = remaining - (length - done)
+        if on { run self.dashPush(b, bKind) }
+        k = k + 1
+      }
+      s = s + 1
+    }
+  }
+}
+
+fn sq(x: f64) -> f64 { return x * x }
+fn distance(a: Point, b: Point) -> f64 { return f64.sqrt(sq(b.x - a.x) + sq(b.y - a.y)) }
+
+struct Slice3<'a> {
+  points: &'a [Point],
+  kinds: &'a [u8],
+}
+
+/// Emits an arc around `center` of radius `half` from direction `from` to `to` through `mid`
+/// (each half under 180 degrees), excluding the start point.
+effect fn arc(out: &mut Path, center: Point, from: Vec2, mid: Vec2, to: Vec2, half: f64, tolerance: f64) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  run arcPart(&mut out, center, from, mid, half, tolerance)
+  run arcPart(&mut out, center, mid, to, half, tolerance)
+}
+
+effect fn arcPart(out: &mut Path, center: Point, from: Vec2, to: Vec2, half: f64, tolerance: f64) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let mut c = dot(from, to)
+  let mut s = cross(from, to)
+  // Halve the rotation until each chord is within tolerance: 1 - cos(step / 2) <= tol / r.
+  // Arcs are cheap, so they get a quarter of the tolerance: round caps and joins are where
+  // a too-coarse polygon is most visible.
+  let limit = 1.0 - 0.25 * tolerance / half
+  let mut steps: u32 = 1
+  let mut hc = f64.sqrt(f64.max((1.0 + c) * 0.5, 0.0))
+  while hc < limit && steps < 256 {
+    let l = f64.sqrt(sq(1.0 + c) + s * s)
+    c = (1.0 + c) / l
+    s = s / l
+    steps = steps * 2
+    hc = f64.sqrt(f64.max((1.0 + c) * 0.5, 0.0))
+  }
+  // The endpoints lie on the circle; the interior vertices sit on a slightly larger radius chosen
+  // so the polygon fan has the arc's area rather than the smaller inscribed area.
+  let radius = areaRadius(half, steps, f64.abs(s))
+  let mut v = from
+  let mut k: u32 = 1
+  while k < steps {
+    v = rotate(v, c, s)
+    let p = add(center, v, radius)
+    run out.lineTo(p.x, p.y)
+    k = k + 1
+  }
+  let end = add(center, to, half)
+  run out.lineTo(end.x, end.y)
+}
+
+/// Solves `(n - 2) sin(t) R^2 + 2 r sin(t) R = r^2 n t` for the interior radius `R` of an
+/// `n`-step arc with step angle `t` (given by `sin t`, `t` at most 45 degrees).
+fn areaRadius(r: f64, steps: u32, sine: f64) -> f64 {
+  if steps < 2 { return r }
+  let s2 = sine * sine
+  // asin series; at 45 degrees the truncation error is below 1e-4 of the step.
+  let t = sine * (1.0 + s2 * (1.0 / 6.0 + s2 * (3.0 / 40.0 + s2 * (15.0 / 336.0))))
+  let n = u32.toF64(steps)
+  let a = (n - 2.0) * sine
+  let b = 2.0 * r * sine
+  let c = r * r * n * t
+  if a <= 0.0 { return c / b }
+  return (f64.sqrt(b * b + 4.0 * a * c) - b) / (2.0 * a)
+}
+
+/// The midpoint direction of the outer arc from `a` to `b`, turning clockwise in math terms.
+fn arcMid(a: Vec2, b: Vec2) -> Vec2 {
+  let sx = a.x + b.x
+  let sy = a.y + b.y
+  let l = f64.sqrt(sx * sx + sy * sy)
+  if l < 1.0e-9 { return Vec2 { x: a.y, y: 0.0 - a.x } }
+  let m = Vec2 { x: sx / l, y: sy / l }
+  // `a + b` bisects the shorter way; the outer arc turns negatively from `a`.
+  if cross(a, m) > 0.0 { return Vec2 { x: 0.0 - m.x, y: 0.0 - m.y } }
+  return m
+}
+
+/// Emits the join at `v` on the `+normal` side, from the end of the segment with direction `a`
+/// to the start of the segment with direction `b`.
+effect fn join(out: &mut Path, v: Point, a: Vec2, b: Vec2, lengthIn: f64, lengthOut: f64, kind: u8, pen: Pen) -> () ! OutOfMemoryError ? &mut Allocator {
+  let na = normal(a)
+  let nb = normal(b)
+  let from = add(v, na, pen.half)
+  let to = add(v, nb, pen.half)
+  let turn = cross(a, b)
+  if dot(a, b) > 0.9999999 && f64.abs(turn) < 1.0e-7 {
+    run out.lineTo(from.x, from.y)
+    run out.lineTo(to.x, to.y)
+    return
+  }
+  if turn > 0.0 {
+    // Inner side. Where both segments are long enough, end at the intersection of the two
+    // offset lines. Otherwise go through the vertex so the overlap fills under nonzero; that
+    // overlap reaches the inner edge, where per-pixel clamping would overstate coverage, so it
+    // is only the fallback.
+    let sx = na.x + nb.x
+    let sy = na.y + nb.y
+    let sl = f64.sqrt(sx * sx + sy * sy)
+    if sl > 1.0e-12 {
+      let u = Vec2 { x: sx / sl, y: sy / sl }
+      let halfCos = dot(na, u)
+      let reach = pen.half * f64.sqrt(f64.max(1.0 - halfCos * halfCos, 0.0)) / halfCos
+      if reach <= 0.5 * f64.min(lengthIn, lengthOut) {
+        let x = add(v, u, pen.half / halfCos)
+        run out.lineTo(x.x, x.y)
+        return
+      }
+    }
+    run out.lineTo(from.x, from.y)
+    run out.lineTo(v.x, v.y)
+    run out.lineTo(to.x, to.y)
+    return
+  }
+  run out.lineTo(from.x, from.y)
+  let mut style = kind
+  if style == JOIN_ARCS { style = JOIN_MITER_CLIP }
+  if style == JOIN_ROUND {
+    run arc(&mut out, v, na, arcMid(na, nb), nb, pen.half, pen.tolerance)
+    return
+  }
+  if style == JOIN_MITER || style == JOIN_MITER_CLIP {
+    let sx = na.x + nb.x
+    let sy = na.y + nb.y
+    let sl = f64.sqrt(sx * sx + sy * sy)
+    if sl > 1.0e-12 {
+      let u = Vec2 { x: sx / sl, y: sy / sl }
+      // cos of half the angle between the normals; the miter ratio is its reciprocal.
+      let halfCos = dot(na, u)
+      if 1.0 <= pen.miterLimit * halfCos {
+        let tip = add(v, u, pen.half / halfCos)
+        run out.lineTo(tip.x, tip.y)
+      } else if style == JOIN_MITER_CLIP {
+        let ta = pen.half * (pen.miterLimit - halfCos) / dot(a, u)
+        let tb = pen.half * (pen.miterLimit - halfCos) / (0.0 - dot(b, u))
+        let pa = add(from, a, ta)
+        let pb = add(to, b, 0.0 - tb)
+        run out.lineTo(pa.x, pa.y)
+        run out.lineTo(pb.x, pb.y)
+      }
+    }
+  }
+  run out.lineTo(to.x, to.y)
+}
+
+/// Emits the cap at `e` from `e + half * normal(d)` to `e - half * normal(d)`.
+effect fn cap(out: &mut Path, e: Point, d: Vec2, pen: Pen) -> () ! OutOfMemoryError ? &mut Allocator {
+  let n = normal(d)
+  if pen.cap == CAP_SQUARE {
+    let a = add(add(e, n, pen.half), d, pen.half)
+    let b = add(add(e, n, 0.0 - pen.half), d, pen.half)
+    run out.lineTo(a.x, a.y)
+    run out.lineTo(b.x, b.y)
+  } else if pen.cap == CAP_ROUND {
+    run arc(&mut out, e, n, d, Vec2 { x: 0.0 - n.x, y: 0.0 - n.y }, pen.half, pen.tolerance)
+    return
+  }
+  let end = add(e, n, 0.0 - pen.half)
+  run out.lineTo(end.x, end.y)
+}
+
+/// Point `i` of the subpath walked forward or backward.
+fn at(points: &[Point], sub: Subpath, i: usize, reversed: bool) -> Point {
+  return if reversed { points[sub.start + sub.count - 1 - i] } else { points[sub.start + i] }
+}
+fn kindAt(kinds: &[u8], sub: Subpath, i: usize, reversed: bool) -> u8 {
+  return if reversed { kinds[sub.start + sub.count - 1 - i] } else { kinds[sub.start + i] }
+}
+
+/// Emits the `+normal` side of an open polyline, from its first offset point to its last.
+effect fn openSide(out: &mut Path, src: &Slice3, sub: Subpath, reversed: bool, pen: Pen, start: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let p0 = at(src.points, sub, 0, reversed)
+  let p1 = at(src.points, sub, 1, reversed)
+  let d0 = unit(p0, p1)
+  let s = add(p0, normal(d0), pen.half)
+  if start { run out.moveTo(s.x, s.y) } else { run out.lineTo(s.x, s.y) }
+  let mut i: usize = 1
+  while i + 1 < sub.count {
+    let prev = at(src.points, sub, i - 1, reversed)
+    let v = at(src.points, sub, i, reversed)
+    let next = at(src.points, sub, i + 1, reversed)
+    let kind = if kindAt(src.kinds, sub, i, reversed) == SMOOTH { JOIN_ROUND } else { pen.join }
+    run join(&mut out, v, unit(prev, v), unit(v, next), distance(prev, v), distance(v, next), kind, pen)
+    i = i + 1
+  }
+  let a = at(src.points, sub, sub.count - 2, reversed)
+  let e = at(src.points, sub, sub.count - 1, reversed)
+  let d = unit(a, e)
+  let end = add(e, normal(d), pen.half)
+  run out.lineTo(end.x, end.y)
+  run cap(&mut out, e, d, pen)
+}
+
+/// Emits the closed `+normal` side loop of a closed polyline.
+effect fn closedSide(out: &mut Path, src: &Slice3, sub: Subpath, reversed: bool, pen: Pen) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let n = sub.count
+  let p0 = at(src.points, sub, 0, reversed)
+  let p1 = at(src.points, sub, 1, reversed)
+  let s = add(p0, normal(unit(p0, p1)), pen.half)
+  run out.moveTo(s.x, s.y)
+  let mut i: usize = 1
+  while i <= n {
+    let prev = at(src.points, sub, i - 1, reversed)
+    let v = at(src.points, sub, i % n, reversed)
+    let next = at(src.points, sub, (i + 1) % n, reversed)
+    let kind = if kindAt(src.kinds, sub, i % n, reversed) == SMOOTH { JOIN_ROUND } else { pen.join }
+    run join(&mut out, v, unit(prev, v), unit(v, next), distance(prev, v), distance(v, next), kind, pen)
+    i = i + 1
+  }
+  run out.close()
+}
+
+effect fn strokeSubpath(src: Slice3, sub: Subpath, pen: Pen, out: &mut Path) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  if sub.count == 0 { return }
+  if sub.count == 1 {
+    // Zero-length subpath: round and square caps draw a dot aligned to the user x axis.
+    let c = src.points[sub.start]
+    let h = pen.half
+    if pen.cap == CAP_SQUARE {
+      run out.moveTo(c.x - h, c.y - h)
+      run out.lineTo(c.x + h, c.y - h)
+      run out.lineTo(c.x + h, c.y + h)
+      run out.lineTo(c.x - h, c.y + h)
+      run out.close()
+    } else if pen.cap == CAP_ROUND {
+      run out.moveTo(c.x + h, c.y)
+      run arc(&mut out, c, Vec2 { x: 1.0, y: 0.0 }, Vec2 { x: 0.0, y: -1.0 }, Vec2 { x: -1.0, y: 0.0 }, h, pen.tolerance)
+      run arc(&mut out, c, Vec2 { x: -1.0, y: 0.0 }, Vec2 { x: 0.0, y: 1.0 }, Vec2 { x: 1.0, y: 0.0 }, h, pen.tolerance)
+      run out.close()
+    }
+    return
+  }
+  if sub.closed {
+    run closedSide(&mut out, &src, sub, false, pen)
+    run closedSide(&mut out, &src, sub, true, pen)
+  } else {
+    run openSide(&mut out, &src, sub, false, pen, true)
+    run openSide(&mut out, &src, sub, true, pen, false)
+    run out.close()
+  }
+}

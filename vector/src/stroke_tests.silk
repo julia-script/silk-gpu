@@ -1,0 +1,174 @@
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import geometry { Affine, Rect }
+import path { Path }
+import strips { Rasterizer, Coverage, NONZERO }
+import stroke { Stroke, Stroker, JOIN_MITER, JOIN_MITER_CLIP, JOIN_ROUND, JOIN_BEVEL, JOIN_ARCS, CAP_BUTT, CAP_ROUND, CAP_SQUARE }
+
+const PI: f64 = 3.141592653589793
+
+/// Strokes `path` and returns the covered area in device pixels on a 64 x 64 canvas.
+pub effect fn strokedArea(path: &Path, style: &Stroke, transform: &Affine) -> f64 ! OutOfMemoryError ? &mut Allocator {
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  run stroker.stroke(path, style, transform, &mut outline)
+  let mut raster = Rasterizer.make()
+  let mut coverage = Coverage.make(64, 64)
+  run raster.fill(&outline, transform, NONZERO, &mut coverage)
+  let mut sum: f64 = 0.0
+  let mut y: u32 = 0
+  while y < 64 {
+    let mut x: u32 = 0
+    while x < 64 {
+      sum = sum + u32.toF64(u8.toU32(coverage.alphaAt(x, y))) / 255.0
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return sum
+}
+
+fn near(value: f64, expected: f64, tolerance: f64) -> bool { return f64.abs(value - expected) <= tolerance }
+
+pub effect fn line() -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut p = Path.make()
+  run p.moveTo(10.0, 20.0)
+  run p.lineTo(30.0, 20.0)
+  return move p
+}
+
+pub effect fn square() -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut p = Path.make()
+  run p.rect(Rect.make(10.0, 10.0, 20.0, 20.0))
+  return move p
+}
+
+test effect fn capsExtendOpenLines() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run line() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  let butt = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.cap = CAP_SQUARE
+  let squared = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.cap = CAP_ROUND
+  let round = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(near(butt, 80.0, 0.01), "butt: 20 x 4")
+  run Testing.expect(near(squared, 96.0, 0.01), "square: 24 x 4")
+  run Testing.expect(near(round, 80.0 + 4.0 * PI, 0.05), "round: 20 x 4 + circle")
+}
+
+test effect fn joinsShapeClosedCorners() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run square() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(2.0)
+  let miter = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.join = JOIN_BEVEL
+  let bevel = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.join = JOIN_ROUND
+  let round = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(near(miter, 22.0 * 22.0 - 18.0 * 18.0, 0.01), "miter: ring 22^2 - 18^2")
+  run Testing.expect(near(bevel, 160.0 - 2.0, 0.01), "bevel cuts four half-unit triangles")
+  run Testing.expect(near(round, 160.0 - 4.0 + PI, 0.02), "round corners")
+}
+
+test effect fn miterLimitFallsBack() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run square() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(2.0)
+  // A right angle has miter ratio sqrt(2), so limit 1.4 exceeds it.
+  style.miterLimit = 1.4
+  let miter = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.miterLimit = 1.0
+  style.join = JOIN_MITER_CLIP
+  let clipped = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.join = JOIN_ARCS
+  let arcs = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(near(miter, 158.0, 0.01), "miter over the limit becomes bevel")
+  // Clipping at distance 1 from the vertex removes a triangle of height sqrt(2) - 1 per corner.
+  let cut = (f64.sqrt(2.0) - 1.0) * (f64.sqrt(2.0) - 1.0)
+  run Testing.expect(near(clipped, 160.0 - 4.0 * cut, 0.01), "miter-clip")
+  run Testing.expect(near(arcs, clipped, 0.0001), "arcs on straight segments match miter-clip")
+}
+
+test effect fn dashesCutTheCenterline() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run line() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(2.0)
+  run style.setDashes(&[4.0, 4.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  // On: 0-4, 8-12, 16-20 of 20.
+  let a = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.dashOffset = 2.0
+  // On: 0-2, 6-10, 14-18.
+  let b = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run style.setDashes(&[3.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.dashOffset = 0.0 - 1.0
+  // Odd lists repeat: [3, 3]; offset -1 starts 2 units into the last gap: on 1-4, 7-10, 13-16, 19-20.
+  let c = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run style.setDashes(&[0.0, 0.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let solid = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(near(a, 24.0, 0.01), "dash 4 4")
+  run Testing.expect(near(b, 20.0, 0.01), "dash offset 2")
+  run Testing.expect(near(c, 20.0, 0.01), "odd list, negative offset")
+  run Testing.expect(near(solid, 40.0, 0.01), "all-zero list is solid")
+}
+
+test effect fn zeroLengthSubpathsDrawDots() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(20.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(20.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(6.0)
+  let butt = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.cap = CAP_SQUARE
+  let squared = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.cap = CAP_ROUND
+  let round = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(butt == 0.0, "butt draws nothing")
+  run Testing.expect(near(squared, 36.0, 0.01), "square dot")
+  run Testing.expect(near(round, 9.0 * PI, 0.05), "round dot")
+}
+
+test effect fn curvesAndTransformsStayAccurate() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.circle(16.0, 16.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(2.0)
+  let ring = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  let scaled = run strokedArea(&p, &style, &Affine.scale(2.0, 2.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let expected = PI * (11.0 * 11.0 - 9.0 * 9.0)
+  run Testing.expect(f64.abs(ring - expected) / expected < 0.01, "ring area")
+  run Testing.expect(f64.abs(scaled - 4.0 * expected) / (4.0 * expected) < 0.01, "scaled ring area")
+}
+
+test effect fn sharpTurnsKeepInnerJoinsFilled() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  // A path that doubles back on itself covers one stroke's area, not zero.
+  let mut p = Path.make()
+  run p.moveTo(10.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(30.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(2.0)
+  style.join = JOIN_BEVEL
+  let area = run strokedArea(&p, &style, &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(near(area, 40.0, 0.01), "doubled-back line")
+}
+
+test effect fn innerJoinsOfPolygonsAreExact() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  // A regular 16-gon: the miter ring's exact area is 2 * perimeter * half-width.
+  let mut p = Path.make()
+  run p.moveTo(26.0, 16.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 1
+  while i < 16 {
+    let t = u32.toF64(i) * 2.0 * PI / 16.0
+    run p.lineTo(16.0 + 10.0 * f64.cos(t), 16.0 + 10.0 * f64.sin(t)) |> Effect.provideMut<Allocator>(&mut allocator)
+    i = i + 1
+  }
+  run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  let area = run strokedArea(&p, &Stroke.make(2.0), &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(near(area, 2.0 * 2.0 * 16.0 * 10.0 * f64.sin(PI / 16.0), 0.1), "16-gon ring")
+}
