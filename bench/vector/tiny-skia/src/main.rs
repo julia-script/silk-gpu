@@ -127,11 +127,47 @@ fn icons(target: &mut Pixmap) {
     }
 }
 
+fn tile() -> Pixmap {
+    let mut image = Pixmap::new(64, 64).unwrap();
+    let d = image.data_mut();
+    for y in 0..64u32 {
+        for x in 0..64u32 {
+            let i = ((y * 64 + x) * 4) as usize;
+            let dark = ((x / 8) + (y / 8)) % 2 == 0;
+            d[i] = if dark { x * 2 } else { 255 - x * 2 } as u8;
+            d[i + 1] = if dark { y * 3 } else { 250 - y * 3 } as u8;
+            d[i + 2] = if dark { 40 } else { 200 };
+            d[i + 3] = 255;
+        }
+    }
+    image
+}
+
+fn images(target: &mut Pixmap, image: &Pixmap) {
+    let mut random = Random(7);
+    for _ in 0..60 {
+        let (x, y) = (random.next() * 412.0, random.next() * 412.0);
+        let (w, h) = (20.0 + random.next() * 80.0, 20.0 + random.next() * 80.0);
+        let angle = random.next() * PI;
+        let scale = 0.5 + random.next() * 1.5;
+        let (cos, sin) = (angle.cos() * scale, angle.sin() * scale);
+        let placement = Transform::from_row(cos as f32, sin as f32, -sin as f32, cos as f32, x as f32, y as f32);
+        let mut paint = Paint::default();
+        paint.shader = Pattern::new(image.as_ref(), SpreadMode::Repeat, FilterQuality::Bilinear, 1.0, placement);
+        paint.anti_alias = true;
+        let rect = Rect::from_xywh(x as f32, y as f32, w as f32, h as f32).unwrap();
+        target.fill_rect(rect, &paint, Transform::identity(), None);
+    }
+}
+
 fn main() {
     let frames: usize = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(20);
     let mut target = Pixmap::new(512, 512).unwrap();
-    let scenes: [(&str, fn(&mut Pixmap)); 5] =
-        [("fills", fills), ("strokes", strokes), ("gradients", gradients), ("polygon", polygon), ("icons", icons)];
+    let image = tile();
+    let scenes: [(&str, &dyn Fn(&mut Pixmap)); 6] = [
+        ("fills", &fills), ("strokes", &strokes), ("gradients", &gradients), ("polygon", &polygon), ("icons", &icons),
+        ("images", &|target: &mut Pixmap| images(target, &image)),
+    ];
     for (name, draw) in scenes {
         let mut times = Vec::new();
         for _ in 0..frames {

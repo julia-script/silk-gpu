@@ -23,7 +23,7 @@ import vector.path { Path }
 import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import vector.stroke { Stroke, Stroker, JOIN_ROUND, CAP_BUTT }
 import vector.pixmap { Pixmap, Rgba8 }
-import vector.paint { Gradient, Stop, Solid, SPREAD_PAD }
+import vector.paint { Gradient, Stop, Solid, ImagePattern, SPREAD_PAD, SAMPLE_BILINEAR, EXTEND_REPEAT }
 import vector.paint as painting
 
 const SIZE: u32 = 512
@@ -165,17 +165,61 @@ effect fn icons(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError 
   }
 }
 
+/// A 64 x 64 opaque tile: a two-color checker of 8-pixel squares tinted by position.
+effect fn tile() -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+  let mut image = run Pixmap.make(64, 64)
+  let d = image.dataMut()
+  let mut y: u32 = 0
+  while y < 64 {
+    let mut x: u32 = 0
+    while x < 64 {
+      let i = u32.toUsize(y * 64 + x) * 4
+      let dark = ((x / 8) + (y / 8)) % 2 == 0
+      d[i] = u32.toU8(if dark { x * 2 } else { 255 - x * 2 })
+      d[i + 1] = u32.toU8(if dark { y * 3 } else { 250 - y * 3 })
+      d[i + 2] = u32.toU8(if dark { 40 } else { 200 })
+      d[i + 3] = 255
+      x = x + 1
+    }
+    y = y + 1
+  }
+  return move image
+}
+
+effect fn images(r: &mut Renderer, target: &mut Pixmap, image: &Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut random = Random.make()
+  let id = Affine.identity()
+  let mut i: u32 = 0
+  while i < 60 {
+    let x = random.next() * 412.0
+    let y = random.next() * 412.0
+    let w = 20.0 + random.next() * 80.0
+    let h = 20.0 + random.next() * 80.0
+    let angle = random.next() * PI
+    let scale = 0.5 + random.next() * 1.5
+    let cos = f64.cos(angle) * scale
+    let sin = f64.sin(angle) * scale
+    let placement = Affine { a: cos, b: sin, c: 0.0 - sin, d: cos, e: x, f: y }
+    r.path.clear()
+    run r.path.rect(Rect.make(x, y, w, h))
+    run r.raster.fill(&r.path, &id, NONZERO, &mut r.coverage)
+    painting.fill(&mut target, &r.coverage, &ImagePattern.make(image, &placement, SAMPLE_BILINEAR, EXTEND_REPEAT), 255)
+    i = i + 1
+  }
+}
+
 fn nanos(start: &Instant, end: &Instant) -> i64 {
   return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000 + SystemClock.nanoseconds(end) - SystemClock.nanoseconds(start)
 }
 
-effect fn scene(r: &mut Renderer, target: &mut Pixmap, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn scene(r: &mut Renderer, target: &mut Pixmap, image: &Pixmap, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
   target.clear(Rgba8.make(255, 255, 255, 255))
   if index == 0 { run fills(&mut r, &mut target) }
   else if index == 1 { run strokes(&mut r, &mut target) }
   else if index == 2 { run gradients(&mut r, &mut target) }
   else if index == 3 { run polygon(&mut r, &mut target) }
-  else { run icons(&mut r, &mut target) }
+  else if index == 4 { run icons(&mut r, &mut target) }
+  else { run images(&mut r, &mut target, image) }
 }
 
 fn name(index: u32) -> string<'static> {
@@ -184,7 +228,8 @@ fn name(index: u32) -> string<'static> {
     1 => "strokes"
     2 => "gradients"
     3 => "polygon"
-    _ => "icons"
+    4 => "icons"
+    _ => "images"
   }
 }
 
@@ -194,7 +239,8 @@ fn output(index: u32) -> string<'static> {
     1 => "vector-strokes.rgba"
     2 => "vector-gradients.rgba"
     3 => "vector-polygon.rgba"
-    _ => "vector-icons.rgba"
+    4 => "vector-icons.rgba"
+    _ => "vector-images.rgba"
   }
 }
 
@@ -212,13 +258,14 @@ effect fn program() -> i32 ! OutOfMemoryError | FileError | HostInputError ? &mu
   let frames: u32 = 20
   let mut r = Renderer { raster: Rasterizer.make(), stroker: Stroker.make(), coverage: Coverage.make(SIZE, SIZE), path: Path.make(), outline: Path.make() }
   let mut target = run Pixmap.make(SIZE, SIZE)
+  let image = run tile()
   let mut index: u32 = 0
-  while index < 5 {
+  while index < 6 {
     let mut times = List<i64>.make()
     let mut frame: u32 = 0
     while frame < frames {
       let start = run MonotonicClock.now()
-      run scene(&mut r, &mut target, index)
+      run scene(&mut r, &mut target, &image, index)
       let end = run MonotonicClock.now()
       run times.append(nanos(&start, &end))
       frame = frame + 1

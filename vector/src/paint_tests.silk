@@ -16,6 +16,8 @@ import paint {
 }
 import paint as painting
 import paint { Shader }
+import pixmap { pack }
+import silk.num.usize
 
 fn close(a: u8, b: u8, tolerance: i32) -> bool {
   let d = u8.toI32(a) - u8.toI32(b)
@@ -220,4 +222,43 @@ test effect fn uniformFillMatchesShadedSpans() -> () ! AssertionError<'static> |
     c = c + 1
   }
   run Testing.expect(ok, "uniform fills match span shading byte for byte")
+}
+
+test effect fn imageSpansMatchSinglePixels() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut image = run Pixmap.make(5, 3) |> Effect.provideMut<Allocator>(&mut allocator)
+  let d = image.dataMut()
+  let mut i: usize = 0
+  while i < d.length {
+    d[i] = u32.toU8(u32.wrappingMultiply(usize.toU32(i), 37) % 256)
+    i = i + 1
+  }
+  let transforms = [
+    Affine { a: 1.7, b: 0.4, c: -0.3, d: 2.1, e: -3.25, f: 1.5 },
+    Affine { a: 0.31, b: -0.9, c: 0.77, d: 0.12, e: 40.0, f: -7.0 },
+    Affine { a: 1.0e-14, b: 0.0, c: 0.0, d: 1.0e-14, e: 0.0, f: 0.0 },
+    Affine { a: -2.5, b: 0.0, c: 0.0, d: 3.0, e: 100.0, f: 0.0 },
+  ]
+  let mut ok = true
+  let mut t: usize = 0
+  while t < 4 {
+    let mut e: u8 = 0
+    while e < 2 {
+      let pattern = ImagePattern.make(&image, &transforms[t], SAMPLE_BILINEAR, e)
+      let mut colors: [u32; 23] = [0; 23]
+      let mut y: u32 = 0
+      while y < 9 {
+        pattern.shadeSpan(3, y, 23, &mut colors)
+        let mut x: u32 = 0
+        while x < 23 {
+          if colors[u32.toUsize(x)] != pack(pattern.shade(3 + x, y)) { ok = false }
+          x = x + 1
+        }
+        y = y + 1
+      }
+      e = e + 1
+    }
+    t = t + 1
+  }
+  run Testing.expect(ok, "four-pixel image spans match single-pixel sampling")
 }

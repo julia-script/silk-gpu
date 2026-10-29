@@ -10,7 +10,7 @@ from pathlib import Path
 from _build import ROOT, build
 
 OUT = ROOT / ".cache" / "bench" / "vector"
-SCENES = ("fills", "strokes", "gradients", "polygon", "icons")
+SCENES = ("fills", "strokes", "gradients", "polygon", "icons", "images")
 
 
 def timings(command):
