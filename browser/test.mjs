@@ -102,6 +102,7 @@ try {
     ...(process.platform === 'linux' ? ['--use-vulkan=swiftshader'] : []),
     '--enable-logging=stderr',
   ] });
+  console.log(`Chromium ${browser.version()} (${process.platform}): compiled Silk WebGPU tests`);
   const page = await browser.newPage();
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -141,16 +142,16 @@ try {
   });
   try {
     const screenshot = await page.locator('#gpu-test').screenshot();
+    await mkdir(resolve(root, '.cache/pixels'), { recursive: true });
+    await writeFile(resolve(root, '.cache/pixels/browser-canvas.png'), screenshot);
     const actual = png(screenshot);
     const finalFrame = canvasResult.frames.at(-1);
     if (actual.width !== finalFrame.width || actual.height !== finalFrame.height)
       throw new Error('Canvas presentation dimensions do not match the resized surface');
     for (let pixel = 0; pixel < actual.width * actual.height; pixel++) {
       if (canvasResult.rgba.some((value, channel) => Math.abs(actual.rgba[pixel * 4 + channel] - value) > 2))
-        throw new Error(`Canvas presentation differs at pixel ${pixel}`);
+        throw new Error(`Canvas presentation differs at pixel ${pixel}: expected RGBA ${canvasResult.rgba}, actual ${[...actual.rgba.subarray(pixel * 4, pixel * 4 + 4)]}`);
     }
-    await mkdir(resolve(root, '.cache/pixels'), { recursive: true });
-    await writeFile(resolve(root, '.cache/pixels/browser-canvas.png'), screenshot);
   } finally {
     await page.evaluate(async () => {
       await globalThis.canvasCheck.cleanup();
