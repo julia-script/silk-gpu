@@ -1,6 +1,7 @@
 //! Points, rectangles and 2D affine transforms in user space (f64).
 import silk.core.ownership { Copy }
 import silk.num.f64
+import silk.option { Option }
 
 pub struct Point {
   pub x: f64,
@@ -55,6 +56,18 @@ impl Affine {
       e: self.a * other.e + self.c * other.f + self.e,
       f: self.b * other.e + self.d * other.f + self.f,
     }
+  }
+  pub fn determinant(self: &Self) -> f64 { return self.a * self.d - self.b * self.c }
+  /// The inverse transform, or `None` when the matrix is singular or not finite.
+  pub fn invert(self: &Self) -> Option<Affine> {
+    let det = self.determinant()
+    if !(det != 0.0) || !f64.isFinite(det) { return Option<Affine>.none() }
+    let k = 1.0 / det
+    let a = self.d * k
+    let b = 0.0 - self.b * k
+    let c = 0.0 - self.c * k
+    let d = self.a * k
+    return Option<Affine>.some(Affine { a: a, b: b, c: c, d: d, e: 0.0 - (a * self.e + c * self.f), f: 0.0 - (b * self.e + d * self.f) })
   }
   pub fn apply(self: &Self, point: Point) -> Point {
     return Point { x: self.a * point.x + self.c * point.y + self.e, y: self.b * point.x + self.d * point.y + self.f }
