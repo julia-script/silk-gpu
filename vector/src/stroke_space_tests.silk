@@ -1,0 +1,648 @@
+//! SVG 2 CR 2018 §8.13: https://www.w3.org/TR/2018/CR-SVG2-20181004/coords.html#VectorEffectProperty
+//! §13.5: https://www.w3.org/TR/2018/CR-SVG2-20181004/painting.html#StrokeShape
+//! SVGWG #323: widths, dash lengths and offsets belong to the stroke host.
+//! https://github.com/w3c/svgwg/issues/323
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.f64
+import silk.collections.list { List }
+import silk.num.f32
+import flatten { Line }
+import projective
+import silk.num.u32
+import geometry { Point, Rect, Affine }
+import geometry_error { GeometryError }
+import path { Path, MOVE, CLOSE }
+import projective { Homography }
+import stroke { Stroker, Stroke, StrokeBounds, CAP_SQUARE, CAP_ROUND, JOIN_ARCS, JOIN_MITER_CLIP }
+
+fn identity() -> Homography {
+  return Homography.fromAffine(&Affine.identity())
+}
+
+fn perspective() -> Homography {
+  return Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.01,
+    wy: 0.0,
+    ww: 1.0,
+  }
+}
+
+fn nearest(p: Point, path: &Path) -> f64 {
+  let points = path.pointList()
+  let verbs = path.verbList()
+  let mut at: usize = 0
+  let mut current = Point.make(0.0, 0.0)
+  let mut start = current
+  let mut best = 1.0e100
+  let mut i: usize = 0
+  while i < verbs.length {
+    if verbs[i] == MOVE {
+      current = points[at]
+      start = current
+      at = at + 1
+    } else {
+      let next = if verbs[i] == CLOSE {
+        start
+      } else {
+        points[at]
+      }
+      if verbs[i] != CLOSE {
+        at = at + 1
+      }
+      let dx = next.x - current.x
+      let dy = next.y - current.y
+      let dd = dx * dx + dy * dy
+      let t = if dd == 0.0 {
+        0.0
+      } else {
+        f64.max(0.0, f64.min(1.0, ((p.x - current.x) * dx + (p.y - current.y) * dy) / dd))
+      }
+      let x = p.x - current.x - t * dx
+      let y = p.y - current.y - t * dy
+      best = f64.min(best, f64.sqrt(x * x + y * y))
+      current = next
+    }
+    i = i + 1
+  }
+  return best
+}
+
+test effect fn strokeHostAffineReflectionSkewAndNonuniformCaps() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(0.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography.fromAffine(&Affine { a: -3.0, b: 0.0, c: 3.0, d: 4.0, e: 2.0, f: 7.0 })
+  let mut style = Stroke.make(10.0)
+  style.cap = CAP_SQUARE
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -100.0, y0: -100.0, x1: 100.0, y1: 100.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Host tangent=(3/5,4/5), normal=(-4/5,3/5), halfwidth=5.
+  run Testing.expect(nearest(Point.make(-5.0, 6.0), &out) < 0.001, "analytic start square corner")
+  run Testing.expect(nearest(Point.make(39.0, 48.0), &out) < 0.001, "analytic end square corner")
+}
+
+test effect fn strokeHostProjectiveWideCurveUsesRationalNormal() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(50.0, 0.0, 100.0, 100.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(80.0)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &perspective(),
+    &identity(),
+    Rect { x0: -200.0, y0: -200.0, x1: 200.0, y1: 200.0 },
+    0.02,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 200 {
+    let t = u32.toF64(i) / 200.0
+    let w = 1.0 + t
+    let x = 100.0 * t / w
+    let y = 100.0 * t * t / w
+
+    // Quotient rule: derivative proportional to (1, 2t+t²).
+    let dy = 2.0 * t + t * t
+    let n = f64.sqrt(1.0 + dy * dy)
+    run Testing.expect(
+      nearest(Point.make(x - 40.0 * dy / n, y + 40.0 / n), &out) <= 0.02,
+      "wide rational outer offset certified",
+    )
+    run Testing.expect(
+      nearest(Point.make(x + 40.0 * dy / n, y - 40.0 / n), &out) <= 0.02,
+      "wide rational inner offset certified",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn strokeHostDashesAndOffsetUseHostDistance() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(100.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  run style.setDashes(&[10.0, 5.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  style.dashOffset = 3.0
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &perspective(),
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 100.0, y1: 100.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(nearest(Point.make(7.0, 0.0), &out) < 0.001, "first dash ends at host 7")
+  run Testing.expect(nearest(Point.make(12.0, 0.0), &out) < 0.001, "second dash starts at host 12")
+  run Testing.expect(nearest(Point.make(22.0, 0.0), &out) < 0.001, "second dash ends at host 22")
+  let box = run stroker.boundsInSpace(&p, &style, &perspective(), &identity(), 0.01, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !box.empty && f64.abs(box.bounds.x1 - 50.0) <= 0.01,
+    "undashed box reaches rational endpoint",
+  )
+}
+
+test effect fn strokeHostEyeCrossingHasNoVisibleArtificialCap() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(200.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut h = perspective()
+  h.wx = -0.01
+  let mut style = Stroke.make(4.0)
+  style.cap = CAP_SQUARE
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -10.0, y0: -10.0, x1: 100.0, y1: 10.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nearest(Point.make(99.0, 2.0), &out) < 0.001,
+    "positive-w ray reaches clip boundary",
+  )
+  run Testing.expect(nearest(Point.make(99.0, 0.0), &out) > 1.9, "clipping creates no visible cap")
+}
+
+test effect fn strokeHostCollapsedContourRetainsRoundCap() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(1.0, 2.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(7.0, 9.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography.fromAffine(&Affine { a: 0.0, b: 0.0, c: 0.0, d: 0.0, e: 3.0, f: 4.0 })
+  let mut style = Stroke.make(6.0)
+  style.cap = CAP_ROUND
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -10.0, y0: -10.0, x1: 20.0, y1: 20.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nearest(Point.make(6.0, 4.0), &out) <= 0.01,
+    "singular map retains zero-length contour cap",
+  )
+}
+
+test effect fn strokeHostRejectsInvalidMapAndHidesNegativeW() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(2.0)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  let mut h = identity()
+  h.ww = -1.0
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 20.0, y1: 20.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(out.pointList().length == 0, "negative homogeneous halfspace is invisible")
+  h.xx = 1.0 / 0.0
+  let result = run Effect.result(
+    stroker.strokeInSpace(
+      &p,
+      &style,
+      &h,
+      &identity(),
+      Rect { x0: -20.0, y0: -20.0, x1: 20.0, y1: 20.0 },
+      0.01,
+      &mut out,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {}
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "nonfinite map fails explicitly")
+    }
+  }
+}
+
+test effect fn strokeHostCubicRepeatedControlRetainsAnalyticCap() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.cubicTo(0.0, 0.0, 0.0, 10.0, 10.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  style.cap = CAP_SQUARE
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &perspective(),
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 30.0, y1: 30.0 },
+    0.02,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nearest(Point.make(-2.0, -2.0), &out) < 0.002,
+    "limiting cubic tangent, not first tessellation chord",
+  )
+  run Testing.expect(
+    nearest(Point.make(2.0, -2.0), &out) < 0.002,
+    "both analytic square cap corners",
+  )
+}
+
+test effect fn strokeHostArcsAndMiterClipUseMappedJoinDirections() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography.fromAffine(&Affine { a: 2.0, b: 0.0, c: 1.0, d: 1.0, e: 0.0, f: 0.0 })
+  let mut style = Stroke.make(4.0)
+  style.join = JOIN_ARCS
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 50.0, y1: 50.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nearest(Point.make(20.0 + 2.0 * (f64.sqrt(2.0) - 1.0), -2.0), &out) < 0.001,
+    "zero-curvature arcs join intersects analytic host offsets",
+  )
+  out.clear()
+  style.join = JOIN_MITER_CLIP
+  style.miterLimit = 1.0
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 50.0, y1: 50.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let angle = 0.39269908169872414
+  run Testing.expect(
+    nearest(Point.make(20.0 + 2.0 * f64.sin(angle), -2.0 * f64.cos(angle)), &out) < 0.001,
+    "miter clip plane uses mapped angle bisector",
+  )
+}
+
+test effect fn strokeHostRationalEllipseUsesAnalyticCurvature() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(20.0, 0.0),
+    Point.make(0.0, 20.0),
+    0.0,
+    1.5707963267948966,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(30.0)
+  let mut h = perspective()
+  h.xx = -1.0
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -60.0, y0: -60.0, x1: 60.0, y1: 60.0 },
+    0.02,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 128 {
+    let angle = 1.5707963267948966 * u32.toF64(i) / 128.0
+    let c = f64.cos(angle)
+    let s = f64.sin(angle)
+    let w = 1.0 + 0.2 * c
+    let dx = 20.0 * s
+    let dy = 20.0 * c + 4.0
+    let n = f64.sqrt(dx * dx + dy * dy)
+    run Testing.expect(
+      nearest(Point.make(-20.0 * c / w - 15.0 * dy / n, 20.0 * s / w + 15.0 * dx / n), &out)
+        <= 0.02,
+      "wide rational ellipse normal from quotient-rule derivative",
+    )
+    run Testing.expect(
+      nearest(Point.make(-20.0 * c / w + 15.0 * dy / n, 20.0 * s / w - 15.0 * dx / n), &out)
+        <= 0.02,
+      "both rational ellipse offsets",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn strokeHostUnboundedBoundsAndUnrepresentableMapsFail() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(200.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(4.0)
+  let mut h = perspective()
+  h.wx = -0.01
+  let mut stroker = Stroker.make()
+  let box = run Effect.result(stroker.boundsInSpace(&p, &style, &h, &identity(), 0.01, true))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &box {
+    Result<StrokeBounds, GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {}
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "unbounded reference box must not be clipped")
+    }
+  }
+  h = identity()
+  h.xx = 1.0e308
+  let mut out = Path.make()
+  let result = run Effect.result(
+    stroker.strokeInSpace(
+      &p,
+      &style,
+      &h,
+      &identity(),
+      Rect { x0: -20.0, y0: -20.0, x1: 20.0, y1: 20.0 },
+      0.01,
+      &mut out,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {}
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "unrepresentable mapped geometry fails explicitly")
+    }
+  }
+}
+
+effect fn deviceOutline(outline: &Path, h: &Homography, clip: Rect) -> Path
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let mut lines = List<Line>.make()
+  run projective.fill(outline, h, clip, 0.001, &mut lines)
+  let mut result = Path.make()
+  let mut i: usize = 0
+  while i < lines.length() {
+    let line = lines.asSlice()[i]
+    run result.moveTo(f32.toF64(line.x0), f32.toF64(line.y0))
+    run result.lineTo(f32.toF64(line.x1), f32.toF64(line.y1))
+    i = i + 1
+  }
+  return move result
+}
+
+test effect fn strokeHostProjectiveOutputControlsDeviceError() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(50.0, 0.0, 100.0, 100.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(20.0)
+  let target = Homography {
+    xx: 2.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 3.0,
+    yw: 0.0,
+    wx: 0.005,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let clip = Rect { x0: -100.0, y0: -100.0, x1: 200.0, y1: 200.0 }
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(&p, &style, &perspective(), &target, clip, 0.02, &mut out)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let device = run deviceOutline(&out, &target, clip)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 128 {
+    let t = u32.toF64(i) / 128.0
+    let dy = 2.0 * t + t * t
+    let n = f64.sqrt(1.0 + dy * dy)
+    let x = 100.0 * t / (1.0 + t) - 10.0 * dy / n
+    let y = 100.0 * t * t / (1.0 + t) + 10.0 / n
+    let w = 1.0 + 0.005 * x
+    run Testing.expect(
+      nearest(Point.make(2.0 * x / w, 3.0 * y / w), &device) <= 0.022,
+      "independent rational normal then projective output within combined error budgets",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn strokeHostDoubleProjectiveCrossingConvergesToVisibleLimit() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut source = identity()
+  source.wx = -1.0
+  let mut target = identity()
+  target.wx = 1.0
+  let clip = Rect { x0: -0.5, y0: -0.5, x1: 1.5, y1: 0.5 }
+  let style = Stroke.make(0.2)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(&p, &style, &source, &target, clip, 0.02, &mut out)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let device = run deviceOutline(&out, &target, clip)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // x_host=x/(1-x); output undoes x perspective. Offsets +/-0.1 become
+  // y_device=+/-0.1*(1-x), converging to (1,0), not an infinite device ray.
+  run Testing.expect(
+    nearest(Point.make(1.0, 0.0), &device) <= 0.022,
+    "certified visible finite asymptote",
+  )
+  run Testing.expect(nearest(Point.make(0.5, 0.05), &device) <= 0.002, "true projected host offset")
+  run Testing.expect(
+    nearest(Point.make(0.5, -0.05), &device) <= 0.002,
+    "both sides survive positive-w truncation",
+  )
+}
+
+test effect fn strokeHostPreservesSeparateZeroLengthContours() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.moveTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  style.cap = CAP_ROUND
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &perspective(),
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 40.0, y1: 20.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(nearest(Point.make(2.0, 0.0), &out) < 0.01, "first zero-length contour cap")
+  run Testing.expect(
+    nearest(Point.make(20.0 / 1.2 + 2.0, 0.0), &out) < 0.01,
+    "second zero-length contour cap",
+  )
+  run Testing.expect(
+    nearest(Point.make(8.0, 0.0), &out) > 5.0,
+    "no invented connection between contours",
+  )
+}
+
+test effect fn strokeHostDoesNotChangeReusableSourceStrokeSemantics() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(4.0)
+  let affine = Affine.scale(3.0, 1.0)
+  let h = Homography.fromAffine(&affine)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect { x0: -20.0, y0: -20.0, x1: 40.0, y1: 20.0 },
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nearest(Point.make(30.0, 0.0), &out) < 0.001,
+    "host outline is transformed centerline",
+  )
+  out.clear()
+  run stroker.stroke(&p, &style, &affine, 0.01, &mut out)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    nearest(Point.make(10.0, 0.0), &out) < 0.001,
+    "ordinary stroke still returns source outline",
+  )
+  run Testing.expect(
+    nearest(Point.make(30.0, 0.0), &out) > 19.0,
+    "host state never leaks into ordinary stroke",
+  )
+}
+
+test effect fn strokeHostNonpositiveBezierStartingAtEyeIsInvisible() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+
+  // Homogeneous Bézier weights are [0,-1,-2,-3]. Their convex hull is
+  // nonpositive, including the exact eye-plane endpoint: no epsilon-w sliver.
+  run p.moveTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.cubicTo(2.0, 1.0, 3.0, 1.0, 4.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut source = identity()
+  source.wx = -1.0
+  let mut target = identity()
+  target.wx = 1.0
+  let style = Stroke.make(0.2)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &source,
+    &target,
+    Rect { x0: -0.5, y0: -0.5, x1: 1.5, y1: 0.5 },
+    0.02,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(out.pointList().length == 0, "exact nonpositive Bernstein hull is invisible")
+}

@@ -1,0 +1,467 @@
+//! Analytic stroke-host curves. Rational derivatives and interval bounds feed the same
+//! offset/cap/join/dash machinery as ordinary source-space stroking. No centerline polygon.
+import silk.core.ownership { Copy }
+import silk.num.f64
+import geometry { Point, Affine }
+import path { LINE, QUAD, ARC }
+import stroke_curve { Curve, norm }
+import projective { Homography }
+
+fn length(p: Point) -> f64 {
+  return norm(p.x, p.y)
+}
+
+fn linear(h: &Homography, p: Point) -> Point {
+  return Point.make(h.xx * p.x + h.xy * p.y, h.yx * p.x + h.yy * p.y)
+}
+
+fn numerator(h: &Homography, p: Point) -> Point {
+  let v = linear(h, p)
+  return Point.make(v.x + h.xw, v.y + h.yw)
+}
+
+fn weight(h: &Homography, p: Point) -> f64 {
+  return h.wx * p.x + h.wy * p.y + h.ww
+}
+
+fn weightDerivative(h: &Homography, p: Point) -> f64 {
+  return h.wx * p.x + h.wy * p.y
+}
+
+fn divided(p: Point, w: f64) -> Point {
+  return Point.make(p.x / w, p.y / w)
+}
+
+fn difference(a: Point, b: Point, k: f64) -> Point {
+  return Point.make(a.x - b.x * k, a.y - b.y * k)
+}
+
+// Error-free residuals preserve *exact* zero endpoints of the homogeneous
+// Bernstein hull. Unconditional epsilon guards would turn an invisible interval
+// beginning at w=0 into a fictitious positive sliver at every subdivision depth.
+// The Dekker predicate follows paint's exact product machinery, but only claims
+// exactness in a range where all split products remain normal and finite.
+fn productRange(a: f64, b: f64) -> Point {
+  let p = a * b
+  if !f64.isFinite(p) {
+    return Point.make(-1.0 / 0.0, 1.0 / 0.0)
+  }
+  if a == 0.0 || b == 0.0 {
+    return Point.make(0.0, 0.0)
+  }
+  if f64.abs(a) >= 1.0e-100 && f64.abs(a) <= 1.0e100 && f64.abs(b) >= 1.0e-100
+    && f64.abs(b) <= 1.0e100 {
+    let sa = 134217729.0 * a
+    let sb = 134217729.0 * b
+    let ah = sa - (sa - a)
+    let bh = sb - (sb - b)
+    let al = a - ah
+    let bl = b - bh
+    let error = ((ah * bh - p) + ah * bl + al * bh) + al * bl
+    if error == 0.0 {
+      return Point.make(p, p)
+    }
+  }
+  let guard = f64.abs(p) * 3.552713678800501e-15 + 1.5810100666919889e-322
+  return Point.make(p - guard, p + guard)
+}
+
+fn sumRange(a: f64, b: f64) -> Point {
+  let s = a + b
+  if !f64.isFinite(s) {
+    return Point.make(-1.0 / 0.0, 1.0 / 0.0)
+  }
+  let virtual = s - a
+  let error = (a - (s - virtual)) + (b - virtual)
+  if error == 0.0 {
+    return Point.make(s, s)
+  }
+  let guard = (f64.abs(a) + f64.abs(b)) * 3.552713678800501e-15 + 1.5810100666919889e-322
+  return Point.make(s - guard, s + guard)
+}
+
+fn addRange(a: Point, b: Point) -> Point {
+  return Point.make(sumRange(a.x, b.x).x, sumRange(a.y, b.y).y)
+}
+
+fn lerpRange(a: Point, b: Point, t: f64) -> Point {
+  // Subdivision parameters have at most 40 fractional binary bits, so 1-t is exact.
+  let left = Point.make(productRange(a.x, 1.0 - t).x, productRange(a.y, 1.0 - t).y)
+  let right = Point.make(productRange(b.x, t).x, productRange(b.y, t).y)
+  return addRange(left, right)
+}
+
+fn weightControl(h: &Homography, p: Point) -> Point {
+  return addRange(
+    addRange(productRange(h.wx, p.x), productRange(h.wy, p.y)),
+    Point.make(h.ww, h.ww),
+  )
+}
+
+fn blossom(w0: Point, w1: Point, w2: Point, w3: Point, kind: u8, a: f64, b: f64, c: f64) -> Point {
+  let p = lerpRange(w0, w1, a)
+  if kind == LINE {
+    return p
+  }
+  let q = lerpRange(w1, w2, a)
+  let pq = lerpRange(p, q, b)
+  if kind == QUAD {
+    return pq
+  }
+  return lerpRange(pq, lerpRange(q, lerpRange(w2, w3, a), b), c)
+}
+
+fn unionRange(a: Point, b: Point) -> Point {
+  return Point.make(f64.min(a.x, b.x), f64.max(a.y, b.y))
+}
+
+pub struct StrokeCurve {
+  pub kind: u8,
+  source: Curve,
+  mapping: Homography,
+  rational: bool,
+  rounding: f64,
+}
+
+impl Copy for StrokeCurve {}
+
+struct DerivativeBounds {
+  second: f64,
+  normalFirst: f64,
+  normalSecond: f64,
+}
+
+impl Copy for DerivativeBounds {}
+
+impl StrokeCurve {
+  pub fn plain(source: Curve) -> StrokeCurve {
+    return StrokeCurve {
+      kind: source.kind,
+      source: source,
+      mapping: Homography.fromAffine(&Affine.identity()),
+      rational: false,
+      rounding: 0.0,
+    }
+  }
+
+  pub fn mapped(source: Curve, h: &Homography) -> StrokeCurve {
+    if h.wx == 0.0 && h.wy == 0.0 && h.ww > 0.0 {
+      let mut c = source
+      c.p0 = divided(numerator(h, source.p0), h.ww)
+      if source.kind == ARC {
+        c.p1 = divided(linear(h, source.p1), h.ww)
+        c.p2 = divided(linear(h, source.p2), h.ww)
+      } else {
+        c.p1 = divided(numerator(h, source.p1), h.ww)
+        c.p2 = divided(numerator(h, source.p2), h.ww)
+      }
+      c.p3 = divided(numerator(h, source.p3), h.ww)
+      c.anchorStart = divided(numerator(h, source.anchorStart), h.ww)
+      c.anchorEnd = divided(numerator(h, source.anchorEnd), h.ww)
+      if source.kind == ARC {
+        c = Curve.ellipse(c.p0, c.p1, c.p2, 0.0, c.sweep, c.anchorStart, c.anchorEnd)
+      }
+      let mut result = StrokeCurve.plain(c)
+      let sourceMapped = StrokeCurve {
+        kind: source.kind,
+        source: source,
+        mapping: h.*,
+        rational: true,
+        rounding: 0.0,
+      }
+      result.rounding = sourceMapped.precisionError(0.0, 1.0)
+      return result
+    }
+    return StrokeCurve {
+      kind: source.kind,
+      source: source,
+      mapping: h.*,
+      rational: true,
+      rounding: 0.0,
+    }
+  }
+
+  pub fn collapsed(self: &Self) -> bool {
+    if self.rational {
+      if self.kind != LINE {
+        return false
+      }
+      let a = self.point(0.0)
+      let b = self.point(1.0)
+      return a.x == b.x && a.y == b.y
+    }
+    let c = &self.source
+    if c.kind == ARC {
+      return c.sweep == 0.0 && c.anchorStart.x == c.anchorEnd.x && c.anchorStart.y == c.anchorEnd.y
+    }
+    return c.p0.x == c.p1.x && c.p0.y == c.p1.y && c.p1.x == c.p2.x && c.p1.y == c.p2.y
+      && c.p2.x == c.p3.x
+      && c.p2.y == c.p3.y
+  }
+
+  pub fn point(self: &Self, t: f64) -> Point {
+    let p = self.source.point(t)
+    if !self.rational {
+      return p
+    }
+    return divided(numerator(&self.mapping, p), weight(&self.mapping, p))
+  }
+
+  pub fn derivative(self: &Self, t: f64) -> Point {
+    if !self.rational {
+      return self.source.derivative(t)
+    }
+    let d = self.source.derivative(t)
+    return divided(
+      difference(linear(&self.mapping, d), self.point(t), weightDerivative(&self.mapping, d)),
+      weight(&self.mapping, self.source.point(t)),
+    )
+  }
+
+  fn second(self: &Self, t: f64) -> Point {
+    if !self.rational {
+      return self.source.second(t)
+    }
+    let h = &self.mapping
+    let d = self.source.derivative(t)
+    let dd = self.source.second(t)
+    return divided(
+      difference(
+        difference(linear(h, dd), self.point(t), weightDerivative(h, dd)),
+        self.derivative(t),
+        2.0 * weightDerivative(h, d),
+      ),
+      weight(h, self.source.point(t)),
+    )
+  }
+
+  // A denominator-free derivative numerator. Factoring endpoint scalar zeros in the
+  // original derivative also factors this numerator, preserving true limiting directions.
+  fn normalDerivative(self: &Self, t: f64) -> Point {
+    let v = self.source.normalDerivative(t)
+    let p = self.source.point(t)
+    let h = &self.mapping
+    let av = linear(h, v)
+    let w = weight(h, p)
+    let n = numerator(h, p)
+    let cv = weightDerivative(h, v)
+    return Point.make(av.x * w - n.x * cv, av.y * w - n.y * cv)
+  }
+
+  pub fn tangent(self: &Self, t: f64) -> Point {
+    if !self.rational {
+      return self.source.tangent(t)
+    }
+    let v = self.normalDerivative(t)
+    let n = length(v)
+    if n == 0.0 {
+      return Point.make(1.0, 0.0)
+    }
+    return divided(v, n)
+  }
+
+  pub fn curvature(self: &Self, t: f64) -> f64 {
+    if !self.rational {
+      return self.source.curvature(t)
+    }
+    let d = self.derivative(t)
+    let speed = length(d)
+    if speed == 0.0 {
+      return 0.0
+    }
+    let dd = self.second(t)
+    return ((d.x / speed) * (dd.y / speed) - (d.y / speed) * (dd.x / speed)) / speed
+  }
+
+  // A conservative interval enclosure of any affine functional of the source curve.
+  // Global derivative bounds plus the midpoint value include every point, not samples.
+  pub fn functional(self: &Self, a: f64, b: f64, x: f64, y: f64, z: f64) -> Point {
+    let p = self.source.point((a + b) * 0.5)
+    let center = x * p.x + y * p.y + z
+    let radius = norm(x, y) * (self.source.firstBound() * (b - a) * 0.5 + self.source.anchorError())
+    let guard = (f64.abs(x * p.x) + f64.abs(y * p.y) + f64.abs(z) + radius) * 1.4210854715202004e-14
+    return Point.make(center - radius - guard, center + radius + guard)
+  }
+
+  pub fn precisionError(self: &Self, a: f64, b: f64) -> f64 {
+    if !self.rational {
+      return self.rounding
+    }
+    let h = &self.mapping
+    let p = self.source.point((a + b) * 0.5)
+    let r = self.source.firstBound() * (b - a) * 0.5 + self.source.anchorError()
+    let x = f64.abs(p.x) + r
+    let y = f64.abs(p.y) + r
+    let n = f64.max(
+      f64.abs(h.xx) * x + f64.abs(h.xy) * y + f64.abs(h.xw),
+      f64.abs(h.yx) * x + f64.abs(h.yy) * y + f64.abs(h.yw),
+    )
+    let w = self.weightRange(a, b)
+    if !(w.x > 0.0) {
+      return 1.0 / 0.0
+    }
+    let work = f64.abs(h.wx) * x + f64.abs(h.wy) * y + f64.abs(h.ww)
+    let matrix = norm(norm(h.xx, h.xy), norm(h.yx, h.yy))
+    let anchors = self.source.anchorError() * (matrix / w.x + n * norm(h.wx, h.wy) / (w.x * w.x))
+    return anchors + (n / w.x) * (1.0 + work / w.x) * 2.8421709430404007e-14
+  }
+
+  pub fn weightRange(self: &Self, a: f64, b: f64) -> Point {
+    let h = &self.mapping
+    if h.wx == 0.0 && h.wy == 0.0 {
+      return Point.make(h.ww, h.ww)
+    }
+    if self.kind == ARC {
+      return self.functional(a, b, h.wx, h.wy, h.ww)
+    }
+    let w0 = weightControl(h, self.source.p0)
+    let w1 = weightControl(h, self.source.p1)
+    let w2 = weightControl(h, self.source.p2)
+    let w3 = weightControl(h, self.source.p3)
+    let first = blossom(w0, w1, w2, w3, self.kind, a, a, a)
+    let last = blossom(w0, w1, w2, w3, self.kind, b, b, b)
+    let endpoints = unionRange(first, last)
+    if self.kind == LINE {
+      return endpoints
+    }
+    if self.kind == QUAD {
+      return unionRange(endpoints, blossom(w0, w1, w2, w3, self.kind, a, b, b))
+    }
+    return unionRange(
+      endpoints,
+      unionRange(
+        blossom(w0, w1, w2, w3, self.kind, a, a, b),
+        blossom(w0, w1, w2, w3, self.kind, a, b, b),
+      ),
+    )
+  }
+
+  pub fn weightAt(self: &Self, t: f64) -> f64 {
+    return weight(&self.mapping, self.source.point(t))
+  }
+
+  fn derivativeBounds(self: &Self, a: f64, b: f64) -> DerivativeBounds {
+    let h = &self.mapping
+    let mid = (a + b) * 0.5
+    let radius = (b - a) * 0.5
+    let p = self.source.point(mid)
+    let d1 = self.source.firstBound()
+    let d2 = self.source.secondBound()
+    let matrix = norm(norm(h.xx, h.xy), norm(h.yx, h.yy))
+    let c = norm(h.wx, h.wy)
+    let w = self.weightRange(a, b)
+    if !(w.x > 0.0) {
+      return DerivativeBounds { second: 1.0 / 0.0, normalFirst: 1.0 / 0.0, normalSecond: 1.0 / 0.0 }
+    }
+    let n = length(numerator(h, p)) + matrix * (d1 * radius + self.source.anchorError())
+    let q0 = n / w.x
+    let q1 = (matrix * d1 + q0 * c * d1) / w.x
+    let q2 = (matrix * d2 + q0 * c * d2 + 2.0 * q1 * c * d1) / w.x
+    let v1 = self.source.normalFirstBound()
+    let v2 = self.source.normalSecondBound()
+    let v0 = length(self.source.normalDerivative(mid)) + v1 * radius
+    let u1 = matrix * v1 * w.y + matrix * v0 * c * d1 + matrix * d1 * c * v0 + n * c * v1
+    let u2 = matrix * v2 * w.y + 2.0 * matrix * v1 * c * d1 + matrix * v0 * c * d2
+      + matrix * d2 * c * v0
+      + 2.0 * matrix * d1 * c * v1
+      + n * c * v2
+
+    // Outward slack covers evaluation of these nonnegative bounds.
+    return DerivativeBounds {
+      second: q2 * 1.000000000001,
+      normalFirst: u1 * 1.000000000001,
+      normalSecond: u2 * 1.000000000001,
+    }
+  }
+
+  pub fn anchorError(self: &Self) -> f64 {
+    if !self.rational {
+      return self.source.anchorError()
+    }
+
+    // Projected endpoint discrepancy is interval-dependent and included in precisionError.
+    return 0.0
+  }
+
+  fn normalRounding(self: &Self, t: f64, half: f64) -> f64 {
+    if !self.rational {
+      if self.rounding == 0.0 {
+        return 0.0
+      }
+      let speed = length(self.source.normalDerivative(t))
+      if !(speed > self.rounding * 16.0) {
+        return 1.0 / 0.0
+      }
+      return half * 32.0 * self.rounding / (speed - self.rounding * 16.0)
+    }
+    let h = &self.mapping
+    let p = self.source.point(t)
+    let v = self.source.normalDerivative(t)
+    let matrix = norm(norm(h.xx, h.xy), norm(h.yx, h.yy))
+    let n = norm(
+      f64.abs(h.xx * p.x) + f64.abs(h.xy * p.y) + f64.abs(h.xw),
+      f64.abs(h.yx * p.x) + f64.abs(h.yy * p.y) + f64.abs(h.yw),
+    )
+    let w = f64.abs(h.wx * p.x) + f64.abs(h.wy * p.y) + f64.abs(h.ww)
+    let error = (matrix * length(v) * w + n * norm(h.wx, h.wy) * length(v)) * 2.8421709430404007e-14
+    let speed = length(self.normalDerivative(t))
+    if !(speed > error) {
+      return 1.0 / 0.0
+    }
+    return half * 2.0 * error / (speed - error)
+  }
+
+  pub fn offsetError(self: &Self, a: f64, b: f64, half: f64) -> f64 {
+    let rounding = f64.max(self.normalRounding(a, half), self.normalRounding(b, half))
+    if !self.rational {
+      return self.source.offsetError(a, b, half) + rounding
+    }
+    if self.kind == LINE {
+      return rounding
+    }
+    let bounds = self.derivativeBounds(a, b)
+    let dt = b - a
+    let v = length(self.normalDerivative((a + b) * 0.5)) - bounds.normalFirst * dt * 0.5
+    if !(v > 0.0) {
+      return 1.0 / 0.0
+    }
+    let ratio = bounds.normalFirst / v
+    return rounding
+      + dt * dt * 0.125 * (bounds.second + half * (bounds.normalSecond / v + 3.0 * ratio * ratio))
+  }
+
+  pub fn lengthError(self: &Self, a: f64, b: f64) -> f64 {
+    if !self.rational {
+      return self.source.lengthError(a, b)
+    }
+    if self.kind == LINE {
+      return 0.0
+    }
+    let dt = b - a
+    let m = self.derivativeBounds(a, b).second
+    let speed = length(self.derivative((a + b) * 0.5))
+    let low = speed - m * dt * 0.5
+    if !(low > 0.0) {
+      return m * dt * dt
+    }
+    let variation = f64.min(2.0, 2.0 * m * dt / low)
+    return (speed + m * dt * 0.5) * dt * variation * variation * 0.5
+  }
+
+  pub fn offsetMetric(self: &Self, a: f64, b: f64, half: f64) -> f64 {
+    if !self.rational {
+      return self.source.offsetMetric(a, b, half)
+    }
+    if self.kind == LINE {
+      return 1.0
+    }
+    let bounds = self.derivativeBounds(a, b)
+    let dt = b - a
+    let v = length(self.normalDerivative((a + b) * 0.5)) - bounds.normalFirst * dt * 0.5
+    let speed = length(self.derivative((a + b) * 0.5)) - bounds.second * dt * 0.5
+    if !(v > 0.0) || !(speed > 0.0) {
+      return 1.0 / 0.0
+    }
+    return 1.0 + half * bounds.normalFirst / v / speed
+  }
+}
