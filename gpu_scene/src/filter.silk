@@ -21,7 +21,10 @@ import silk.num.usize
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import vector.pixmap { Pixmap, Rgba8, div255 }
-import vector.filter { Region, BlurPlan, ComponentTransfer, Convolution, conversionTable }
+import vector.filter { Region, BlurPlan, ComponentTransfer, Convolution, Turbulence, TurbulenceSettings, Lighting, conversionTable, stitchOf, lightSetupOf }
+import vector.geometry { Affine }
+import silk.num.i64
+import silk.num.f64
 import renderer { FORMAT, extent, storage, entry, textureEntry, writeU32 }
 import generated_shaders as shaders
 
@@ -39,6 +42,8 @@ const OP_TRANSFER: u32 = 10
 const OP_TILE: u32 = 11
 const OP_CONVOLVE: u32 = 12
 const OP_DISPLACE: u32 = 13
+const OP_TURBULENCE: u32 = 14
+const OP_LIGHTING: u32 = 15
 
 /// Bytes of the shader's `Params` uniform.
 const PARAMS_BYTES: usize = 144
@@ -325,6 +330,70 @@ impl FilterRenderer {
     let buffer = run storage(device, queue, b"filter displacement", &packed, flags.WGPUBufferUsage_Storage)
     let params = header(OP_DISPLACE, u8.toU32(xChannel), u8.toU32(yChannel), 0, clamped(region, out))
     run self.pass(device, queue, &mut encoder, out, &params, input, map, &buffer)
+  }
+
+  /// `feTurbulence` from `noise`'s tables, computed in f32; `toUser` maps device pixels to
+  /// user space.
+  pub effect fn turbulence(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, noise: &Turbulence,
+    settings: &TurbulenceSettings, toUser: &Affine, region: Region) -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
+    let lattice = noise.lattice()
+    let gradients = noise.gradients()
+    let mut packed = List<u8>.make()
+    run packed.appendRepeated(0, (lattice.length + gradients.length) * 4)
+    let bytes = packed.asMutSlice()
+    let mut i: usize = 0
+    while i < lattice.length {
+      writeU32(&mut bytes, i * 4, lattice[i])
+      i = i + 1
+    }
+    i = 0
+    while i < gradients.length {
+      writeF32(&mut bytes, (lattice.length + i) * 4, f64.toF32(gradients[i]))
+      i = i + 1
+    }
+    let buffer = run storage(device, queue, b"filter noise", packed.asSlice(), flags.WGPUBufferUsage_Storage)
+    let stitch = stitchOf(settings)
+    let mut flagBits: u32 = if settings.fractalNoise { 1 } else { 0 }
+    if stitch.enabled { flagBits = flagBits | 2 }
+    let mut params = header(OP_TURBULENCE, settings.octaves, flagBits, 0, clamped(region, out))
+    writeU32(&mut params, 32, i32.wrappingToU32(i64.toI32(stitch.width)))
+    writeU32(&mut params, 36, i32.wrappingToU32(i64.toI32(stitch.height)))
+    writeU32(&mut params, 40, i32.wrappingToU32(i64.toI32(stitch.wrapX)))
+    writeU32(&mut params, 44, i32.wrappingToU32(i64.toI32(stitch.wrapY)))
+    writeF32(&mut params, 48, f64.toF32(stitch.frequencyX))
+    writeF32(&mut params, 52, f64.toF32(stitch.frequencyY))
+    writeF32(&mut params, 64, f64.toF32(toUser.a))
+    writeF32(&mut params, 68, f64.toF32(toUser.b))
+    writeF32(&mut params, 72, f64.toF32(toUser.c))
+    writeF32(&mut params, 76, f64.toF32(toUser.d))
+    writeF32(&mut params, 80, f64.toF32(toUser.e))
+    writeF32(&mut params, 84, f64.toF32(toUser.f))
+    run self.pass(device, queue, &mut encoder, out, &params, &self.blank, &self.blank, &buffer)
+  }
+
+  /// `feDiffuseLighting` or `feSpecularLighting` with `input`'s alpha as the bump map.
+  pub effect fn lighting(self: &Self, device: &Device, queue: &Queue, encoder: &mut CommandEncoder, out: &FilterImage, input: &FilterImage,
+    lighting: &Lighting, region: Region) -> () ! GpuError {
+    let setup = lightSetupOf(&lighting.light)
+    let specular: u32 = if lighting.specular { 1 } else { 0 }
+    let mut params = header(OP_LIGHTING, specular | u32.shiftLeft(u8.toU32(setup.kind), 8), 0, 0, clamped(region, out))
+    writeU32(&mut params, 32, u8.toU32(lighting.color.r))
+    writeU32(&mut params, 36, u8.toU32(lighting.color.g))
+    writeU32(&mut params, 40, u8.toU32(lighting.color.b))
+    writeU32(&mut params, 44, u8.toU32(lighting.color.a))
+    writeF32(&mut params, 48, lighting.surfaceScale)
+    writeF32(&mut params, 52, lighting.constant)
+    writeF32(&mut params, 56, lighting.exponent)
+    writeF32(&mut params, 60, setup.coneCosine)
+    let mut i: usize = 0
+    while i < 3 {
+      writeF32(&mut params, 64 + i * 4, setup.direction[i])
+      writeF32(&mut params, 80 + i * 4, setup.position[i])
+      writeF32(&mut params, 96 + i * 4, setup.spot[i])
+      i = i + 1
+    }
+    writeF32(&mut params, 76, setup.spotExponent)
+    run self.pass(device, queue, &mut encoder, out, &params, input, input, &self.empty)
   }
 
   /// Converts the whole of `input` to linear light (`color-interpolation-filters: linearRGB`).

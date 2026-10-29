@@ -7,12 +7,14 @@ import silk.num.i32
 import silk.num.usize
 import pixmap { Pixmap, Rgba8 }
 import layer { BLEND_MULTIPLY }
+import geometry { Affine }
 import filter {
   Region, BlurPlan, flood, offset, mergeOver, copy, composite, compositePixel, blend, colorMatrix, colorMatrixOf, matrixPixel,
   gaussianBlur, toLinear, toSrgb, COMPOSITE_OVER, COMPOSITE_IN, COMPOSITE_OUT, COMPOSITE_ATOP, COMPOSITE_XOR, COMPOSITE_LIGHTER,
   COMPOSITE_ARITHMETIC, MATRIX, SATURATE, HUE_ROTATE, LUMINANCE_TO_ALPHA, morphology, MORPHOLOGY_ERODE, MORPHOLOGY_DILATE,
   ComponentTransfer, componentTransfer, transferPixel, transferTable, transferDiscrete, transferLinear, transferGamma, tile,
   Convolution, convolveMatrix, EDGE_DUPLICATE, EDGE_WRAP, EDGE_NONE, displacementMap, displacementTable, CHANNEL_R, CHANNEL_A,
+  Turbulence, TurbulenceSettings, turbulence, Light, Lighting, lighting, surfaceNormal, LIGHT_DISTANT, LIGHT_POINT, LIGHT_SPOT,
 }
 
 fn close(a: u8, b: u8) -> bool {
@@ -227,4 +229,76 @@ test effect fn displacementMovesBySelectedChannels() -> () ! AssertionError<'sta
   let mut out = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   displacementMap(&mut out, &input, &map, &table, CHANNEL_R, CHANNEL_A, Region.of(&map))
   run Testing.expect(exact(out.pixel(3, 1), 0, 0, 255, 255) && out.pixel(8, 1).a == 0, "x displaced by +5, y by 0")
+}
+
+test effect fn turbulenceMatchesTheSpecReference() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  // Expected bytes come from a direct transliteration of the spec's C reference code.
+  let mut out = run Pixmap.make(128, 96) |> Effect.provideMut<Allocator>(&mut allocator)
+  let noise = run Turbulence.make(2.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let plain = TurbulenceSettings {
+    baseFrequencyX: 0.05, baseFrequencyY: 0.08, octaves: 3, fractalNoise: false, stitchTiles: false, tileX: 0.0, tileY: 0.0, tileWidth: 128.0, tileHeight: 96.0,
+  }
+  turbulence(&mut out, &noise, &plain, &Affine.identity(), Region.make(0, 0, 128, 96))
+  run Testing.expect(exact(out.pixel(10, 7), 7, 8, 5, 22) && exact(out.pixel(33, 50), 19, 33, 30, 91), "turbulence, seed 2")
+  let stitched = run Turbulence.make(-7.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let fractal = TurbulenceSettings {
+    baseFrequencyX: 0.031, baseFrequencyY: 0.031, octaves: 4, fractalNoise: true, stitchTiles: true, tileX: 4.0, tileY: 3.0, tileWidth: 100.0, tileHeight: 80.0,
+  }
+  turbulence(&mut out, &stitched, &fractal, &Affine.identity(), Region.make(4, 3, 104, 83))
+  run Testing.expect(exact(out.pixel(21, 64), 58, 73, 56, 139) && exact(out.pixel(99, 77), 59, 89, 95, 158), "stitched fractal noise, seed -7")
+  run Testing.expect(exact(out.pixel(2, 2), 0, 0, 0, 0), "outside the region")
+  // Stitched noise repeats with the tile: a pixel one tile width to the right matches.
+  let wide = TurbulenceSettings {
+    baseFrequencyX: 0.031, baseFrequencyY: 0.031, octaves: 4, fractalNoise: true, stitchTiles: true, tileX: 4.0, tileY: 3.0, tileWidth: 50.0, tileHeight: 80.0,
+  }
+  turbulence(&mut out, &stitched, &wide, &Affine.identity(), Region.make(0, 0, 128, 96))
+  run Testing.expect(exact(out.pixel(10, 20), out.pixel(60, 20).r, out.pixel(60, 20).g, out.pixel(60, 20).b, out.pixel(60, 20).a)
+    && exact(out.pixel(30, 5), out.pixel(30, 85).r, out.pixel(30, 85).g, out.pixel(30, 85).b, out.pixel(30, 85).a), "tiles stitch")
+}
+
+fn light(kind: u8, azimuth: f64, elevation: f64, x: f64, y: f64, z: f64) -> Light {
+  return Light { kind: kind, azimuth: azimuth, elevation: elevation, x: x, y: y, z: z, pointsAtX: x, pointsAtY: y, pointsAtZ: 0.0, specularExponent: 1.0, limitingConeAngle: -1.0 }
+}
+
+test effect fn lightingFollowsTheSpec() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = run Pixmap.make(16, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  flood(&mut input, Rgba8.make(0, 0, 0, 255), 255, Region.make(0, 0, 16, 16))
+  let mut out = run Pixmap.make(16, 16) |> Effect.provideMut<Allocator>(&mut allocator)
+  let white = Rgba8.make(255, 255, 255, 255)
+  let overhead = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: light(LIGHT_DISTANT, 0.0, 90.0, 0.0, 0.0, 0.0) }
+  lighting(&mut out, &input, &overhead, Region.make(0, 0, 16, 16))
+  run Testing.expect(exact(out.pixel(0, 0), 255, 255, 255, 255) && exact(out.pixel(7, 9), 255, 255, 255, 255), "flat surface, light overhead")
+  let low = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: light(LIGHT_DISTANT, 0.0, 30.0, 0.0, 0.0, 0.0) }
+  lighting(&mut out, &input, &low, Region.make(0, 0, 16, 16))
+  run Testing.expect(exact(out.pixel(5, 5), 128, 128, 128, 255), "N.L = sin 30")
+  let shiny = Lighting { specular: true, surfaceScale: 1.0, constant: 0.5, exponent: 8.0, color: Rgba8.make(255, 128, 0, 255), light: light(LIGHT_DISTANT, 0.0, 90.0, 0.0, 0.0, 0.0) }
+  lighting(&mut out, &input, &shiny, Region.make(0, 0, 16, 16))
+  run Testing.expect(same(out.pixel(5, 5), 64, 32, 0, 128), "specular alpha is the max channel")
+  let above = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: light(LIGHT_POINT, 0.0, 0.0, 8.0, 8.0, 9.0) }
+  lighting(&mut out, &input, &above, Region.make(0, 0, 16, 16))
+  run Testing.expect(exact(out.pixel(8, 8), 255, 255, 255, 255) && out.pixel(0, 8).r < 200, "point light falls off with angle")
+  let mut spot = light(LIGHT_SPOT, 0.0, 0.0, 8.0, 8.0, 20.0)
+  spot.pointsAtX = 8.0
+  spot.pointsAtY = 8.0
+  spot.limitingConeAngle = 10.0
+  let cone = Lighting { specular: false, surfaceScale: 1.0, constant: 1.0, exponent: 1.0, color: white, light: spot }
+  lighting(&mut out, &input, &cone, Region.make(0, 0, 16, 16))
+  run Testing.expect(out.pixel(8, 8).r > 250 && out.pixel(0, 0).r == 0, "spot cone")
+  // A ramp in x: interior Nx = -surfaceScale / 4 * 4 * (A(x+1) - A(x-1)).
+  let mut ramp = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let bytes = ramp.dataMut()
+  let mut i: usize = 0
+  while i < 64 {
+    bytes[i * 4 + 3] = usize.toU8((i % 16) * 10)
+    i = i + 1
+  }
+  let mut column = run Pixmap.make(16, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  copy(&mut column, &ramp, Region.make(0, 0, 16, 4))
+  let n = surfaceNormal(column.data(), 64, Region.make(0, 0, 16, 4), 5, 1, 2.0)
+  run Testing.expect(n[0] < -0.1567 && n[0] > -0.1571 && n[1] == 0.0, "interior Sobel normal")
+  let edge = surfaceNormal(column.data(), 64, Region.make(0, 0, 16, 4), 0, 0, 2.0)
+  // Top-left corner: factor 2/3 over (2 dA + dA) with one-pixel differences.
+  run Testing.expect(edge[0] < -0.1567 && edge[0] > -0.1571, "corner Sobel normal")
 }
