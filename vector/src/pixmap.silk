@@ -1,0 +1,130 @@
+//! The CPU reference target: premultiplied RGBA8, row major, composited with exact integer math.
+//!
+//! Every blend divides by 255 with [`div255`], which is exact for products of two bytes, so the
+//! GPU renderer can be held to the same bytes.
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import strips { Coverage, BAND, minU32 }
+
+/// A straight (not premultiplied) 8-bit color.
+pub struct Rgba8 {
+  pub r: u8,
+  pub g: u8,
+  pub b: u8,
+  pub a: u8,
+}
+impl Copy for Rgba8 {}
+impl Rgba8 {
+  pub fn make(r: u8, g: u8, b: u8, a: u8) -> Rgba8 { return Rgba8 { r: r, g: g, b: b, a: a } }
+  pub fn premultiply(self: &Self) -> Rgba8 {
+    let a = u8.toU32(self.a)
+    return Rgba8 {
+      r: u32.toU8(div255(u8.toU32(self.r) * a)), g: u32.toU8(div255(u8.toU32(self.g) * a)),
+      b: u32.toU8(div255(u8.toU32(self.b) * a)), a: self.a,
+    }
+  }
+}
+
+/// `round(x / 255)` for `x` in `0 ..= 255 * 255`.
+pub fn div255(x: u32) -> u32 {
+  let t = x + 128
+  return u32.shiftRight(t + u32.shiftRight(t, 8), 8)
+}
+
+pub struct Pixmap {
+  pixelWidth: u32,
+  pixelHeight: u32,
+  bytes: List<u8>,
+}
+impl Pixmap {
+  /// A transparent `width` x `height` pixmap.
+  pub effect fn make(width: u32, height: u32) -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+    let mut bytes = List<u8>.make()
+    run bytes.appendRepeated(0, u32.toUsize(width) * u32.toUsize(height) * 4)
+    return Pixmap { pixelWidth: width, pixelHeight: height, bytes: move bytes }
+  }
+  pub fn width(self: &Self) -> u32 { return self.pixelWidth }
+  pub fn height(self: &Self) -> u32 { return self.pixelHeight }
+  /// Premultiplied RGBA8 bytes, row major with no padding.
+  pub fn data(self: &Self) -> &[u8] { return self.bytes.asSlice() }
+  /// The premultiplied pixel at `(x, y)`.
+  pub fn pixel(self: &Self, x: u32, y: u32) -> Rgba8 {
+    let i = (u32.toUsize(y) * u32.toUsize(self.pixelWidth) + u32.toUsize(x)) * 4
+    let d = self.bytes.asSlice()
+    return Rgba8 { r: d[i], g: d[i + 1], b: d[i + 2], a: d[i + 3] }
+  }
+  /// Sets every pixel to the premultiplied form of `color`.
+  pub fn clear(self: &mut Self, color: Rgba8) -> () {
+    let p = color.premultiply()
+    let d = self.bytes.asMutSlice()
+    let mut i: usize = 0
+    while i < d.length {
+      d[i] = p.r
+      d[i + 1] = p.g
+      d[i + 2] = p.b
+      d[i + 3] = p.a
+      i = i + 4
+    }
+  }
+  /// Composites `color` (straight alpha) source-over through `coverage`.
+  pub fn fillCoverage(self: &mut Self, coverage: &Coverage, color: Rgba8) -> () {
+    let source = color.premultiply()
+    let width = minU32(self.pixelWidth, coverage.width())
+    let height = minU32(self.pixelHeight, coverage.height())
+    let stride = u32.toUsize(self.pixelWidth) * 4
+    let d = self.bytes.asMutSlice()
+    let fills = coverage.fills()
+    let mut f: usize = 0
+    while f < fills.length {
+      let fill = fills[f]
+      let mut y = fill.y
+      while y < fill.y + BAND && y < height {
+        let mut x = fill.x
+        let end = fill.x + fill.width
+        while x < end && x < width {
+          over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, source)
+          x = x + 1
+        }
+        y = y + 1
+      }
+      f = f + 1
+    }
+    let alphas = coverage.alphas()
+    let strips = coverage.strips()
+    let mut s: usize = 0
+    while s < strips.length {
+      let strip = strips[s]
+      let mut column: u32 = 0
+      while column < strip.width && strip.x + column < width {
+        let base = u32.toUsize(strip.alphaOffset + column * BAND)
+        let mut row: u32 = 0
+        while row < BAND && strip.y + row < height {
+          let mask = u8.toU32(alphas[base + u32.toUsize(row)])
+          if mask != 0 {
+            let masked = Rgba8 {
+              r: u32.toU8(div255(u8.toU32(source.r) * mask)), g: u32.toU8(div255(u8.toU32(source.g) * mask)),
+              b: u32.toU8(div255(u8.toU32(source.b) * mask)), a: u32.toU8(div255(u8.toU32(source.a) * mask)),
+            }
+            over(&mut d, u32.toUsize(strip.y + row) * stride + u32.toUsize(strip.x + column) * 4, masked)
+          }
+          row = row + 1
+        }
+        column = column + 1
+      }
+      s = s + 1
+    }
+  }
+}
+
+/// Premultiplied source-over of `source` onto the pixel at byte offset `i`.
+fn over(d: &mut [u8], i: usize, source: Rgba8) -> () {
+  let inverse = 255 - u8.toU32(source.a)
+  d[i] = u32.toU8(u8.toU32(source.r) + div255(u8.toU32(d[i]) * inverse))
+  d[i + 1] = u32.toU8(u8.toU32(source.g) + div255(u8.toU32(d[i + 1]) * inverse))
+  d[i + 2] = u32.toU8(u8.toU32(source.b) + div255(u8.toU32(d[i + 2]) * inverse))
+  d[i + 3] = u32.toU8(u8.toU32(source.a) + div255(u8.toU32(d[i + 3]) * inverse))
+}

@@ -24,6 +24,8 @@ run([sys.executable, "-m", "unittest", "discover", "-s", "tests/pixels", "-p", "
 compiler_bin = command_path("install-silk")
 os.environ["SILK_CLANG"] = str(command_path("install-llvm"))
 run([compiler_bin / "silkc", "check", "--workspace", "--stdlib", compiler_bin.parent / "lib/silk/stdlib"])
+run([compiler_bin / "silkc", "test", "--manifest-path", ROOT / "vector/silk.toml", "--root", ROOT / "vector/src/tests.silk",
+     "--stdlib", compiler_bin.parent / "lib/silk/stdlib"])
 if not args.skip_native:
     run([sys.executable, ROOT / "scripts/test-abi"])
     run([sys.executable, ROOT / "scripts/test-native"])

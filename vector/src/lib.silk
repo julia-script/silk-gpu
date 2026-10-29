@@ -1,0 +1,6 @@
+//! Pure-Silk 2D vector core: paths, flattening, sparse-strip coverage and a CPU reference pixmap.
+import geometry
+import path
+import flatten
+import strips
+import pixmap
