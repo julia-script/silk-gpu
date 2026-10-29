@@ -21,6 +21,7 @@ import silk.num.usize
 import silk.num.i32
 import silk.num.f64
 import vector.geometry { Affine, Rect }
+import vector.projective { Homography }
 import vector.path { Path }
 import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import vector.stroke { Stroke, Stroker, JOIN_ROUND, JOIN_MITER_CLIP, CAP_ROUND, CAP_SQUARE }
@@ -311,6 +312,126 @@ effect fn images() -> Canvas
   run c.raster.fill(&disk, &id, NONZERO, &mut c.coverage)
   painting.fill(&mut c.cpu, &c.coverage, &bilinear, 230)
   run c.scene.fillImage(&c.coverage, &bilinear, 230)
+  return move c
+}
+
+/// Every panel has a different inverse w across both axes. All four image
+/// sampling/extend combinations use the same original checkerboard pixels.
+effect fn projectiveImages() -> Canvas
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let mut c = run Canvas.make()
+  let mut image = run Pixmap.make(8, 8)
+  let data = image.dataMut()
+  let mut i: usize = 0
+  while i < 64 {
+    let light = (i / 8 + i % 8) % 2 == 0
+    data[i * 4] = if light {
+      220
+    } else {
+      20
+    }
+    data[i * 4 + 1] = if light {
+      60
+    } else {
+      160
+    }
+    data[i * 4 + 2] = if light {
+      20
+    } else {
+      210
+    }
+    data[i * 4 + 3] = 230
+    i = i + 1
+  }
+  let mut panel: u32 = 0
+  while panel < 4 {
+    let x = u32.toF64(panel % 2) * 64.0
+    let y = u32.toF64(panel / 2) * 48.0
+    let h = Homography {
+      xx: 4.3 + x * 0.025,
+      xy: 0.7 - x * 0.012,
+      xw: x + 8.3,
+      yx: 0.3 + y * 0.025,
+      yy: 4.8 - y * 0.012,
+      yw: y + 6.7,
+      wx: 0.025,
+      wy: -0.012,
+      ww: 1.0,
+    }
+    let pattern = run ImagePattern.makeProjective(
+      &image,
+      &h,
+      if panel % 2 == 0 {
+        SAMPLE_NEAREST
+      } else {
+        SAMPLE_BILINEAR
+      },
+      if panel / 2 == 0 {
+        EXTEND_CLAMP
+      } else {
+        EXTEND_REPEAT
+      },
+    )
+
+    // Keep these nonbinary coefficients and the complete zero-tolerance image
+    // comparison: pixel (125,88) exposed a Metal multiply/add contraction that
+    // moved the blue bilinear result across a rounding boundary. Projective
+    // sampling now specifies the same nested FMAs on both CPU and GPU.
+    let mut box = Path.make()
+    run box.rect(Rect.make(x + 2.0, y + 2.0, 60.0, 44.0))
+    run c.raster.fill(&box, &Affine.identity(), NONZERO, &mut c.coverage)
+    painting.fill(&mut c.cpu, &c.coverage, &pattern, 235)
+    run c.scene.fillImage(&c.coverage, &pattern, 235)
+
+    // A solid following a 19-word record exercises mixed-stride word offsets.
+    let mut mark = Path.make()
+    run mark.rect(Rect.make(x + 3.0, y + 3.0, 2.0, 2.0))
+    run c.fill(&mark, &Affine.identity(), NONZERO, Rgba8.make(40, 80, 120, 255), 255)
+    panel = panel + 1
+  }
+  return move c
+}
+
+/// Linear and two-circle radial paints, each spread mode and both interpolation
+/// contracts, with perspective in both coordinates. Uses the existing tolerance.
+effect fn projectiveGradients() -> Canvas
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let mut c = run Canvas.make()
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(230, 40, 60, 100) },
+    Stop { offset: 0.45, color: Rgba8.make(40, 190, 70, 220) },
+    Stop { offset: 1.0, color: Rgba8.make(20, 60, 230, 255) },
+  ]
+  let mut panel: u32 = 0
+  while panel < 6 {
+    let x = u32.toF64(panel % 3) * 42.0
+    let y = u32.toF64(panel / 3) * 48.0
+    let h = Homography {
+      xx: 2.7 + x * 0.018,
+      xy: 0.3 + x * 0.009,
+      xw: x + 3.7,
+      yx: -0.2 + y * 0.018,
+      yy: 3.1 + y * 0.009,
+      yw: y + 5.3,
+      wx: 0.018,
+      wy: 0.009,
+      ww: 1.0,
+    }
+    let mode = u32.toU8(panel % 3)
+    let mut gradient = if panel < 3 {
+      run Gradient.linearProjective(0.0, 0.0, 9.0, 4.0, mode, &h)
+    } else {
+      run Gradient.radialProjective(6.0, 5.0, 7.0, 4.0, 3.0, 1.0, mode, &h)
+    }
+    gradient.setPremultipliedInterpolation(panel % 2 != 0)
+    run gradient.setStops(&stops)
+    let mut box = Path.make()
+    run box.rect(Rect.make(x + 1.0, y + 1.0, 40.0, 46.0))
+    run c.fillGradient(&box, &Affine.identity(), &gradient, 240)
+    panel = panel + 1
+  }
   return move c
 }
 
@@ -687,6 +808,34 @@ effect fn program() -> i32
   if !imageBoundaryOk {
     StderrWriter.print("images: nearest boundary fixture changed texel\n", &())
   }
+  let perspectiveImage = run projectiveImages() |> Effect.provideMut<Allocator>(&mut allocator)
+  let perspectiveImageGpu = run renderOnGpu(&device, &queue, &mut renderer, &perspectiveImage.scene)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  // WGSL only bounds `x / y` to 2.5 ULP (Vulkan's precision too), so the perspective divide can
+  // move a bilinear weight across a rounding step; allow one level, as for gradients.
+  let perspectiveImagesOk = compare(
+    "projective images",
+    perspectiveImage.cpu.data(),
+    perspectiveImageGpu.asSlice(),
+    1,
+  )
+    && painted("projective images", perspectiveImage.cpu.data(), 9000)
+  let perspectiveGradient = run projectiveGradients()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let perspectiveGradientGpu = run renderOnGpu(
+    &device,
+    &queue,
+    &mut renderer,
+    &perspectiveGradient.scene,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let perspectiveGradientsOk = compare(
+    "projective gradients",
+    perspectiveGradient.cpu.data(),
+    perspectiveGradientGpu.asSlice(),
+    2,
+  )
+    && painted("projective gradients", perspectiveGradient.cpu.data(), 9000)
 
   // The renderer keeps its layer textures; a second render must not see the first one's pixels.
   let againGpu = run renderOnGpu(&device, &queue, &mut renderer, &layered.scene) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -695,7 +844,9 @@ effect fn program() -> i32
     && painted("images", imaged.cpu.data(), 6000)
   let filtersOk = run filters(&device, &queue) |> Effect.provideMut<Allocator>(&mut allocator)
   return if solidOk && gradientOk && layersOk && imagesOk && imageBoundaryOk && againOk && drawn
-    && filtersOk {
+    && filtersOk
+    && perspectiveImagesOk
+    && perspectiveGradientsOk {
     0
   } else {
     1

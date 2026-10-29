@@ -3,4 +3,4 @@ name = "vector"
 version = "0.1.0"
 silk-version = "0.1.0-dev.29+94cf9559bf47"
 kind = "library"
-exports = ["geometry", "geometry_error", "path", "flatten", "strips", "pixmap", "stroke", "paint", "layer", "filter"]
+exports = ["geometry", "geometry_error", "path", "flatten", "projective", "strips", "pixmap", "stroke", "paint", "layer", "filter"]

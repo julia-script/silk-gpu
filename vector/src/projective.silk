@@ -1,0 +1,1709 @@
+//! Homogeneous filled-path geometry, with clipping BEFORE perspective division.
+//! CSS Transforms 2 §4.2; SVG 2 B.2.2 (exact elliptical-arc parameterization).
+//! Curves are homogeneous Beziers. Positive-weight projected control hulls bound
+//! chord error; a hull wholly outside any clipping halfspace can be replaced by
+//! its chord without changing winding anywhere inside the target rectangle.
+//! Whole subpaths, not independent edges, undergo homogeneous polygon clipping.
+//! This preserves closing edges, multiplicity, and both fill-rule windings.
+//! Errors leave possibly partial appended output, which must not be rasterized.
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import geometry { Point, Rect, Affine }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import path { Path, MOVE, LINE, QUAD, CUBIC, CLOSE, ARC }
+import flatten { Line }
+
+const ROUND: f64 = 7.105427357601002e-15
+
+const TINY: f64 = 1.5810100666919889e-322
+
+const MAX_WORK: u32 = 1048576
+
+const MAX_VERTICES: usize = 1048576
+
+const MAX_DEPTH: u32 = 48
+
+const HALF_PI: f64 = 1.5707963267948966
+
+/// Row-major map of (x,y,1). A positive common scale does not affect fill;
+/// a negative scale reverses the visible homogeneous halfspace and is retained.
+pub struct Homography {
+  pub xx: f64,
+  pub xy: f64,
+  pub xw: f64,
+  pub yx: f64,
+  pub yy: f64,
+  pub yw: f64,
+  pub wx: f64,
+  pub wy: f64,
+  pub ww: f64,
+}
+
+impl Copy for Homography {}
+
+impl Homography {
+  pub fn fromAffine(a: &Affine) -> Homography {
+    return Homography {
+      xx: a.a,
+      xy: a.c,
+      xw: a.e,
+      yx: a.b,
+      yy: a.d,
+      yw: a.f,
+      wx: 0.0,
+      wy: 0.0,
+      ww: 1.0,
+    }
+  }
+
+  pub fn isFinite(self: &Self) -> bool {
+    return f64.isFinite(self.xx) && f64.isFinite(self.xy) && f64.isFinite(self.xw)
+      && f64.isFinite(self.yx)
+      && f64.isFinite(self.yy)
+      && f64.isFinite(self.yw)
+      && f64.isFinite(self.wx)
+      && f64.isFinite(self.wy)
+      && f64.isFinite(self.ww)
+  }
+
+  /// Checked parent * child composition, preserving the positive representative
+  /// (and therefore the sign of homogeneous w). Ordinary finite products use
+  /// the direct path. Range failures retry with exact, positive power-of-two
+  /// matrix rescaling. Lost nonzero products, inexact rescaling or unavailable
+  /// cancellation precision fail NUMERIC_LIMIT rather than inventing geometry.
+  pub effect fn compose(self: &Self, right: &Homography) -> Homography
+    ! GeometryError {
+    if !self.isFinite() || !right.isFinite() {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    if let Option<Homography>.Some { value: result } = composed(self, right) {
+      return result
+    }
+    let leftScale = compositionPower(magnitude(self))
+    let rightScale = compositionPower(magnitude(right))
+    let left = divided(self, leftScale)
+    let rhs = divided(right, rightScale)
+    if !exactCompositionScale(self, &left, leftScale)
+      || !exactCompositionScale(right, &rhs, rightScale) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    if let Option<Homography>.Some { value: result } = composed(&left, &rhs) {
+      return result
+    }
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+
+  /// A positively scaled representative of the inverse. Independent row
+  /// scaling prevents overflow/underflow of the unscaled determinant. None
+  /// means singular, nonfinite, or an inverse not representable in f64.
+  pub fn inverse(self: &Self) -> Option<Homography> {
+    if !self.isFinite() {
+      return Option<Homography>.none()
+    }
+    let sx = max3(f64.abs(self.xx), f64.abs(self.xy), f64.abs(self.xw))
+    let sy = max3(f64.abs(self.yx), f64.abs(self.yy), f64.abs(self.yw))
+    let sw = max3(f64.abs(self.wx), f64.abs(self.wy), f64.abs(self.ww))
+    if sx == 0.0 || sy == 0.0 || sw == 0.0 {
+      return Option<Homography>.none()
+    }
+    let a = self.xx / sx
+    let b = self.xy / sx
+    let c = self.xw / sx
+    let d = self.yx / sy
+    let e = self.yy / sy
+    let f = self.yw / sy
+    let g = self.wx / sw
+    let h = self.wy / sw
+    let i = self.ww / sw
+    let normalized = Homography { xx: a, xy: b, xw: c, yx: d, yy: e, yw: f, wx: g, wy: h, ww: i }
+    if lost(self, &normalized) {
+      return Option<Homography>.none()
+    }
+    let aa = e * i - f * h
+    let ba = f * g - d * i
+    let ca = d * h - e * g
+    let det = a * aa + b * ba + c * ca
+    if det == 0.0 || !f64.isFinite(det) {
+      return Option<Homography>.none()
+    }
+    let small = f64.min(sx, f64.min(sy, sw))
+    let large = max3(sx, sy, sw)
+
+    // Center the inverse's exponent range instead of normalizing its largest
+    // entry to one (which would erase a representable 1e-300 diagonal entry).
+    let mut scale = f64.min(large, f64.sqrt(small) * f64.sqrt(large))
+    if small < 1.0 {
+      scale = f64.min(scale, small * 1.0e307)
+    }
+    let sign = if det < 0.0 {
+      -1.0
+    } else {
+      1.0
+    }
+    let kx = (scale / sx) * sign
+    let ky = (scale / sy) * sign
+    let kw = (scale / sw) * sign
+    if kx == 0.0 || ky == 0.0 || kw == 0.0 {
+      return Option<Homography>.none()
+    }
+    let result = Homography {
+      xx: aa * kx,
+      xy: (c * h - b * i) * ky,
+      xw: (b * f - c * e) * kw,
+      yx: ba * kx,
+      yy: (a * i - c * g) * ky,
+      yw: (c * d - a * f) * kw,
+      wx: ca * kx,
+      wy: (b * g - a * h) * ky,
+      ww: (a * e - b * d) * kw,
+    }
+    if !result.isFinite() {
+      return Option<Homography>.none()
+    }
+
+    // Detect lost nonzero cofactors rather than silently returning a singular map.
+    if (aa != 0.0 && result.xx == 0.0) || (c * h - b * i != 0.0 && result.xy == 0.0)
+      || (b * f - c * e != 0.0 && result.xw == 0.0)
+      || (ba != 0.0 && result.yx == 0.0)
+      || (a * i - c * g != 0.0 && result.yy == 0.0)
+      || (c * d - a * f != 0.0 && result.yw == 0.0)
+      || (ca != 0.0 && result.wx == 0.0)
+      || (b * g - a * h != 0.0 && result.wy == 0.0)
+      || (a * e - b * d != 0.0 && result.ww == 0.0) {
+      return Option<Homography>.none()
+    }
+    return Option<Homography>.some(result)
+  }
+
+  /// Generic point mapping, including negative w. Visibility clipping belongs
+  /// to fill, not to inverse paint-coordinate lookup. Zero w has no finite map.
+  pub fn project(self: &Self, p: Point) -> Option<Point> {
+    if !self.isFinite() || !p.isFinite() {
+      return Option<Point>.none()
+    }
+
+    // Prefer the unscaled map when its intermediates are representable. This
+    // retains highly anisotropic matrices whose rows span >324 exponents.
+    let directX = self.xx * p.x + self.xy * p.y + self.xw
+    let directY = self.yx * p.x + self.yy * p.y + self.yw
+    let directW = self.wx * p.x + self.wy * p.y + self.ww
+    if f64.isFinite(directX) && f64.isFinite(directY) && f64.isFinite(directW) && directW != 0.0 {
+      let direct = Point.make(directX / directW, directY / directW)
+      if direct.isFinite() {
+        return Option<Point>.some(direct)
+      }
+    }
+    let scale = magnitude(self)
+    if scale == 0.0 {
+      return Option<Point>.none()
+    }
+    let h = divided(self, scale)
+    if lost(self, &h) {
+      return Option<Point>.none()
+    }
+    let s = f64.max(1.0, f64.max(f64.abs(p.x), f64.abs(p.y)))
+    let x = p.x / s
+    let y = p.y / s
+    let z = 1.0 / s
+    let w = h.wx * x + h.wy * y + h.ww * z
+    if w == 0.0 || !f64.isFinite(w) {
+      return Option<Point>.none()
+    }
+    let q = Point.make((h.xx * x + h.xy * y + h.xw * z) / w, (h.yx * x + h.yy * y + h.yw * z) / w)
+    return if q.isFinite() {
+      Option<Point>.some(q)
+    } else {
+      Option<Point>.none()
+    }
+  }
+}
+
+fn max3(a: f64, b: f64, c: f64) -> f64 {
+  return f64.max(a, f64.max(b, c))
+}
+
+fn magnitude(h: &Homography) -> f64 {
+  return max3(
+    max3(f64.abs(h.xx), f64.abs(h.xy), f64.abs(h.xw)),
+    max3(f64.abs(h.yx), f64.abs(h.yy), f64.abs(h.yw)),
+    max3(f64.abs(h.wx), f64.abs(h.wy), f64.abs(h.ww)),
+  )
+}
+
+fn divided(h: &Homography, s: f64) -> Homography {
+  return Homography {
+    xx: h.xx / s,
+    xy: h.xy / s,
+    xw: h.xw / s,
+    yx: h.yx / s,
+    yy: h.yy / s,
+    yw: h.yw / s,
+    wx: h.wx / s,
+    wy: h.wy / s,
+    ww: h.ww / s,
+  }
+}
+
+fn lost(original: &Homography, scaled: &Homography) -> bool {
+  return (original.xx != 0.0 && scaled.xx == 0.0) || (original.xy != 0.0 && scaled.xy == 0.0)
+    || (original.xw != 0.0 && scaled.xw == 0.0)
+    || (original.yx != 0.0 && scaled.yx == 0.0)
+    || (original.yy != 0.0 && scaled.yy == 0.0)
+    || (original.yw != 0.0 && scaled.yw == 0.0)
+    || (original.wx != 0.0 && scaled.wx == 0.0)
+    || (original.wy != 0.0 && scaled.wy == 0.0)
+    || (original.ww != 0.0 && scaled.ww == 0.0)
+}
+
+fn norm(x: f64, y: f64) -> f64 {
+  let s = f64.max(f64.abs(x), f64.abs(y))
+  if s == 0.0 {
+    return 0.0
+  }
+  let a = x / s
+  let b = y / s
+  return s * f64.sqrt(a * a + b * b)
+}
+
+// Componentwise absolute errors avoid inventing w uncertainty from a large x.
+// A common source and matrix normalization is used for the ENTIRE path:
+// independently normalizing controls would change rational weights/geometry.
+struct HPoint {
+  x: f64,
+  y: f64,
+  w: f64,
+  ex: f64,
+  ey: f64,
+  ew: f64
+}
+
+impl Copy for HPoint {}
+
+fn mapped(h: &Homography, x: f64, y: f64, w: f64) -> HPoint {
+  let a = h.xx * x + h.xy * y + h.xw * w
+  let b = h.yx * x + h.yy * y + h.yw * w
+  let c = h.wx * x + h.wy * y + h.ww * w
+  return HPoint {
+    x: a,
+    y: b,
+    w: c,
+    ex: (f64.abs(h.xx * x) + f64.abs(h.xy * y) + f64.abs(h.xw * w)) * ROUND + TINY,
+    ey: (f64.abs(h.yx * x) + f64.abs(h.yy * y) + f64.abs(h.yw * w)) * ROUND + TINY,
+    ew: (f64.abs(h.wx * x) + f64.abs(h.wy * y) + f64.abs(h.ww * w)) * ROUND + TINY,
+  }
+}
+
+fn point(h: &Homography, p: Point, s: f64) -> HPoint {
+  return mapped(h, p.x / s, p.y / s, 1.0 / s)
+}
+
+fn mix(a: HPoint, b: HPoint, t: f64) -> HPoint {
+  let u = 1.0 - t
+  return HPoint {
+    x: u * a.x + t * b.x,
+    y: u * a.y + t * b.y,
+    w: u * a.w + t * b.w,
+    ex: u * a.ex + t * b.ex + (u * f64.abs(a.x) + t * f64.abs(b.x)) * ROUND + TINY,
+    ey: u * a.ey + t * b.ey + (u * f64.abs(a.y) + t * f64.abs(b.y)) * ROUND + TINY,
+    ew: u * a.ew + t * b.ew + (u * f64.abs(a.w) + t * f64.abs(b.w)) * ROUND + TINY,
+  }
+}
+
+fn anchor(actual: HPoint, analytic: HPoint) -> HPoint {
+  return HPoint {
+    x: actual.x,
+    y: actual.y,
+    w: actual.w,
+    ex: actual.ex + analytic.ex + f64.abs(actual.x - analytic.x),
+    ey: actual.ey + analytic.ey + f64.abs(actual.y - analytic.y),
+    ew: actual.ew + analytic.ew + f64.abs(actual.w - analytic.w),
+  }
+}
+
+fn projected(p: HPoint) -> Point {
+  return Point.make(p.x / p.w, p.y / p.w)
+}
+
+fn projectionError(p: HPoint, q: Point) -> f64 {
+  if !(p.w > p.ew) || !q.isFinite() {
+    return 1.0e308
+  }
+  let x = (p.ex + f64.abs(q.x) * p.ew) / (p.w - p.ew)
+  let y = (p.ey + f64.abs(q.y) * p.ew) / (p.w - p.ew)
+  return norm(x, y) + ROUND * norm(q.x, q.y)
+}
+
+/// Additional device-homogeneous visibility plane: x*X + y*Y + w*W >= 0.
+/// Positive common coefficient scale preserves the plane; negative does not.
+pub struct HalfPlane {
+  pub x: f64,
+  pub y: f64,
+  pub w: f64,
+}
+
+impl Copy for HalfPlane {}
+
+// Scaled halfspace equations stay finite even for very large finite clips.
+struct Plane {
+  x: f64,
+  y: f64,
+  w: f64
+}
+
+impl Copy for Plane {}
+
+fn plane(index: u32, r: Rect) -> Plane {
+  if index == 0 {
+    return Plane { x: 0.0, y: 0.0, w: 1.0 }
+  }
+  let v = if index == 1 {
+    r.x0
+  } else if index == 2 {
+    r.x1
+  } else if index == 3 {
+    r.y0
+  } else {
+    r.y1
+  }
+  let s = f64.max(1.0, f64.abs(v))
+  let sign = if index == 1 || index == 3 {
+    1.0
+  } else {
+    -1.0
+  }
+  return Plane {
+    x: if index <= 2 {
+      sign / s
+    } else {
+      0.0
+    },
+    y: if index >= 3 {
+      sign / s
+    } else {
+      0.0
+    },
+    w: -sign * (v / s),
+  }
+}
+
+fn side(p: HPoint, c: Plane) -> f64 {
+  return c.x * p.x + c.y * p.y + c.w * p.w
+}
+
+fn sideError(p: HPoint, c: Plane) -> f64 {
+  return f64.abs(c.x) * p.ex + f64.abs(c.y) * p.ey + f64.abs(c.w) * p.ew
+    + (f64.abs(c.x * p.x) + f64.abs(c.y * p.y) + f64.abs(c.w * p.w)) * ROUND
+    + TINY
+}
+
+struct Curve {
+  a: HPoint,
+  b: HPoint,
+  c: HPoint,
+  d: HPoint
+}
+
+impl Copy for Curve {}
+
+fn quadratic(a: HPoint, b: HPoint, c: HPoint) -> Curve {
+  return Curve { a: a, b: mix(a, b, 0.6666666666666666), c: mix(c, b, 0.6666666666666666), d: c }
+}
+
+effect fn outside(q: Curve, clip: Rect, planes: &[Plane], work: &mut Work) -> bool
+  ! GeometryError {
+  let mut i: u32 = 0
+  while i < 5 {
+    let p = plane(i, clip)
+    if side(q.a, p) < -sideError(q.a, p) && side(q.b, p) < -sideError(q.b, p)
+      && side(q.c, p) < -sideError(q.c, p)
+      && side(q.d, p) < -sideError(q.d, p) {
+      return true
+    }
+    i = i + 1
+  }
+  let mut j: usize = 0
+  while j < planes.length {
+    run spend(&mut work)
+    let p = planes[j]
+    if side(q.a, p) < -sideError(q.a, p) && side(q.b, p) < -sideError(q.b, p)
+      && side(q.c, p) < -sideError(q.c, p)
+      && side(q.d, p) < -sideError(q.d, p) {
+      return true
+    }
+    j = j + 1
+  }
+  return false
+}
+
+fn chordDistance(p: Point, a: Point, b: Point) -> f64 {
+  let dx = b.x - a.x
+  let dy = b.y - a.y
+  let length = norm(dx, dy)
+  if length == 0.0 {
+    return norm(p.x - a.x, p.y - a.y)
+  }
+  if !f64.isFinite(length) {
+    return 1.0e308
+  }
+  let ux = dx / length
+  let uy = dy / length
+  let along = (p.x - a.x) * ux + (p.y - a.y) * uy
+  if along <= 0.0 {
+    return norm(p.x - a.x, p.y - a.y)
+  }
+  if along >= length {
+    return norm(p.x - b.x, p.y - b.y)
+  }
+  return f64.abs((p.x - a.x) * uy - (p.y - a.y) * ux)
+}
+
+effect fn append(out: &mut List<HPoint>, p: HPoint) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if out.length() >= MAX_VERTICES {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  if !f64.isFinite(p.x) || !f64.isFinite(p.y) || !f64.isFinite(p.w) || !f64.isFinite(p.ex)
+    || !f64.isFinite(p.ey)
+    || !f64.isFinite(p.ew) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  run out.append(p)
+}
+
+struct Work {
+  visits: u32
+}
+
+effect fn spend(work: &mut Work) -> ()
+  ! GeometryError {
+  if work.visits >= MAX_WORK {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  work.visits = work.visits + 1
+}
+
+effect fn flatten(
+  q: Curve,
+  clip: Rect,
+  planes: &[Plane],
+  tolerance: f64,
+  depth: u32,
+  work: &mut Work,
+  out: &mut List<HPoint>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run spend(&mut work)
+  if run outside(q, clip, planes, &mut work) {
+    run append(&mut out, q.d)
+    return
+  }
+  if q.a.w > q.a.ew && q.b.w > q.b.ew && q.c.w > q.c.ew && q.d.w > q.d.ew {
+    let a = projected(q.a)
+    let b = projected(q.b)
+    let c = projected(q.c)
+    let d = projected(q.d)
+    let error = f64.max(
+      f64.max(projectionError(q.a, a), projectionError(q.b, b)),
+      f64.max(projectionError(q.c, c), projectionError(q.d, d)),
+    )
+    let deviation = f64.max(chordDistance(b, a, d), chordDistance(c, a, d))
+
+    // The rational Bezier lies in its projected control hull for positive
+    // weights. Distance to the chord is convex; control distances bound it.
+    if error + deviation <= tolerance * 0.5 {
+      run append(&mut out, q.d)
+      return
+    }
+  }
+  if depth >= MAX_DEPTH {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let ab = mix(q.a, q.b, 0.5)
+  let bc = mix(q.b, q.c, 0.5)
+  let cd = mix(q.c, q.d, 0.5)
+  let abc = mix(ab, bc, 0.5)
+  let bcd = mix(bc, cd, 0.5)
+  let middle = mix(abc, bcd, 0.5)
+  run flatten(
+    Curve { a: q.a, b: ab, c: abc, d: middle },
+    clip,
+    planes,
+    tolerance,
+    depth + 1,
+    &mut work,
+    &mut out,
+  )
+  run flatten(
+    Curve { a: middle, b: bcd, c: cd, d: q.d },
+    clip,
+    planes,
+    tolerance,
+    depth + 1,
+    &mut work,
+    &mut out,
+  )
+}
+
+// Sutherland-Hodgman in homogeneous coordinates, including actual w=0.
+// The closing edge is processed on every plane; disconnected components may
+// have coincident, opposite boundary bridges whose winding cancels exactly.
+effect fn clipPlane(
+  input: &[HPoint],
+  out: &mut List<HPoint>,
+  p: Plane,
+  targetGuard: f64,
+  work: &mut Work,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  out.clear()
+  if input.length == 0 {
+    return
+  }
+  let mut previous = input[input.length - 1]
+  let mut dp = side(previous, p)
+  let mut previousUncertainty = sideError(previous, p)
+  let mut i: usize = 0
+  while i < input.length {
+    run spend(&mut work)
+    let current = input[i]
+    let dc = side(current, p)
+    let sideUncertainty = sideError(current, p)
+    if !f64.isFinite(dc) || !f64.isFinite(sideUncertainty) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+
+    // Additional planes are applied after finite viewport clipping. An
+    // uncertain classification must not silently discard geometry whose
+    // positional uncertainty exceeds the target budget, even if no crossing
+    // vertex survives to outputPoint. Baseline w/viewport clipping runs before
+    // this finite-device precondition and uses its homogeneous guards instead.
+    if targetGuard > 0.0 && f64.abs(dc) <= sideUncertainty {
+      if !(current.w > current.ew)
+        || projectionError(current, projected(current)) > targetGuard * 0.125 {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+    }
+    if (dp < 0.0 && dc >= 0.0) || (dp >= 0.0 && dc < 0.0) {
+      let denominator = f64.abs(dp) + f64.abs(dc)
+      if denominator == 0.0 || !f64.isFinite(denominator) {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      let t = f64.abs(dp) / denominator
+      let mut intersection = mix(previous, current, t)
+      let uncertainty = (previousUncertainty + sideUncertainty) / denominator + ROUND
+      intersection.ex = intersection.ex
+        + 2.0 * (f64.abs(current.x - previous.x) + previous.ex + current.ex) * uncertainty
+      intersection.ey = intersection.ey
+        + 2.0 * (f64.abs(current.y - previous.y) + previous.ey + current.ey) * uncertainty
+      intersection.ew = intersection.ew
+        + 2.0 * (f64.abs(current.w - previous.w) + previous.ew + current.ew) * uncertainty
+
+      // Snap only the algebraically known clipping plane, not w to an epsilon.
+      if p.y == 0.0 && p.x != 0.0 {
+        intersection.x = -p.w * intersection.w / p.x
+        intersection.ex = f64.abs(p.w / p.x) * intersection.ew + f64.abs(intersection.x) * ROUND
+          + TINY
+      } else if p.x == 0.0 && p.y != 0.0 {
+        intersection.y = -p.w * intersection.w / p.y
+        intersection.ey = f64.abs(p.w / p.y) * intersection.ew + f64.abs(intersection.y) * ROUND
+          + TINY
+      } else if p.x == 0.0 && p.y == 0.0 {
+        intersection.w = 0.0
+        intersection.ew = 0.0
+      } else if f64.abs(p.x) >= f64.abs(p.y) && f64.abs(p.x) >= f64.abs(p.w) {
+        let y = p.y / p.x
+        let w = p.w / p.x
+        intersection.x = -(y * intersection.y + w * intersection.w)
+        intersection.ex = f64.abs(y) * intersection.ey + f64.abs(w) * intersection.ew
+          + (f64.abs(y * intersection.y) + f64.abs(w * intersection.w)) * ROUND
+          + TINY
+      } else if f64.abs(p.y) >= f64.abs(p.w) {
+        let x = p.x / p.y
+        let w = p.w / p.y
+        intersection.y = -(x * intersection.x + w * intersection.w)
+        intersection.ey = f64.abs(x) * intersection.ex + f64.abs(w) * intersection.ew
+          + (f64.abs(x * intersection.x) + f64.abs(w * intersection.w)) * ROUND
+          + TINY
+      } else {
+        let x = p.x / p.w
+        let y = p.y / p.w
+        intersection.w = -(x * intersection.x + y * intersection.y)
+        intersection.ew = f64.abs(x) * intersection.ex + f64.abs(y) * intersection.ey
+          + (f64.abs(x * intersection.x) + f64.abs(y * intersection.y)) * ROUND
+          + TINY
+      }
+      run append(&mut out, intersection)
+    }
+    if dc >= 0.0 {
+      run append(&mut out, current)
+    }
+    previous = current
+    dp = dc
+    previousUncertainty = sideUncertainty
+    i = i + 1
+  }
+}
+
+effect fn outputPoint(p: HPoint, clip: Rect, tolerance: f64) -> Point
+  ! GeometryError {
+  if !(p.w > 0.0) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let raw = projected(p)
+  if !raw.isFinite() {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let q = Point.make(
+    f64.max(clip.x0, f64.min(clip.x1, raw.x)),
+    f64.max(clip.y0, f64.min(clip.y1, raw.y)),
+  )
+  let error = projectionError(p, raw) + norm(q.x - raw.x, q.y - raw.y)
+  let x = f64.toF32(q.x)
+  let y = f64.toF32(q.y)
+  if !f32.isFinite(x) || !f32.isFinite(y) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if error + norm(q.x - f32.toF64(x), q.y - f32.toF64(y)) > tolerance * 0.5 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  return Point.make(f32.toF64(x), f32.toF64(y))
+}
+
+effect fn finish(
+  a: &mut List<HPoint>,
+  b: &mut List<HPoint>,
+  clip: Rect,
+  planes: &[Plane],
+  tolerance: f64,
+  work: &mut Work,
+  lines: &mut List<Line>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if a.length() < 2 {
+    a.clear()
+    return
+  }
+  let mut positive = false
+  let mut uncertainFront = false
+  let mut k: usize = 0
+  while k < a.length() {
+    if a.asSlice()[k].w > 0.0 {
+      positive = true
+    }
+    if a.asSlice()[k].w + a.asSlice()[k].ew > 0.0 {
+      uncertainFront = true
+    }
+    k = k + 1
+  }
+  if !positive {
+    if uncertainFront {
+      fail GeometryError { code: ACCURACY_LIMIT }
+    }
+    a.clear()
+    return
+  }
+  run clipPlane(a.asSlice(), &mut b, plane(0, clip), 0.0, &mut work)
+  run clipPlane(b.asSlice(), &mut a, plane(1, clip), 0.0, &mut work)
+  run clipPlane(a.asSlice(), &mut b, plane(2, clip), 0.0, &mut work)
+  run clipPlane(b.asSlice(), &mut a, plane(3, clip), 0.0, &mut work)
+  run clipPlane(a.asSlice(), &mut b, plane(4, clip), 0.0, &mut work)
+  let mut inB = true
+  let mut j: usize = 0
+  while j < planes.length {
+    run spend(&mut work)
+    if (inB && b.length() == 0) || (!inB && a.length() == 0) {
+      break
+    }
+    if inB {
+      run clipPlane(b.asSlice(), &mut a, planes[j], tolerance, &mut work)
+    } else {
+      run clipPlane(a.asSlice(), &mut b, planes[j], tolerance, &mut work)
+    }
+    inB = !inB
+    j = j + 1
+  }
+  let polygon = if inB {
+    b.asSlice()
+  } else {
+    a.asSlice()
+  }
+  if polygon.length >= 2 {
+    let mut from = run outputPoint(polygon[polygon.length - 1], clip, tolerance)
+    let mut i: usize = 0
+    while i < polygon.length {
+      let to = run outputPoint(polygon[i], clip, tolerance)
+
+      // Include horizontal edges too: this API returns complete boundaries.
+      if from.x != to.x || from.y != to.y {
+        run lines.append(
+          Line {
+            x0: f64.toF32(from.x),
+            y0: f64.toF32(from.y),
+            x1: f64.toF32(to.x),
+            y1: f64.toF32(to.y),
+          },
+        )
+      }
+      from = to
+      i = i + 1
+    }
+  }
+  a.clear()
+  b.clear()
+}
+
+fn ellipsePoint(center: Point, x: Point, y: Point, angle: f64, weight: f64) -> Point {
+  let c = f64.cos(angle)
+  let s = f64.sin(angle)
+  return Point.make(center.x * weight + x.x * c + y.x * s, center.y * weight + x.y * c + y.y * s)
+}
+
+fn ellipseError(p: HPoint, h: &Homography, xy: f64, w: f64) -> HPoint {
+  return HPoint {
+    x: p.x,
+    y: p.y,
+    w: p.w,
+    ex: p.ex + (f64.abs(h.xx) + f64.abs(h.xy)) * xy + f64.abs(h.xw) * w,
+    ey: p.ey + (f64.abs(h.yx) + f64.abs(h.yy)) * xy + f64.abs(h.yw) * w,
+    ew: p.ew + (f64.abs(h.wx) + f64.abs(h.wy)) * xy + f64.abs(h.ww) * w,
+  }
+}
+
+effect fn arc(
+  h: &Homography,
+  sourceScale: f64,
+  start: HPoint,
+  center: Point,
+  axisX: Point,
+  axisY: Point,
+  angles: Point,
+  end: HPoint,
+  clip: Rect,
+  planes: &[Plane],
+  tolerance: f64,
+  work: &mut Work,
+  out: &mut List<HPoint>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let ellipse = run ellipseSetup(h, sourceScale, start, center, axisX, axisY, angles)
+  let mut previous = ellipse.first
+  let mut i: u32 = 0
+  while i < ellipse.count {
+    let q = ellipseCurve(h, ellipse, previous, end, i)
+    run flatten(q, clip, planes, tolerance, 0, &mut work, &mut out)
+    previous = q.d
+    i = i + 1
+  }
+}
+
+/// Appends device-space closed fill boundaries clipped to clip and w>0.
+/// tolerance includes homogeneous arithmetic, curve approximation and f32
+/// output rounding. Limits are refusals, never silent subdivision clamps:
+/// at most 2^20 curve/extra-plane/clip-vertex visits per fill, depth 48, and
+/// 2^20 vertices in either scratch polygon (no subdivision allocations).
+/// A zero-area target is empty. Malformed/nonfinite inputs fail INVALID_INPUT;
+/// unrepresentable coordinates fail NUMERIC_LIMIT; precision/resources fail
+/// ACCURACY_LIMIT. Output already appended on any error must be discarded.
+pub effect fn fill(
+  path: &Path,
+  transform: &Homography,
+  clip: Rect,
+  tolerance: f64,
+  lines: &mut List<Line>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run fillImpl(path, transform, clip, &[], tolerance, &mut lines)
+}
+
+/// Whole-contour clipping against nested device-homogeneous visibility planes.
+/// This preserves winding closure; it does not multiply separately rasterized
+/// clip coverage. Input planes are normalized once using positive scales.
+/// The ordinary fill entry point adds no allocation for an empty plane chain.
+pub effect fn fillWithPlanes(
+  path: &Path,
+  transform: &Homography,
+  clip: Rect,
+  planes: &[HalfPlane],
+  tolerance: f64,
+  lines: &mut List<Line>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if planes.length > MAX_VERTICES {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let mut normalized = List<Plane>.make()
+  let mut i: usize = 0
+  while i < planes.length {
+    let p = planes[i]
+    if !f64.isFinite(p.x) || !f64.isFinite(p.y) || !f64.isFinite(p.w) {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    let s = max3(f64.abs(p.x), f64.abs(p.y), f64.abs(p.w))
+    if s > 0.0 {
+      let q = Plane { x: p.x / s, y: p.y / s, w: p.w / s }
+      if (p.x != 0.0 && q.x == 0.0) || (p.y != 0.0 && q.y == 0.0) || (p.w != 0.0 && q.w == 0.0) {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      if q.x != 0.0 || q.y != 0.0 || q.w < 0.0 {
+        run normalized.append(q)
+      }
+    }
+    i = i + 1
+  }
+  run fillImpl(path, transform, clip, normalized.asSlice(), tolerance, &mut lines)
+}
+
+effect fn fillImpl(
+  path: &Path,
+  transform: &Homography,
+  clip: Rect,
+  planes: &[Plane],
+  tolerance: f64,
+  lines: &mut List<Line>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if !transform.isFinite() || !f64.isFinite(tolerance) || tolerance <= 0.0
+    || !Point.make(clip.x0, clip.y0).isFinite()
+    || !Point.make(clip.x1, clip.y1).isFinite()
+    || clip.x1 < clip.x0
+    || clip.y1 < clip.y0 {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  if tolerance * 0.5 == 0.0 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let verbs = path.verbList()
+  let points = path.pointList()
+  let mut sourceScale = 1.0
+  let mut p: usize = 0
+  let mut i: usize = 0
+  while i < verbs.length {
+    let v = verbs[i]
+    let n: usize = if v == MOVE || v == LINE {
+      1
+    } else if v == QUAD {
+      2
+    } else if v == CUBIC {
+      3
+    } else if v == ARC {
+      5
+    } else if v == CLOSE {
+      0
+    } else {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    if p > points.length || n > points.length - p {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    let mut k: usize = 0
+    while k < n {
+      let q = points[p + k]
+      if !q.isFinite() {
+        fail GeometryError { code: INVALID_INPUT }
+      }
+      if v != ARC || k != 3 {
+        sourceScale = max3(sourceScale, f64.abs(q.x), f64.abs(q.y))
+      }
+      k = k + 1
+    }
+    p = p + n
+    i = i + 1
+  }
+  if p != points.length {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  if clip.x0 == clip.x1 || clip.y0 == clip.y1 || verbs.length == 0 {
+    return
+  }
+  let mut planeIndex: usize = 0
+  while planeIndex < planes.length {
+    let p = planes[planeIndex]
+    if p.x == 0.0 && p.y == 0.0 && p.w < 0.0 {
+      // W <= 0 has empty intersection with the visible W > 0 halfspace.
+      return
+    }
+    planeIndex = planeIndex + 1
+  }
+  let matrixScale = magnitude(transform)
+  if matrixScale == 0.0 {
+    return
+  }
+  let h = divided(transform, matrixScale)
+  if lost(transform, &h) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if h.wx == 0.0 && h.wy == 0.0 && h.ww <= 0.0 {
+    return
+  }
+  let mut a = List<HPoint>.make()
+  let mut b = List<HPoint>.make()
+  let mut current = point(&h, Point.make(0.0, 0.0), sourceScale)
+  let mut start = current
+  let mut work = Work { visits: 0 }
+  p = 0
+  i = 0
+  while i < verbs.length {
+    let v = verbs[i]
+    if v == MOVE {
+      run finish(&mut a, &mut b, clip, planes, tolerance, &mut work, &mut lines)
+      current = point(&h, points[p], sourceScale)
+      start = current
+      run append(&mut a, current)
+      p = p + 1
+    } else if v == CLOSE {
+      run finish(&mut a, &mut b, clip, planes, tolerance, &mut work, &mut lines)
+      current = start
+    } else {
+      if a.length() == 0 {
+        run append(&mut a, current)
+      }
+      if v == LINE {
+        current = point(&h, points[p], sourceScale)
+        run append(&mut a, current)
+        p = p + 1
+      } else if v == QUAD {
+        let control = point(&h, points[p], sourceScale)
+        let end = point(&h, points[p + 1], sourceScale)
+        run flatten(quadratic(current, control, end), clip, planes, tolerance, 0, &mut work, &mut a)
+        current = end
+        p = p + 2
+      } else if v == CUBIC {
+        let control1 = point(&h, points[p], sourceScale)
+        let control2 = point(&h, points[p + 1], sourceScale)
+        let end = point(&h, points[p + 2], sourceScale)
+        run flatten(
+          Curve { a: current, b: control1, c: control2, d: end },
+          clip,
+          planes,
+          tolerance,
+          0,
+          &mut work,
+          &mut a,
+        )
+        current = end
+        p = p + 3
+      } else if v == ARC {
+        let end = point(&h, points[p + 4], sourceScale)
+        run arc(
+          &h,
+          sourceScale,
+          current,
+          points[p],
+          points[p + 1],
+          points[p + 2],
+          points[p + 3],
+          end,
+          clip,
+          planes,
+          tolerance,
+          &mut work,
+          &mut a,
+        )
+        current = end
+        p = p + 5
+      }
+    }
+    i = i + 1
+  }
+  run finish(&mut a, &mut b, clip, planes, tolerance, &mut work, &mut lines)
+}
+
+/// Certified source-to-target Lipschitz bound on the positive-w preimage of a
+/// tolerance-expanded viewport. This does not need a source stroke envelope.
+///
+/// For N = H/maxAbs(H), adj(N)'s last row c satisfies
+/// w * (c.x*u + c.y*v + c.w) = det(N). Consequently 1/w is at most
+/// (|c.x|*U + |c.y|*V + |c.w|)/|det(N)|. Each Jacobian entry is
+/// (N.ij - target.i*N.wj)/w. Its entrywise absolute sum bounds its spectral norm.
+/// These identities hold throughout the visible preimage, even when the source
+/// outline crosses the eye plane. No positive epsilon-w is introduced.
+///
+/// Arithmetic certificate: normalized entries have absolute division error <=
+/// 2^-52 (also covering subnormals); cofactors have error < 16*2^-52;
+/// the six determinant products and additions have error < 128*2^-52.
+/// ROUND = 32*2^-52, so the guards below exceed these bounds, including the
+/// rounding of the guards themselves. Nonnegative sums/products are inflated
+/// by ROUND and TINY after each operation. A failed determinant certificate is
+/// NUMERIC_LIMIT, not a guessed scale or a silently singular projection.
+pub effect fn strokeScale(h: &Homography, clip: Rect, tolerance: f64) -> f64
+  ! GeometryError {
+  if !h.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance)
+    || !Point.make(clip.x0, clip.y0).isFinite()
+    || !Point.make(clip.x1, clip.y1).isFinite()
+    || clip.x0 > clip.x1
+    || clip.y0 > clip.y1 {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let s = magnitude(h)
+  if !(s > 0.0) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let n = divided(h, s)
+  let cx = n.yx * n.wy - n.yy * n.wx
+  let cy = n.xy * n.wx - n.xx * n.wy
+  let cw = n.xx * n.yy - n.xy * n.yx
+  let det = n.xw * cx + n.yw * cy + n.ww * cw
+  let lower = (f64.abs(det) - ROUND * 8.0) * (1.0 - ROUND)
+  if !(lower > 0.0) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let u = upperAdd(f64.max(f64.abs(clip.x0), f64.abs(clip.x1)), tolerance)
+  let v = upperAdd(f64.max(f64.abs(clip.y0), f64.abs(clip.y1)), tolerance)
+  let denominator = upperAdd(
+    upperAdd(upperMul(upperAdd(f64.abs(cx), ROUND), u), upperMul(upperAdd(f64.abs(cy), ROUND), v)),
+    upperAdd(f64.abs(cw), ROUND),
+  )
+  let rowX = upperAdd(upperAdd(f64.abs(n.xx), ROUND), upperAdd(f64.abs(n.xy), ROUND))
+  let rowY = upperAdd(upperAdd(f64.abs(n.yx), ROUND), upperAdd(f64.abs(n.yy), ROUND))
+  let rowW = upperAdd(upperAdd(f64.abs(n.wx), ROUND), upperAdd(f64.abs(n.wy), ROUND))
+  let numerator = upperAdd(upperAdd(rowX, rowY), upperMul(upperAdd(u, v), rowW))
+  let reciprocalW = (denominator / lower) * (1.0 + ROUND) + TINY
+  let scale = upperMul(numerator, reciprocalW)
+  if !(scale > 0.0) || !f64.isFinite(scale) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+
+  // A source error <= tolerance/scale cannot cross the expanded preimage's
+  // boundary from the viewport: the image would first have to travel tolerance.
+  // Existing source stroking uses only a fraction of that budget. This argument
+  // applies in both directions, including an approximant initially behind w=0.
+  return scale
+}
+
+fn upperAdd(a: f64, b: f64) -> f64 {
+  return (a + b) * (1.0 + ROUND) + TINY
+}
+
+fn upperMul(a: f64, b: f64) -> f64 {
+  return (a * b) * (1.0 + ROUND) + TINY
+}
+
+// Shared exact rational ellipse construction for clipped fill and unclipped bounds.
+struct Ellipse {
+  center: Point,
+  x: Point,
+  y: Point,
+  z: f64,
+  sweep: f64,
+  count: u32,
+  error: f64,
+  weightError: f64,
+  first: HPoint,
+}
+
+impl Copy for Ellipse {}
+
+effect fn ellipseSetup(
+  h: &Homography,
+  sourceScale: f64,
+  start: HPoint,
+  center: Point,
+  axisX: Point,
+  axisY: Point,
+  angles: Point,
+) -> Ellipse
+  ! GeometryError {
+  let count = f64.max(1.0, f64.ceil(f64.abs(angles.y) / HALF_PI))
+  if !f64.isFinite(count) || count > 1048576.0 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let c = Point.make(center.x / sourceScale, center.y / sourceScale)
+  let ax = Point.make(axisX.x / sourceScale, axisX.y / sourceScale)
+  let ay = Point.make(axisY.x / sourceScale, axisY.y / sourceScale)
+  let co = f64.cos(angles.x)
+  let si = f64.sin(angles.x)
+  let x = Point.make(ax.x * co + ay.x * si, ax.y * co + ay.y * si)
+  let y = Point.make(-ax.x * si + ay.x * co, -ax.y * si + ay.y * co)
+  let z = 1.0 / sourceScale
+  let error = 16.0 * ROUND
+    * (f64.abs(c.x) + f64.abs(c.y) + f64.abs(ax.x) + f64.abs(ax.y) + f64.abs(ay.x) + f64.abs(ay.y)
+      + z)
+    * (1.0 + f64.abs(angles.y))
+  let weightError = 16.0 * ROUND * z * (1.0 + f64.abs(angles.y))
+  let first = ellipsePoint(c, x, y, 0.0, 1.0)
+  return Ellipse {
+    center: c,
+    x: x,
+    y: y,
+    z: z,
+    sweep: angles.y,
+    count: f64.toU32(count),
+    error: error,
+    weightError: weightError,
+    first: ellipseError(anchor(start, mapped(h, first.x, first.y, z)), h, error, weightError),
+  }
+}
+
+fn ellipseCurve(h: &Homography, e: Ellipse, previous: HPoint, end: HPoint, i: u32) -> Curve {
+  let count = u32.toF64(e.count)
+  let a = e.sweep * (u32.toF64(i) / count)
+  let b = e.sweep * (u32.toF64(i + 1) / count)
+  let weight = f64.cos((b - a) * 0.5)
+  let control = ellipsePoint(e.center, e.x, e.y, (a + b) * 0.5, weight)
+  let target = ellipsePoint(e.center, e.x, e.y, b, 1.0)
+  let analytic = ellipseError(mapped(h, target.x, target.y, e.z), h, e.error, e.weightError)
+  let next = if i + 1 == e.count {
+    anchor(end, analytic)
+  } else {
+    analytic
+  }
+  let middle = ellipseError(
+    mapped(h, control.x, control.y, e.z * weight),
+    h,
+    e.error,
+    e.weightError,
+  )
+  return quadratic(previous, middle, next)
+}
+
+/// Unclipped positive-w source-geometry bounds (SVG 2 §8.10 / CSS Transforms 2).
+/// Each successful face is conservative and at most tolerance outside the true
+/// face. Empty means no drawable visible segment, not a zero-area rectangle.
+pub struct Bounds {
+  pub empty: bool,
+  pub bounds: Rect,
+}
+
+impl Copy for Bounds {}
+
+effect fn boundsCurve(q: Curve, tolerance: f64, depth: u32, work: &mut Work, out: &mut Bounds) -> ()
+  ! GeometryError {
+  if work.visits >= MAX_WORK || depth >= MAX_DEPTH {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  work.visits = work.visits + 1
+  if q.a.w < -q.a.ew && q.b.w < -q.b.ew && q.c.w < -q.c.ew && q.d.w < -q.d.ew {
+    return
+  }
+  if (q.a.w > q.a.ew && q.d.w < -q.d.ew) || (q.d.w > q.d.ew && q.a.w < -q.a.ew) {
+    // A continuous denominator changes sign; there is no finite unclipped
+    // bound in the general case. Do not substitute a viewport-clipped box.
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if q.a.w > q.a.ew && q.b.w > q.b.ew && q.c.w > q.c.ew && q.d.w > q.d.ew {
+    let a = projected(q.a)
+    let b = projected(q.b)
+    let c = projected(q.c)
+    let d = projected(q.d)
+    let error = f64.max(
+      f64.max(projectionError(q.a, a), projectionError(q.b, b)),
+      f64.max(projectionError(q.c, c), projectionError(q.d, d)),
+    )
+    let deviation = f64.max(chordDistance(b, a, d), chordDistance(c, a, d))
+    if error + deviation <= tolerance * 0.25 {
+      // Positive rational hull is within deviation of the endpoint chord.
+      // Half a tolerance covers that plus projection/face-rounding error;
+      // actual endpoints witness that no face is a full tolerance too far out.
+      let pad = tolerance * 0.5
+      let box = Rect {
+        x0: f64.min(a.x, d.x) - pad,
+        y0: f64.min(a.y, d.y) - pad,
+        x1: f64.max(a.x, d.x) + pad,
+        y1: f64.max(a.y, d.y) + pad,
+      }
+      if !Point.make(box.x0, box.y0).isFinite() || !Point.make(box.x1, box.y1).isFinite() {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      if out.empty {
+        out.bounds = box
+        out.empty = false
+      } else {
+        out.bounds.x0 = f64.min(out.bounds.x0, box.x0)
+        out.bounds.y0 = f64.min(out.bounds.y0, box.y0)
+        out.bounds.x1 = f64.max(out.bounds.x1, box.x1)
+        out.bounds.y1 = f64.max(out.bounds.y1, box.y1)
+      }
+      return
+    }
+  }
+  let ab = mix(q.a, q.b, 0.5)
+  let bc = mix(q.b, q.c, 0.5)
+  let cd = mix(q.c, q.d, 0.5)
+  let abc = mix(ab, bc, 0.5)
+  let bcd = mix(bc, cd, 0.5)
+  let middle = mix(abc, bcd, 0.5)
+  run boundsCurve(
+    Curve { a: q.a, b: ab, c: abc, d: middle },
+    tolerance,
+    depth + 1,
+    &mut work,
+    &mut out,
+  )
+  run boundsCurve(
+    Curve { a: middle, b: bcd, c: cd, d: q.d },
+    tolerance,
+    depth + 1,
+    &mut work,
+    &mut out,
+  )
+}
+
+/// Bounds actual rational curves in f64 without viewport clipping or f32 lines.
+/// Positioned degenerate LINE/QUAD/CUBIC/ARC segments are retained; MOVE alone
+/// is empty. Entirely negative-w geometry is empty. Eye-plane singularities,
+/// insufficient arithmetic precision, depth 48 or 2^20 visits fail explicitly.
+/// No allocation is needed, including for exact rational elliptical arcs.
+pub effect fn bounds(path: &Path, transform: &Homography, tolerance: f64) -> Bounds
+  ! GeometryError {
+  if !transform.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance) {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  if tolerance * 0.25 == 0.0 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let mut result = Bounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+  let verbs = path.verbList()
+  let points = path.pointList()
+  let mut sourceScale = 1.0
+  let mut p: usize = 0
+  let mut i: usize = 0
+  while i < verbs.length {
+    let v = verbs[i]
+    let n: usize = if v == MOVE || v == LINE {
+      1
+    } else if v == QUAD {
+      2
+    } else if v == CUBIC {
+      3
+    } else if v == ARC {
+      5
+    } else if v == CLOSE {
+      0
+    } else {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    if p > points.length || n > points.length - p {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    let mut k: usize = 0
+    while k < n {
+      let q = points[p + k]
+      if !q.isFinite() {
+        fail GeometryError { code: INVALID_INPUT }
+      }
+      if v != ARC || k != 3 {
+        sourceScale = max3(sourceScale, f64.abs(q.x), f64.abs(q.y))
+      }
+      k = k + 1
+    }
+    p = p + n
+    i = i + 1
+  }
+  if p != points.length {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let matrixScale = magnitude(transform)
+  if matrixScale == 0.0 || verbs.length == 0 {
+    return result
+  }
+  let h = divided(transform, matrixScale)
+  if lost(transform, &h) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if h.wx == 0.0 && h.wy == 0.0 && h.ww <= 0.0 {
+    return result
+  }
+  let mut current = point(&h, Point.make(0.0, 0.0), sourceScale)
+  let mut start = current
+  let mut drawn = false
+  let mut work = Work { visits: 0 }
+  p = 0
+  i = 0
+  while i < verbs.length {
+    let v = verbs[i]
+    if v == MOVE {
+      current = point(&h, points[p], sourceScale)
+      start = current
+      drawn = false
+      p = p + 1
+    } else if v == CLOSE {
+      if drawn {
+        run boundsCurve(
+          Curve { a: current, b: current, c: start, d: start },
+          tolerance,
+          0,
+          &mut work,
+          &mut result,
+        )
+      }
+      current = start
+    } else {
+      if v == LINE {
+        let end = point(&h, points[p], sourceScale)
+        run boundsCurve(
+          Curve { a: current, b: current, c: end, d: end },
+          tolerance,
+          0,
+          &mut work,
+          &mut result,
+        )
+        current = end
+        p = p + 1
+      } else if v == QUAD {
+        let control = point(&h, points[p], sourceScale)
+        let end = point(&h, points[p + 1], sourceScale)
+        run boundsCurve(quadratic(current, control, end), tolerance, 0, &mut work, &mut result)
+        current = end
+        p = p + 2
+      } else if v == CUBIC {
+        let b = point(&h, points[p], sourceScale)
+        let c = point(&h, points[p + 1], sourceScale)
+        let end = point(&h, points[p + 2], sourceScale)
+        run boundsCurve(
+          Curve { a: current, b: b, c: c, d: end },
+          tolerance,
+          0,
+          &mut work,
+          &mut result,
+        )
+        current = end
+        p = p + 3
+      } else if v == ARC {
+        let end = point(&h, points[p + 4], sourceScale)
+        let e = run ellipseSetup(
+          &h,
+          sourceScale,
+          current,
+          points[p],
+          points[p + 1],
+          points[p + 2],
+          points[p + 3],
+        )
+        let mut previous = e.first
+        let mut j: u32 = 0
+        while j < e.count {
+          let q = ellipseCurve(&h, e, previous, end, j)
+          run boundsCurve(q, tolerance, 0, &mut work, &mut result)
+          previous = q.d
+          j = j + 1
+        }
+        current = end
+        p = p + 5
+      }
+      drawn = true
+    }
+    i = i + 1
+  }
+  return result
+}
+
+/// Certificate for the source-error tube around an emitted stroke outline.
+/// `uncertain` requests source refinement; empty means every contour is behind.
+pub struct StrokeRegion {
+  pub empty: bool,
+  pub uncertain: bool,
+  pub scale: f64,
+}
+
+struct ContourRegion {
+  active: bool,
+  lower: f64,
+  upper: f64,
+  x: f64,
+  y: f64,
+  positive: bool,
+  negative: bool,
+}
+
+fn emptyContourRegion() -> ContourRegion {
+  return ContourRegion {
+    active: false,
+    lower: 0.0,
+    upper: 0.0,
+    x: 0.0,
+    y: 0.0,
+    positive: false,
+    negative: false,
+  }
+}
+
+effect fn finishStrokeRegion(c: &ContourRegion, h: &Homography, result: &mut StrokeRegion) -> ()
+  ! GeometryError {
+  if !c.active {
+    return
+  }
+  if c.positive && c.negative {
+    // The corresponding true connected contour also has both signs. Its
+    // positive-w image has no certifiable finite, unclipped reference box.
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if c.upper < 0.0 {
+    return
+  }
+  if !(c.lower > 0.0) {
+    result.uncertain = true
+    return
+  }
+  let u = (c.x / c.lower) * (1.0 + ROUND) + TINY
+  let v = (c.y / c.lower) * (1.0 + ROUND) + TINY
+  let rowX = upperAdd(f64.abs(h.xx), f64.abs(h.xy))
+  let rowY = upperAdd(f64.abs(h.yx), f64.abs(h.yy))
+  let rowW = upperAdd(f64.abs(h.wx), f64.abs(h.wy))
+  let numerator = upperAdd(upperAdd(rowX, rowY), upperMul(upperAdd(u, v), rowW))
+  let scale = (numerator / c.lower) * (1.0 + ROUND) + TINY
+  if !f64.isFinite(scale) || !(scale > 0.0) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  result.empty = false
+  result.scale = f64.max(result.scale, scale)
+}
+
+/// Certifies each connected source-outline contour separately, not its AABB.
+/// The 2*sourceError tube covers both the exact source stroke and its polygon.
+/// Affine homogeneous coordinates attain extrema on polygon vertices; their
+/// interval bounds plus the tube's row-norm margin therefore cover whole edges.
+/// Positive and negative disconnected contours may coexist. Uncertain eye-plane
+/// proximity requests refinement; a certified crossing is a typed refusal.
+/// This accepts only the MOVE/LINE/CLOSE outlines emitted by Stroker.
+pub effect fn strokeRegion(outline: &Path, transform: &Homography, sourceError: f64) -> StrokeRegion
+  ! GeometryError {
+  if !transform.isFinite() || !(sourceError > 0.0) || !f64.isFinite(sourceError) {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let mut result = StrokeRegion { empty: true, uncertain: false, scale: 0.0 }
+  let matrixScale = magnitude(transform)
+  if matrixScale == 0.0 {
+    return move result
+  }
+  let h = divided(transform, matrixScale)
+  if lost(transform, &h) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let radius = upperMul(2.0, sourceError)
+  let rowX = upperAdd(f64.abs(h.xx), f64.abs(h.xy))
+  let rowY = upperAdd(f64.abs(h.yx), f64.abs(h.yy))
+  let rowW = upperAdd(f64.abs(h.wx), f64.abs(h.wy))
+  let marginX = upperMul(radius, rowX)
+  let marginY = upperMul(radius, rowY)
+  let marginW = upperMul(radius, rowW)
+  let verbs = outline.verbList()
+  let points = outline.pointList()
+  let mut p: usize = 0
+  let mut i: usize = 0
+  let mut contour = emptyContourRegion()
+  while i < verbs.length {
+    let v = verbs[i]
+    if v == MOVE || v == CLOSE {
+      run finishStrokeRegion(&contour, &h, &mut result)
+      contour = emptyContourRegion()
+    }
+    if v == MOVE || v == LINE {
+      if p >= points.length || !points[p].isFinite() {
+        fail GeometryError { code: INVALID_INPUT }
+      }
+      let q = mapped(&h, points[p].x, points[p].y, 1.0)
+      let ew = upperAdd(q.ew, marginW)
+      let round = upperMul(upperAdd(f64.abs(q.w), ew), ROUND)
+      let lower = q.w - ew - round - TINY
+      let upper = q.w + ew + round + TINY
+      let x = upperAdd(upperAdd(f64.abs(q.x), q.ex), marginX)
+      let y = upperAdd(upperAdd(f64.abs(q.y), q.ey), marginY)
+      if !f64.isFinite(lower) || !f64.isFinite(upper) || !f64.isFinite(x) || !f64.isFinite(y) {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      if !contour.active {
+        contour.lower = lower
+        contour.upper = upper
+        contour.active = true
+      } else {
+        contour.lower = f64.min(contour.lower, lower)
+        contour.upper = f64.max(contour.upper, upper)
+      }
+      contour.x = f64.max(contour.x, x)
+      contour.y = f64.max(contour.y, y)
+      contour.positive = contour.positive || lower > 0.0
+      contour.negative = contour.negative || upper < 0.0
+      p = p + 1
+    } else if v != CLOSE {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    i = i + 1
+  }
+  if p != points.length {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  run finishStrokeRegion(&contour, &h, &mut result)
+  return move result
+}
+
+fn compositionPower(maximum: f64) -> f64 {
+  let bits = f64.toBits(maximum) & 0x7ff0000000000000
+  return f64.fromBits(
+    if bits == 0 {
+      0x0010000000000000
+    } else {
+      bits
+    },
+  )
+}
+
+fn exactCompositionScale(original: &Homography, scaled: &Homography, scale: f64) -> bool {
+  return scaled.xx * scale == original.xx && scaled.xy * scale == original.xy
+    && scaled.xw * scale == original.xw
+    && scaled.yx * scale == original.yx
+    && scaled.yy * scale == original.yy
+    && scaled.yw * scale == original.yw
+    && scaled.wx * scale == original.wx
+    && scaled.wy * scale == original.wy
+    && scaled.ww * scale == original.ww
+}
+
+fn compositionPowerOfTwo(value: f64) -> bool {
+  let bits = f64.toBits(f64.abs(value))
+  return (bits & 0x7ff0000000000000) != 0 && (bits & 0x000fffffffffffff) == 0
+}
+
+// Used only for cancellation-sensitive dots. Dekker decomposition is exact in
+// this range; refusing smaller products protects the otherwise lost residual.
+fn compositionProduct(a: f64, b: f64) -> Option<[f64; 2]> {
+  if a == 0.0 || b == 0.0 {
+    return Option<[f64; 2]>.some([0.0, 0.0])
+  }
+  let p = a * b
+  if !f64.isFinite(p) || p == 0.0 {
+    return Option<[f64; 2]>.none()
+  }
+  if (compositionPowerOfTwo(a) && p / a == b) || (compositionPowerOfTwo(b) && p / b == a) {
+    return Option<[f64; 2]>.some([p, 0.0])
+  }
+  if f64.abs(p) < 1.0e-250 || f64.abs(a) > 1.0e280 || f64.abs(b) > 1.0e280 {
+    return Option<[f64; 2]>.none()
+  }
+  let sa = 134217729.0 * a
+  let sb = 134217729.0 * b
+  let ah = sa - (sa - a)
+  let bh = sb - (sb - b)
+  let al = a - ah
+  let bl = b - bh
+  let error = ((ah * bh - p) + ah * bl + al * bh) + al * bl
+  if !f64.isFinite(error) {
+    return Option<[f64; 2]>.none()
+  }
+  return Option<[f64; 2]>.some([p, error])
+}
+
+fn addCompositionExpansion(e: &mut [f64; 6], length: usize, value: f64) -> usize {
+  let mut sum = value
+  let mut count: usize = 0
+  let mut i: usize = 0
+  while i < length {
+    let next = sum + e[i]
+    let virtual = next - sum
+    let residual = (sum - (next - virtual)) + (e[i] - virtual)
+    if residual != 0.0 {
+      e[count] = residual
+      count = count + 1
+    }
+    sum = next
+    i = i + 1
+  }
+  if sum != 0.0 {
+    e[count] = sum
+    count = count + 1
+  }
+  return count
+}
+
+fn compositionDot(a: &[f64; 3], b: &[f64; 3]) -> Option<f64> {
+  let mut products: [f64; 3] = [0.0; 3]
+  let mut work = 0.0
+  let mut i: usize = 0
+  while i < 3 {
+    let p = a[i] * b[i]
+    if !f64.isFinite(p) || (p == 0.0 && a[i] != 0.0 && b[i] != 0.0) {
+      return Option<f64>.none()
+    }
+    if p != 0.0 && f64.abs(p) < 2.2250738585072014e-308
+      && !((compositionPowerOfTwo(a[i]) && p / a[i] == b[i])
+        || (compositionPowerOfTwo(b[i]) && p / b[i] == a[i])) {
+      return Option<f64>.none()
+    }
+    products[i] = p
+    work = work + f64.abs(p)
+    i = i + 1
+  }
+  if !f64.isFinite(work) {
+    return Option<f64>.none()
+  }
+  let sum = products[0] + products[1] + products[2]
+  if !f64.isFinite(sum) {
+    return Option<f64>.none()
+  }
+
+  // gamma(5) times the absolute product sum bounds ordinary dot arithmetic.
+  // With cancellation <=4 the coefficient's relative error is below ROUND.
+  if work == 0.0 || f64.abs(sum) >= work * 0.25 {
+    return Option<f64>.some(sum)
+  }
+  let mut expansion: [f64; 6] = [0.0; 6]
+  let mut length: usize = 0
+  i = 0
+  while i < 3 {
+    if let Option<[f64; 2]>.Some { value: product } = compositionProduct(a[i], b[i]) {
+      length = addCompositionExpansion(&mut expansion, length, product[1])
+      length = addCompositionExpansion(&mut expansion, length, product[0])
+    } else {
+      return Option<f64>.none()
+    }
+    i = i + 1
+  }
+  let mut result = 0.0
+  i = 0
+  while i < length {
+    result = result + expansion[i]
+    i = i + 1
+  }
+  if !f64.isFinite(result) || (length > 0 && result == 0.0) {
+    return Option<f64>.none()
+  }
+  return Option<f64>.some(result)
+}
+
+fn composed(left: &Homography, right: &Homography) -> Option<Homography> {
+  let rows = [[left.xx, left.xy, left.xw], [left.yx, left.yy, left.yw], [left.wx, left.wy, left.ww]]
+  let columns = [
+    [right.xx, right.yx, right.wx],
+    [right.xy, right.yy, right.wy],
+    [right.xw, right.yw, right.ww],
+  ]
+  let mut values: [f64; 9] = [0.0; 9]
+  let mut row: usize = 0
+  while row < 3 {
+    let mut column: usize = 0
+    while column < 3 {
+      if let Option<f64>.Some { value: value } = compositionDot(&rows[row], &columns[column]) {
+        values[row * 3 + column] = value
+      } else {
+        return Option<Homography>.none()
+      }
+      column = column + 1
+    }
+    row = row + 1
+  }
+  return Option<Homography>.some(
+    Homography {
+      xx: values[0],
+      xy: values[1],
+      xw: values[2],
+      yx: values[3],
+      yy: values[4],
+      yw: values[5],
+      wx: values[6],
+      wy: values[7],
+      ww: values[8],
+    },
+  )
+}

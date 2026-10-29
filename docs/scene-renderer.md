@@ -39,6 +39,25 @@ without Dawn.
    Thus a finite enclosing rectangle at `±1e20` can cover a small viewport without requiring
    those irrelevant coordinates to meet the on-screen f32 error budget. Uncertifiable clipping
    interpolation fails explicitly; coordinates are never silently saturated before clipping.
+
+   Projective callers use `vector.projective.Homography` and
+   `projective.fill(path, transform, viewport, tolerance, lines)`. Curves remain homogeneous
+   Béziers; ellipse arcs become exact rational quadratics, not polynomial approximations.
+   Whole closed contours are clipped against positive w and the finite viewport before
+   division and f32 narrowing, preserving closing edges and both fill-rule windings.
+   `fillWithPlanes` additionally intersects device-homogeneous `HalfPlane { x, y, w }`
+   constraints. Nested flattened projections need these intermediate visibility constraints:
+   multiplying homographies alone can otherwise resurrect geometry behind a child's eye plane.
+   The inverse parent's denominator supplies the corresponding device-space halfplane.
+
+   `Homography.compose` computes parent × child with checked cancellation and positive
+   power-of-two rescaling when direct arithmetic cannot represent the result. Positive common
+   scaling preserves the map; a negative scale reverses visibility and is never discarded.
+   `projective.bounds` measures unclipped f64 curve bounds, retaining positioned degenerates
+   and excluding entirely negative-w geometry. An unbounded eye-plane crossing or unavailable
+   precision is an error, not a viewport-sized replacement box. Projective subdivision allows
+   48 levels and 1,048,576 combined curve, extra-plane and clipping-vertex visits; partial
+   output after failure must be discarded.
 3. **Stroke** (`vector.stroke`): `Stroker.stroke(path, style, transform, tolerance, out)`
    expands a path into a user-space outline for nonzero filling. The caller applies the transform
    when filling, so skew and non-uniform scale transform the pen too. Tolerance is explicit,
@@ -82,6 +101,20 @@ without Dawn.
    Contract tests in `vector/src/stroke_tests.silk` also reference
    [SVG 2 line caps](https://www.w3.org/TR/SVG2/painting.html#LineCaps) and
    [stroke bounding boxes](https://www.w3.org/TR/SVG2/coords.html#BoundingBoxes).
+
+   `Stroker.strokeProjective(path, style, homography, viewport, tolerance, out)` still produces
+   a **source-space** pen outline. It bounds the projective Jacobian over the expanded target
+   viewport using the inverse denominator, then reuses source tangents, curvature, caps, joins
+   and dash lengths. It never strokes a projected centerline. Divide a desired total target
+   error between stroking and subsequent projective flattening.
+
+   `Stroker.boundsProjective(..., tolerance, ignoreDashes)` needs no viewport. A guarded source
+   error tube certifies each connected contour's homogeneous sign; disconnected behind-eye
+   contours are ignored, while genuine crossings fail explicitly. Finite source-coordinate
+   bounds then certify the Jacobian for refinement and outward-padded f64 reference bounds.
+   A source AABB crossing w = 0 does not by itself imply an unbounded stroke. The adaptive
+   source-tolerance search has a 64-refinement refusal limit in addition to the stroker and
+   projective subdivision limits.
 4. **Coverage** (`vector.strips`): exact signed area per pixel cell, accumulated and prefix-summed
    along each row (the font-rs method). Nonzero coverage is `min(|a|, 1)`; even-odd is
    `|a - 2 round(a / 2)|`. Lines are split at x = 0 and x = width and then clamped, so geometry
@@ -105,9 +138,17 @@ without Dawn.
      straight alpha by default (resvg and Skia's SVG behaviour) or premultiplied (CSS Images 3).
      Color-space choice (`color-interpolation: linearRGB`) is the caller's, by converting stops.
    - Image patterns: nearest or bilinear sampling of a premultiplied pixmap, clamped (for
-     `image`, clipped by its rectangle) or repeated (pattern tiles). CPU sampling is f32 with
-     separately rounded operations on the inverse rounded to f32, four pixels per step. Native
-     scene shaders use strict math to preserve those operations at nearest-texel boundaries.
+     `image`, clipped by its rectangle) or repeated (pattern tiles). Affine CPU sampling is f32
+     with separately rounded operations on the inverse rounded to f32, four pixels per step.
+     Native scene shaders use strict math at nearest-texel boundaries.
+   - Projective paints: `Gradient.linearProjective`, `Gradient.radialProjective` and
+     `ImagePattern.makeProjective` take a homography and perform inverse homogeneous division.
+     Negative inverse w is valid; zero inverse w paints transparent. Genuinely singular maps
+     paint nothing; unsupported numeric precision and nonfinite input report `GeometryError`.
+     Projective image coordinates use explicit
+     `fma(yCoefficient, fy, fma(xCoefficient, fx, offset))` per homogeneous row on CPU SIMD and
+     WGSL. This shared rounding contract is necessary even with native strict math: implicit
+     contraction otherwise changed one bilinear image channel by one byte.
    - Opacity (`fill-opacity`, `stroke-opacity`) scales the coverage mask.
    The target is premultiplied RGBA8. Every blend uses the exact integer
    `div255(x) = (x + 128 + ((x + 128) >> 8)) >> 8`, which equals `round(x / 255)` for all
@@ -137,6 +178,11 @@ without Dawn.
    paint module is created with `strictMath = true`. Vulkan (lavapipe in CI) and D3D compile WGSL
    without fast-math contraction and do not offer the feature, so they use the ordinary module
    and still match the CPU exactly. Composition and filters keep their existing math mode.
+   Solid and affine paint records remain 16 words. Projective kinds 4/5/6 use 19 words,
+   appending the inverse denominator; run paint references are word offsets. Projective fixtures
+   allow one level for images and two for gradients: WGSL bounds division only to 2.5 ULP, so
+   the perspective divide can move a bilinear weight by one rounding step (lavapipe shows one
+   channel off by one; the checked Metal run had zero differing image channels).
 
    This is necessary on Metal: relaxed arithmetic changed the image fixture's device column
    `x = 21` from source texel 1 to texel 2 (242 differing channels, maximum delta 130). The

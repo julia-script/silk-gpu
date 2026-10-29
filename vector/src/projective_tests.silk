@@ -1,0 +1,966 @@
+//! CSS Transforms 2 §4.2: divide by w; clip negative w, never mirror it.
+//! https://www.w3.org/TR/css-transforms-2/#processing-of-perspective-transformed-boxes
+//! Pinned spec: ae5706be318c6826179c9fb0172c35c17dcf3aa7362630974b6f8ff32020e4a8
+//! SVG 2 B.2.2: exact center-parametric elliptical arcs, not cubic substitutes.
+//! https://www.w3.org/TR/2018/CR-SVG2-20181004/implnote.html#ArcParameterizationAlternatives
+//! Pinned spec: 88179b76bd0f1e8d4b7693fb2ce965f95a6c1acd2bceed74b537af37fdd1e653
+import projective { Homography, HalfPlane }
+import projective
+import geometry { Point, Rect, Affine }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import path { Path }
+import flatten { Line }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.option { Option }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import silk.testing.testing { Testing, AssertionError }
+
+fn perspective() -> Homography {
+  return Homography {
+    xx: 2.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 3.0,
+    yw: 0.0,
+    wx: 0.25,
+    wy: 0.0,
+    ww: 1.0,
+  }
+}
+
+fn scaled(h: Homography, k: f64) -> Homography {
+  return Homography {
+    xx: h.xx * k,
+    xy: h.xy * k,
+    xw: h.xw * k,
+    yx: h.yx * k,
+    yy: h.yy * k,
+    yw: h.yw * k,
+    wx: h.wx * k,
+    wy: h.wy * k,
+    ww: h.ww * k,
+  }
+}
+
+fn area(lines: &[Line]) -> f64 {
+  let mut a = 0.0
+  let mut i: usize = 0
+  while i < lines.length {
+    let l = lines[i]
+    a = a + (f32.toF64(l.x0) + f32.toF64(l.x1)) * (f32.toF64(l.y1) - f32.toF64(l.y0)) * 0.5
+    i = i + 1
+  }
+  return a
+}
+
+fn winding(lines: &[Line], x: f64, y: f64) -> i32 {
+  let mut result: i32 = 0
+  let mut i: usize = 0
+  while i < lines.length {
+    let l = lines[i]
+    let y0 = f32.toF64(l.y0)
+    let y1 = f32.toF64(l.y1)
+    if (y0 <= y && y < y1) || (y1 <= y && y < y0) {
+      let hit = f32.toF64(l.x0) + (y - y0) * (f32.toF64(l.x1) - f32.toF64(l.x0)) / (y1 - y0)
+      if hit > x {
+        result = result
+          + if y1 > y0 {
+            1
+          } else {
+            -1
+          }
+      }
+    }
+    i = i + 1
+  }
+  return result
+}
+
+fn distance(p: Point, l: Line) -> f64 {
+  let x = f32.toF64(l.x0)
+  let y = f32.toF64(l.y0)
+  let dx = f32.toF64(l.x1) - x
+  let dy = f32.toF64(l.y1) - y
+  let dd = dx * dx + dy * dy
+  let t = if dd == 0.0 {
+    0.0
+  } else {
+    f64.max(0.0, f64.min(1.0, ((p.x - x) * dx + (p.y - y) * dy) / dd))
+  }
+  let ex = p.x - x - t * dx
+  let ey = p.y - y - t * dy
+  return f64.sqrt(ex * ex + ey * ey)
+}
+
+fn nearest(p: Point, lines: &[Line]) -> f64 {
+  let mut d = 1.0e100
+  let mut i: usize = 0
+  while i < lines.length {
+    d = f64.min(d, distance(p, lines[i]))
+    i = i + 1
+  }
+  return d
+}
+
+test effect fn independentlyComputedProjectiveQuadrilateral() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 4.0, 2.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fill(&p, &perspective(), Rect.make(-10.0, -10.0, 30.0, 30.0), 0.00001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Independently: (0,0),(4,0),(4,3),(0,6), trapezoid area 18.
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - 18.0) < 0.00001,
+    "perspective gives a trapezoid, not an affine parallelogram",
+  )
+  run Testing.expect(
+    winding(lines.asSlice(), 2.0, 4.0) == 1 && winding(lines.asSlice(), 3.0, 4.0) == 0,
+    "sloped projected top boundary",
+  )
+}
+
+test effect fn positiveScalarInvarianceAndNegativeWVisibility() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 4.0, 2.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let clip = Rect.make(-10.0, -10.0, 30.0, 30.0)
+  let mut a = List<Line>.make()
+  let mut b = List<Line>.make()
+  let mut c = List<Line>.make()
+  run projective.fill(&p, &scaled(perspective(), 1.0e250), clip, 0.001, &mut a)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run projective.fill(&p, &scaled(perspective(), 1.0e-250), clip, 0.001, &mut b)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run projective.fill(&p, &scaled(perspective(), -1.0), clip, 0.001, &mut c)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    a.length() == b.length() && f64.abs(area(a.asSlice()) - area(b.asSlice())) < 0.00001,
+    "positive homogeneous scale does not change geometry",
+  )
+  let mut i: usize = 0
+  while i < a.length() {
+    let x = a.asSlice()[i]
+    let y = b.asSlice()[i]
+    run Testing.expect(
+      x.x0 == y.x0 && x.y0 == y.y0 && x.x1 == y.x1 && x.y1 == y.y1,
+      "positive scalar invariance of every stored boundary endpoint",
+    )
+    i = i + 1
+  }
+  run Testing.expect(
+    c.length() == 0,
+    "negative w is clipped, not sign-normalized into a visible mirrored shape",
+  )
+  match scaled(perspective(), -1.0).project(Point.make(4.0, 2.0)) {
+    Option<Point>.Some { value } => {
+      run Testing.expect(
+        value.x == 4.0 && value.y == 3.0,
+        "generic inverse point mapping permits negative w",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "finite negative w projects")
+    }
+  }
+}
+
+test effect fn crossingEyePlaneClosesAtFiniteViewport() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let h = Homography {
+    xx: 0.0,
+    xy: 0.0,
+    xw: 1.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 0.0,
+  }
+  let mut p = Path.make()
+  run p.rect(Rect.make(-1.0, -1.0, 2.0, 2.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fill(&p, &h, Rect.make(0.0, -2.0, 4.0, 4.0), 0.0001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Positive source x maps to X=1/x >=1, |Y|<=X. Clip gives area 11.
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) + 11.0) < 0.0001,
+    "w=0 rays close along the viewport with reflected winding",
+  )
+  run Testing.expect(
+    winding(lines.asSlice(), 3.0, 0.0) == -1 && winding(lines.asSlice(), 0.5, 0.0) == 0,
+    "front half only",
+  )
+  let mut i: usize = 0
+  while i < lines.length() {
+    let l = lines.asSlice()[i]
+    run Testing.expect(
+      l.x0 >= 0.0 && l.x0 <= 4.0 && l.x1 >= 0.0 && l.x1 <= 4.0 && l.y0 >= -2.0 && l.y0 <= 2.0
+        && l.y1 >= -2.0
+        && l.y1 <= 2.0,
+      "finite closed target rectangle",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn denseExactRationalQuadraticAndCubicError() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.2,
+    xw: 0.0,
+    yx: 0.1,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.007,
+    wy: 0.003,
+    ww: 1.0,
+  }
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(30.0, 90.0, 100.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.cubicTo(80.0, -80.0, 20.0, -90.0, 0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fill(&p, &h, Rect.make(-200.0, -200.0, 400.0, 400.0), 0.002, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 4096 {
+    let t = u32.toF64(i) / 4096.0
+    let u = 1.0 - t
+    let qx = 60.0 * u * t + 100.0 * t * t
+    let qy = 180.0 * u * t
+    let qw = 1.0 + 0.007 * qx + 0.003 * qy
+    let q = Point.make((qx + 0.2 * qy) / qw, (0.1 * qx + qy) / qw)
+    let cx = 100.0 * u * u * u + 240.0 * u * u * t + 60.0 * u * t * t
+    let cy = -240.0 * u * u * t - 270.0 * u * t * t
+    let cw = 1.0 + 0.007 * cx + 0.003 * cy
+    let c = Point.make((cx + 0.2 * cy) / cw, (0.1 * cx + cy) / cw)
+    run Testing.expect(
+      nearest(q, lines.asSlice()) <= 0.002 && nearest(c, lines.asSlice()) <= 0.002,
+      "dense exact rational curves within device-space tolerance including f32 output",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn denseExactProjectedEllipseError() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.006,
+    wy: 0.002,
+    ww: 1.0,
+  }
+  let mut p = Path.make()
+  run p.moveTo(100.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(100.0, 0.0),
+    Point.make(0.0, 60.0),
+    0.0,
+    -6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fill(&p, &h, Rect.make(-400.0, -400.0, 800.0, 800.0), 0.001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 8192 {
+    let t = u32.toF64(i) * 6.283185307179586 / 8192.0
+    let x = 100.0 * f64.cos(t)
+    let y = 60.0 * f64.sin(t)
+    let w = 1.0 + 0.006 * x + 0.002 * y
+    run Testing.expect(
+      nearest(Point.make(x / w, y / w), lines.asSlice()) <= 0.001,
+      "exact conic, not a projected ordinary cubic approximation",
+    )
+    i = i + 1
+  }
+  run Testing.expect(area(lines.asSlice()) < 0.0, "negative arc sweep keeps winding")
+}
+
+test effect fn clippedSubpathsRetainNonzeroAndEvenoddWinding() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(-4.0, -4.0, 8.0, 8.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.rect(Rect.make(-2.0, -2.0, 4.0, 4.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.1,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  run projective.fill(&p, &h, Rect.make(-1.0, -1.0, 2.0, 2.0), 0.001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    winding(lines.asSlice(), 0.0, 0.0) == 2,
+    "two clipped closed subpaths: nonzero filled, evenodd empty",
+  )
+}
+
+test effect fn inverseCompositionScalingAndSingularity() -> ()
+  ! AssertionError<'static> {
+  let h = Homography {
+    xx: 2.0,
+    xy: 0.5,
+    xw: 7.0,
+    yx: -0.25,
+    yy: 3.0,
+    yw: 11.0,
+    wx: 0.01,
+    wy: -0.02,
+    ww: 1.0,
+  }
+  match scaled(h, 1.0e250).inverse() {
+    Option<Homography>.Some { value: inv } => {
+      match h.project(Point.make(12.0, -4.0)) {
+        Option<Point>.Some { value: q } => {
+          match inv.project(q) {
+            Option<Point>.Some { value: p } => {
+              run Testing.expect(
+                f64.abs(p.x - 12.0) < 1.0e-10 && f64.abs(p.y + 4.0) < 1.0e-10,
+                "scaled inverse composition",
+              )
+            }
+            _ => {
+              run Testing.expect(false, "inverse projection exists")
+            }
+          }
+        }
+        _ => {
+          run Testing.expect(false, "projection exists")
+        }
+      }
+    }
+    _ => {
+      run Testing.expect(false, "large finite invertible matrix")
+    }
+  }
+  let singular = Homography {
+    xx: 1.0,
+    xy: 2.0,
+    xw: 3.0,
+    yx: 2.0,
+    yy: 4.0,
+    yw: 6.0,
+    wx: 0.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  run Testing.expect(
+    match singular.inverse() {
+      Option<Homography>.None => true
+      _ => false
+    },
+    "singular inverse rejected",
+  )
+  let affine = Homography.fromAffine(&Affine.translate(3.0, 4.0))
+  match affine.project(Point.make(2.0, 5.0)) {
+    Option<Point>.Some { value } => {
+      run Testing.expect(
+        f64.abs(value.x - 5.0) < 1.0e-12 && f64.abs(value.y - 9.0) < 1.0e-12 && affine.isFinite(),
+        "affine embedding",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "affine projects")
+    }
+  }
+}
+
+test effect fn impossibleOutputAccuracyFailsExplicitly() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.1, 0.1, 1.0, 1.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  let result = run Effect.result(
+    projective.fill(
+      &p,
+      &Homography.fromAffine(&Affine.identity()),
+      Rect.make(0.0, 0.0, 4.0, 4.0),
+      1.0e-20,
+      &mut lines,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(
+          e.code == ACCURACY_LIMIT,
+          "precision refusal, never silent subdivision saturation",
+        )
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "unrepresentable f32 accuracy must fail")
+    }
+  }
+}
+
+// CSS Transforms 2 §4.2 applies to the entire curved contour, not just its
+// endpoints. The source unit disk crosses w=0 twice; its visible image is
+// X>=1 and Y^2<=X^2-1, an unbounded hyperbola clipped by the finite viewport.
+test effect fn curvedEyePlaneCrossingsPreserveClosedWinding() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let h = Homography {
+    xx: 0.0,
+    xy: 0.0,
+    xw: 1.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 0.0,
+  }
+  let mut p = Path.make()
+  run p.moveTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(0.0, 1.0),
+    0.0,
+    6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fill(&p, &h, Rect.make(0.0, -2.0, 4.0, 4.0), 0.0001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut ix: u32 = 0
+  while ix < 16 {
+    let x = (u32.toF64(ix) + 0.37) * 0.25
+    let mut iy: u32 = 0
+    while iy < 16 {
+      let y = -2.0 + (u32.toF64(iy) + 0.41) * 0.25
+      let expected: i32 = if x * x - y * y > 1.0 {
+        -1
+      } else {
+        0
+      }
+      run Testing.expect(
+        winding(lines.asSlice(), x, y) == expected,
+        "exact inverse-disk predicate after two eye-plane crossings",
+      )
+      iy = iy + 1
+    }
+    ix = ix + 1
+  }
+  let mut k: u32 = 0
+  while k <= 2048 {
+    let theta = -1.0 + 2.0 * u32.toF64(k) / 2048.0
+    let w = f64.cos(theta)
+    run Testing.expect(
+      nearest(Point.make(1.0 / w, f64.sin(theta) / w), lines.asSlice()) <= 0.0001,
+      "dense exact hyperbola remains bounded-error",
+    )
+    k = k + 1
+  }
+}
+
+test effect fn invalidToleranceAndEmptyTargetAreExplicit() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 1.0, 1.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  let h = Homography.fromAffine(&Affine.identity())
+  run projective.fill(&p, &h, Rect.make(0.0, 0.0, 0.0, 1.0), 0.01, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(lines.length() == 0, "zero-area viewport has no boundary")
+  let result = run Effect.result(
+    projective.fill(&p, &h, Rect.make(0.0, 0.0, 1.0, 1.0), 0.0, &mut lines),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(e.code == INVALID_INPUT, "zero tolerance is invalid input")
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "invalid input must fail")
+    }
+  }
+}
+
+test effect fn enormousOutsideCoordinatesAreClippedBeforeNarrowing() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(-1.0e20, -1.0e20, 2.0e20, 2.0e20))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0e-22,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let mut lines = List<Line>.make()
+  run projective.fill(&p, &h, Rect.make(0.0, 0.0, 2.0, 2.0), 0.001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - 4.0) < 0.00001 && winding(lines.asSlice(), 1.0, 1.0) == 1,
+    "discarded outside coordinates impose no f32 rounding requirement",
+  )
+}
+
+test effect fn inverseRetainsExtremeRepresentableRowScales() -> ()
+  ! AssertionError<'static> {
+  let h = Homography {
+    xx: 1.0e300,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0e-300,
+    yw: 0.0,
+    wx: 0.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  match h.inverse() {
+    Option<Homography>.Some { value } => {
+      run Testing.expect(
+        value.xx > 0.0 && value.yy > 0.0 && f64.abs(value.xx * 1.0e300 / value.ww - 1.0) < 1.0e-12
+          && f64.abs(value.yy * 1.0e-300 / value.ww - 1.0) < 1.0e-12,
+        "row-scaled inverse avoids underflow of representable coefficients",
+      )
+      match value.project(Point.make(1.0, 1.0)) {
+        Option<Point>.Some { value: q } => {
+          run Testing.expect(
+            f64.abs(q.x / 1.0e-300 - 1.0) < 1.0e-12 && f64.abs(q.y / 1.0e300 - 1.0) < 1.0e-12,
+            "inverse point map retains anisotropy",
+          )
+        }
+        _ => {
+          run Testing.expect(false, "representable inverse point")
+        }
+      }
+    }
+    _ => {
+      run Testing.expect(false, "row-scaled inverse exists")
+    }
+  }
+  let eye = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 0.0,
+  }
+  run Testing.expect(
+    match eye.project(Point.make(0.0, 1.0)) {
+      Option<Point>.None => true
+      _ => false
+    },
+    "w=0 has no finite generic point map",
+  )
+}
+
+// CSS Transforms 2 §4.2: a flattened child's rejected negative-w geometry
+// cannot reappear merely because another projectivity makes final w positive.
+test effect fn nestedProjectivePlanesPreventNegativeWResurrection() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let child = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let parent = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: -2.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let combined = run parent.compose(&child)
+  let mut p = Path.make()
+  run p.rect(Rect.make(-3.0, 0.0, 3.0, 1.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let clip = Rect.make(-2.0, -2.0, 4.0, 4.0)
+  let mut unguarded = List<Line>.make()
+  let mut guarded = List<Line>.make()
+  run projective.fill(&p, &combined, clip, 0.00001, &mut unguarded)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Independently inverse(parent).row3 = (2,0,1); the preserved child-visible
+  // region is 2*X+W >= 0, or device x >= -.5. Final w alone accepts x >= -.75.
+  run projective.fillWithPlanes(
+    &p,
+    &combined,
+    clip,
+    &[HalfPlane { x: 2.0, y: 0.0, w: 1.0 }],
+    0.00001,
+    &mut guarded,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    f64.abs(area(unguarded.asSlice()) - 0.46875) < 0.00001,
+    "composing matrices alone would resurrect rejected child geometry",
+  )
+  run Testing.expect(
+    f64.abs(area(guarded.asSlice()) - 0.375) < 0.00001,
+    "nested visibility clips the true projected trapezoid",
+  )
+  run Testing.expect(
+    winding(guarded.asSlice(), -0.625, 0.1) == 0 && winding(guarded.asSlice(), -0.25, 0.25) == 1,
+    "child-negative-w stays invisible while the genuine front region remains",
+  )
+}
+
+test effect fn genericObliquePlanesCloseOuterAndHoleWindings() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 4.0, 4.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.moveTo(1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(1.0, 3.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(3.0, 3.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(3.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fillWithPlanes(
+    &p,
+    &Homography.fromAffine(&Affine.identity()),
+    Rect.make(-1.0, -1.0, 6.0, 6.0),
+    &[HalfPlane { x: 1.0, y: 1.0, w: -4.0 }],
+    0.00001,
+    &mut lines,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - 6.0) < 0.00001,
+    "clipped outer triangle area 8 minus oppositely wound hole triangle area 2",
+  )
+  run Testing.expect(
+    winding(lines.asSlice(), 3.5, 3.5) == 1 && winding(lines.asSlice(), 2.5, 2.5) == 0
+      && winding(lines.asSlice(), 1.0, 1.0) == 0,
+    "whole-contour clipping retains both winding closures",
+  )
+}
+
+test effect fn genericPlaneChainsHavePositiveScaleInvariantIntersections() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 4.0, 4.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut a = List<Line>.make()
+  let mut b = List<Line>.make()
+  let h = Homography.fromAffine(&Affine.identity())
+  let clip = Rect.make(-1.0, -1.0, 6.0, 6.0)
+  run projective.fillWithPlanes(
+    &p,
+    &h,
+    clip,
+    &[
+      HalfPlane { x: 1.0e200, y: 1.0e200, w: -4.0e200 },
+      HalfPlane { x: -1.0e200, y: 0.0, w: 3.0e200 },
+    ],
+    0.00001,
+    &mut a,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run projective.fillWithPlanes(
+    &p,
+    &h,
+    clip,
+    &[
+      HalfPlane { x: 1.0e-200, y: 1.0e-200, w: -4.0e-200 },
+      HalfPlane { x: -1.0e-200, y: 0.0, w: 3.0e-200 },
+    ],
+    0.00001,
+    &mut b,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Region 0 <= x <= 3, 4-x <= y <= 4: integral(x dx) = 4.5.
+  run Testing.expect(
+    f64.abs(area(a.asSlice()) - 4.5) < 0.00001 && f64.abs(area(b.asSlice()) - 4.5) < 0.00001,
+    "independent two-plane clipped area",
+  )
+  run Testing.expect(a.length() == b.length(), "positive plane scaling preserves closure")
+  let mut i: usize = 0
+  while i < a.length() {
+    let x = a.asSlice()[i]
+    let y = b.asSlice()[i]
+    run Testing.expect(
+      x.x0 == y.x0 && x.y0 == y.y0 && x.x1 == y.x1 && x.y1 == y.y1,
+      "positive common plane scale preserves each emitted boundary",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn genericObliquePlaneClipsTrueRationalCurves() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(2.0, 0.0),
+    Point.make(0.0, 2.0),
+    0.0,
+    6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fillWithPlanes(
+    &p,
+    &Homography.fromAffine(&Affine.identity()),
+    Rect.make(-3.0, -3.0, 6.0, 6.0),
+    &[HalfPlane { x: 1.0, y: 1.0, w: 0.0 }],
+    0.0001,
+    &mut lines,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - 6.283185307179586) < 0.001,
+    "diameter-clipped exact circle has independently known half-disc area",
+  )
+  run Testing.expect(
+    winding(lines.asSlice(), 0.5, 0.5) == 1 && winding(lines.asSlice(), -0.5, -0.5) == 0,
+    "oblique visibility plane clips curved source geometry",
+  )
+}
+
+test effect fn constantNegativeVisibilityPlaneIsEmpty() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 2.0, 2.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run projective.fillWithPlanes(
+    &p,
+    &Homography.fromAffine(&Affine.identity()),
+    Rect.make(-1.0, -1.0, 4.0, 4.0),
+    &[HalfPlane { x: 0.0, y: 0.0, w: -1.0 }],
+    0.001,
+    &mut lines,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    lines.length() == 0,
+    "negative constant plane has no visible positive-w points",
+  )
+}
+
+test effect fn checkedHomographyCompositionMatchesAffineOrder() -> ()
+  ! AssertionError<'static> | GeometryError {
+  let parent = Homography.fromAffine(&Affine { a: 2.0, b: -0.25, c: 0.5, d: 4.0, e: 3.0, f: -2.0 })
+  let child = Homography.fromAffine(&Affine { a: 0.0, b: 1.0, c: -1.0, d: 0.0, e: 5.0, f: 6.0 })
+  let result = run parent.compose(&child)
+  run Testing.expect(
+    result.xx == 0.5 && result.xy == -2.0 && result.xw == 16.0 && result.yx == 4.0
+      && result.yy == 0.25
+      && result.yw == 20.75
+      && result.wx == 0.0
+      && result.wy == 0.0
+      && result.ww == 1.0,
+    "parent times child, with unchanged ordinary affine arithmetic",
+  )
+}
+
+test effect fn checkedCompositionPreservesPositiveScaleAcrossOverflowAndUnderflow() -> ()
+  ! AssertionError<'static> | GeometryError {
+  let child = Homography.fromAffine(&Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 4.0, f: 2.0 })
+  let huge = run scaled(perspective(), 1.0e250).compose(&scaled(child, 1.0e250))
+  let tiny = run scaled(perspective(), 1.0e-250).compose(&scaled(child, 1.0e-250))
+  let mixed = run scaled(perspective(), 1.0e250).compose(&scaled(child, 1.0e-250))
+  let results = [huge, tiny, mixed]
+  let mut i: usize = 0
+  while i < results.length {
+    let h = results[i]
+    run Testing.expect(h.ww > 0.0, "fallback uses only positive common rescaling")
+
+    // Independent composite at (2,3): X=12,Y=15,W=2.5.
+    match h.project(Point.make(2.0, 3.0)) {
+      Option<Point>.Some { value: q } => {
+        run Testing.expect(
+          f64.abs(q.x - 4.8) < 1.0e-12 && f64.abs(q.y - 6.0) < 1.0e-12,
+          "range-safe composition preserves the actual projective map",
+        )
+      }
+      _ => {
+        run Testing.expect(false, "finite rescaled composition must project")
+      }
+    }
+    i = i + 1
+  }
+}
+
+test effect fn checkedCompositionRetainsCancellationResidual() -> ()
+  ! AssertionError<'static> | GeometryError {
+  let epsilon = 2.220446049250313e-16
+  let parent = Homography {
+    xx: 1.0 + epsilon,
+    xy: 1.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let child = Homography {
+    xx: 1.0 - epsilon,
+    xy: 0.0,
+    xw: 0.0,
+    yx: -1.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let result = run parent.compose(&child)
+  run Testing.expect(
+    result.xx == -(epsilon * epsilon),
+    "(1+epsilon)*(1-epsilon)-1 has a nonzero exactly recoverable residual",
+  )
+  let cancel = Homography {
+    xx: 1.0,
+    xy: 1.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let exact = run cancel.compose(
+    &Homography {
+      xx: 1.0,
+      xy: 0.0,
+      xw: 0.0,
+      yx: -1.0,
+      yy: 1.0,
+      yw: 0.0,
+      wx: 0.0,
+      wy: 0.0,
+      ww: 1.0,
+    },
+  )
+  run Testing.expect(
+    exact.xx == 0.0,
+    "exact zero cancellation is not mistaken for lost nonzero precision",
+  )
+}
+
+test effect fn checkedCompositionRejectsUnrepresentableDynamicRange() -> ()
+  ! AssertionError<'static> {
+  let h = Homography {
+    xx: 1.0e300,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0e-300,
+    yw: 0.0,
+    wx: 0.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let result = run Effect.result(h.compose(&h))
+  match &result {
+    Result<Homography, GeometryError>.Failure { error } => {
+      run Testing.expect(
+        error.code == NUMERIC_LIMIT,
+        "no common finite scale can represent a 1e1200 coefficient ratio",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "must not silently drop nonzero composite coefficients")
+    }
+  }
+}
+
+test effect fn visibilityPlaneNormalizationRejectsLostCoefficients() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.rect(Rect.make(0.0, 0.0, 2.0, 2.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  let result = run Effect.result(
+    projective.fillWithPlanes(
+      &p,
+      &Homography.fromAffine(&Affine.identity()),
+      Rect.make(-1.0, -1.0, 4.0, 4.0),
+      &[HalfPlane { x: 1.0e-300, y: 1.0e300, w: 1.0 }],
+      0.001,
+      &mut lines,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(
+          e.code == NUMERIC_LIMIT,
+          "unrepresentable plane normalization is explicit",
+        )
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "must not silently drop a nonzero visibility-plane coefficient")
+    }
+  }
+}

@@ -1,0 +1,404 @@
+//! Independent inverse-map paint samples; no projected geometry or production inverse
+//! is used to compute the expected coordinates. Native GPU parity lives in scene_tests.
+import geometry { Affine }
+import projective { Homography }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT }
+import paint {
+  Gradient,
+  ImagePattern,
+  Shader,
+  Stop,
+  RAMP_SIZE,
+  SPREAD_PAD,
+  SPREAD_REPEAT,
+  SPREAD_REFLECT,
+  SAMPLE_NEAREST,
+  SAMPLE_BILINEAR,
+  EXTEND_CLAMP,
+  EXTEND_REPEAT,
+  packInverseHomography
+}
+import pixmap { Pixmap, Rgba8, pack }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.testing.testing { Testing, AssertionError }
+
+fn perspective(k: f64) -> Homography {
+  return Homography {
+    xx: k,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: k,
+    yw: 0.0,
+    wx: k * 0.03125,
+    wy: k * 0.015625,
+    ww: k,
+  }
+}
+
+fn spread(t: f64, mode: u8) -> f64 {
+  if mode == SPREAD_REPEAT {
+    return t - f64.floor(t)
+  }
+  if mode == SPREAD_REFLECT {
+    let s = t - 2.0 * f64.floor(t / 2.0)
+    return if s > 1.0 {
+      2.0 - s
+    } else {
+      s
+    }
+  }
+  return f64.min(1.0, f64.max(0.0, t))
+}
+
+fn expectedRamp(g: &Gradient, t: f64, mode: u8) -> u32 {
+  let index = f64.toUsize(f64.floor(spread(t, mode) * usize.toF64(RAMP_SIZE - 1) + 0.5))
+  let bytes = g.rampBytes()
+  return pack(
+    Rgba8.make(bytes[index * 4], bytes[index * 4 + 1], bytes[index * 4 + 2], bytes[index * 4 + 3]),
+  )
+}
+
+test effect fn independentLinearRadialAndSpreadSamples() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(240, 20, 40, 80) },
+    Stop { offset: 0.4, color: Rgba8.make(30, 200, 70, 180) },
+    Stop { offset: 1.0, color: Rgba8.make(20, 40, 230, 255) },
+  ]
+  let mut mode: u8 = 0
+  while mode < 3 {
+    let mut premultiplied: u8 = 0
+    while premultiplied < 2 {
+      let mut linear = run Gradient.linearProjective(0.0, 0.0, 8.0, 0.0, mode, &perspective(1.0))
+      let mut radial = run Gradient.radialProjective(
+        0.0,
+        0.0,
+        10.0,
+        0.0,
+        0.0,
+        2.0,
+        mode,
+        &perspective(1.0),
+      )
+      let mut scaled = run Gradient.linearProjective(
+        0.0,
+        0.0,
+        8.0,
+        0.0,
+        mode,
+        &perspective(1.0e200),
+      )
+      scaled.setPremultipliedInterpolation(premultiplied != 0)
+      run scaled.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+      linear.setPremultipliedInterpolation(premultiplied != 0)
+      radial.setPremultipliedInterpolation(premultiplied != 0)
+      run linear.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+      run radial.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+      let mut x: u32 = 0
+      let mut span: [u32; 48] = [0; 48]
+      linear.shadeSpan(0, 3, 48, &mut span)
+      while x < 48 {
+        let dx = u32.toF64(x) + 0.5
+        let dy = 3.5
+        let w = 1.0 - dx / 32.0 - dy / 64.0
+        let sx = dx / w
+        let sy = dy / w
+        let linearExpected = expectedRamp(&linear, sx / 8.0, mode)
+        let radialExpected = expectedRamp(&radial, (f64.sqrt(sx * sx + sy * sy) - 2.0) / 8.0, mode)
+        run Testing.expect(
+          pack(linear.shade(x, 3)) == linearExpected && span[u32.toUsize(x)] == linearExpected,
+          "linear pixel center and span use inverse homogeneous division",
+        )
+        run Testing.expect(
+          pack(radial.shade(x, 3)) == radialExpected,
+          "radial inverse sample, including negative inverse w",
+        )
+        run Testing.expect(
+          pack(scaled.shade(x, 3)) == linearExpected,
+          "positive gradient matrix scaling preserves samples",
+        )
+        x = x + 1
+      }
+      premultiplied = premultiplied + 1
+    }
+    mode = mode + 1
+  }
+}
+
+fn wrapped(v: f32, repeat: bool) -> u32 {
+  let d = f32.toF64(v)
+  let q = if repeat {
+    d - 4.0 * f64.floor(d / 4.0)
+  } else {
+    f64.min(3.0, f64.max(0.0, d))
+  }
+  return f64.toU32(q)
+}
+
+fn channel(a: u8, b: u8, c: u8, d: u8, wx: f32, wy: f32) -> u8 {
+  let top = u8.toF32(a) + (u8.toF32(b) - u8.toF32(a)) * wx
+  let bottom = u8.toF32(c) + (u8.toF32(d) - u8.toF32(c)) * wx
+  return f64.toU8(f64.floor(f32.toF64(top + (bottom - top) * wy + 0.5)))
+}
+
+fn imageExpected(image: &Pixmap, px: u32, py: u32, sampling: u8, extend: u8) -> u32 {
+  let dx = u32.toF32(px) + 0.5
+  let dy = u32.toF32(py) + 0.5
+  let w = -0.03125 * dx + -0.015625 * dy + 1.0
+  let x = dx / w
+  let y = dy / w
+  let repeat = extend == EXTEND_REPEAT
+  if sampling == SAMPLE_NEAREST {
+    return pack(
+      image.pixel(
+        wrapped(f64.toF32(f64.floor(f32.toF64(x))), repeat),
+        wrapped(f64.toF32(f64.floor(f32.toF64(y))), repeat),
+      ),
+    )
+  }
+  let x0 = f64.toF32(f64.floor(f32.toF64(x - 0.5)))
+  let y0 = f64.toF32(f64.floor(f32.toF64(y - 0.5)))
+  let wx = x - 0.5 - x0
+  let wy = y - 0.5 - y0
+  let a = image.pixel(wrapped(x0, repeat), wrapped(y0, repeat))
+  let b = image.pixel(wrapped(x0 + 1.0, repeat), wrapped(y0, repeat))
+  let c = image.pixel(wrapped(x0, repeat), wrapped(y0 + 1.0, repeat))
+  let d = image.pixel(wrapped(x0 + 1.0, repeat), wrapped(y0 + 1.0, repeat))
+  return pack(
+    Rgba8.make(
+      channel(a.r, b.r, c.r, d.r, wx, wy),
+      channel(a.g, b.g, c.g, d.g, wx, wy),
+      channel(a.b, b.b, c.b, d.b, wx, wy),
+      channel(a.a, b.a, c.a, d.a, wx, wy),
+    ),
+  )
+}
+
+test effect fn checkerboardIndependentSamplingAndScaleInvariance() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut image = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
+  let bytes = image.dataMut()
+  let mut i: usize = 0
+  while i < 16 {
+    let light = (i / 4 + i % 4) % 2 == 0
+    bytes[i * 4] = if light {
+      200
+    } else {
+      20
+    }
+    bytes[i * 4 + 1] = if light {
+      40
+    } else {
+      160
+    }
+    bytes[i * 4 + 2] = if light {
+      10
+    } else {
+      80
+    }
+    bytes[i * 4 + 3] = 220
+    i = i + 1
+  }
+  let mut sampling: u8 = 0
+  while sampling < 2 {
+    let mut extend: u8 = 0
+    while extend < 2 {
+      let pattern = run ImagePattern.makeProjective(&image, &perspective(1.0), sampling, extend)
+      let scaled = run ImagePattern.makeProjective(&image, &perspective(1.0e200), sampling, extend)
+      let tiny = run ImagePattern.makeProjective(&image, &perspective(1.0e-200), sampling, extend)
+      let mut span: [u32; 48] = [0; 48]
+      pattern.shadeSpan(0, 3, 48, &mut span)
+      let mut x: u32 = 0
+      while x < 48 {
+        let expected = imageExpected(&image, x, 3, sampling, extend)
+        run Testing.expect(
+          pack(pattern.shade(x, 3)) == expected && span[u32.toUsize(x)] == expected,
+          "independent checkerboard inverse nearest/bilinear and clamp/repeat",
+        )
+        run Testing.expect(
+          pack(scaled.shade(x, 3)) == expected && pack(tiny.shade(x, 3)) == expected,
+          "positive common matrix scaling preserves image samples",
+        )
+        x = x + 1
+      }
+      extend = extend + 1
+    }
+    sampling = sampling + 1
+  }
+}
+
+test effect fn zeroInverseWAndSingularPaintNothing() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut h = perspective(1.0)
+  h.wx = 0.125
+  h.wy = 0.125
+  let stops = [Stop { offset: 0.0, color: Rgba8.make(200, 80, 40, 255) }]
+  let mut g = run Gradient.linearProjective(0.0, 0.0, 0.0, 0.0, SPREAD_PAD, &h)
+  run g.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut image = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  image.clear(Rgba8.make(200, 80, 40, 255))
+  let pattern = run ImagePattern.makeProjective(&image, &h, SAMPLE_NEAREST, EXTEND_REPEAT)
+  run Testing.expect(
+    !g.isUniform() && g.shade(7, 0).a == 0 && pattern.shade(7, 0).a == 0,
+    "zero inverse w stays transparent even for degenerate gradients",
+  )
+  run Testing.expect(
+    g.shade(8, 0).a == 255 && pattern.shade(8, 0).a == 255,
+    "negative nonzero inverse w is allowed",
+  )
+  let mut span: [u32; 3] = [0; 3]
+  g.shadeSpan(6, 0, 3, &mut span)
+  run Testing.expect(
+    span[0] != 0 && span[1] == 0 && span[2] != 0,
+    "span does not turn a projective single-stop gradient into a uniform fill",
+  )
+  h.xx = 0.0
+  h.xy = 0.0
+  h.xw = 0.0
+  let mut singular = run Gradient.linearProjective(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &h)
+  run singular.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+  let singularImage = run ImagePattern.makeProjective(&image, &h, SAMPLE_BILINEAR, EXTEND_CLAMP)
+  run Testing.expect(
+    !singular.isPaintable() && !singularImage.isPaintable(),
+    "singular forward transform is paint-none",
+  )
+  let dependent = Homography {
+    xx: 1.0,
+    xy: 2.0,
+    xw: 3.0,
+    yx: 2.0,
+    yy: 4.0,
+    yw: 6.0,
+    wx: 0.25,
+    wy: 0.5,
+    ww: 1.0,
+  }
+  let rankDeficient = run Gradient.radialProjective(
+    0.0,
+    0.0,
+    2.0,
+    0.0,
+    0.0,
+    0.0,
+    SPREAD_PAD,
+    &dependent,
+  )
+  run Testing.expect(
+    !rankDeficient.isPaintable(),
+    "dependent nonzero rows are singular, not a numeric error",
+  )
+}
+
+test effect fn nonfiniteAndUnrepresentableMatricesFailExplicitly() -> ()
+  ! AssertionError<'static> {
+  let mut h = perspective(1.0)
+  h.xx = f64.fromBits(0x7ff0000000000000)
+  let invalid = run Effect.result(Gradient.linearProjective(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &h))
+  match &invalid {
+    Result<Gradient, GeometryError>.Failure { error } => {
+      run Testing.expect(error.code == INVALID_INPUT, "nonfinite input is invalid")
+    }
+    _ => {
+      run Testing.expect(false, "nonfinite input must fail rather than become affine")
+    }
+  }
+  let mut wide = Homography.fromAffine(&Affine.identity())
+  wide.xx = 1.0e-100
+  let packed = run Effect.result(packInverseHomography(&wide))
+  match &packed {
+    Result<[f32; 9], GeometryError>.Failure { error } => {
+      run Testing.expect(error.code == NUMERIC_LIMIT, "GPU cannot represent this inverse")
+    }
+    _ => {
+      run Testing.expect(false, "lost coefficients must be reported")
+    }
+  }
+  let mut roundedSingular = Homography.fromAffine(&Affine.identity())
+  roundedSingular.xx = 1.0
+  roundedSingular.xy = 1.0
+  roundedSingular.yx = 1.0
+  roundedSingular.yy = 1.0 + 1.0e-10
+  let collapsed = run Effect.result(packInverseHomography(&roundedSingular))
+  match &collapsed {
+    Result<[f32; 9], GeometryError>.Failure { error } => {
+      run Testing.expect(error.code == NUMERIC_LIMIT, "rounded singular inverse is rejected")
+    }
+    _ => {
+      run Testing.expect(false, "f32-singular inverse must fail")
+    }
+  }
+}
+
+test effect fn cancellationIsNotMistakenForSingularity() -> ()
+  ! AssertionError<'static> {
+  // Its exact determinant is 2^-80, not zero; ordinary cofactor arithmetic
+  // loses the second-order term. The paint constructor must report precision.
+  let h = Homography {
+    xx: 1.0,
+    xy: 1.0,
+    xw: 1.0,
+    yx: 1.0,
+    yy: 1.0000000000009095,
+    yw: 1.0,
+    wx: 1.0,
+    wy: 1.0,
+    ww: 1.0000000000009095,
+  }
+  let result = run Effect.result(Gradient.linearProjective(0.0, 0.0, 1.0, 0.0, SPREAD_PAD, &h))
+  match &result {
+    Result<Gradient, GeometryError>.Failure { error } => {
+      run Testing.expect(
+        error.code == NUMERIC_LIMIT,
+        "lost inverse precision is not transparent singular paint",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "unavailable inverse must fail explicitly")
+    }
+  }
+}
+
+test effect fn imageConstructorRejectsUnsupportedInversePrecision() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let image = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut h = Homography.fromAffine(&Affine.identity())
+  h.xx = 1.0e100
+  let unavailable = run Effect.result(
+    ImagePattern.makeProjective(&image, &h, SAMPLE_NEAREST, EXTEND_CLAMP),
+  )
+  match &unavailable {
+    Result<ImagePattern, GeometryError>.Failure { error } => {
+      run Testing.expect(
+        error.code == NUMERIC_LIMIT,
+        "image constructor checks shader-compatible inverse precision",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "image must not silently replace unsupported inverse")
+    }
+  }
+  h.xx = f64.fromBits(0x7ff8000000000000)
+  let invalid = run Effect.result(
+    ImagePattern.makeProjective(&image, &h, SAMPLE_BILINEAR, EXTEND_REPEAT),
+  )
+  match &invalid {
+    Result<ImagePattern, GeometryError>.Failure { error } => {
+      run Testing.expect(error.code == INVALID_INPUT, "NaN image transform is invalid")
+    }
+    _ => {
+      run Testing.expect(false, "nonfinite image transform must fail")
+    }
+  }
+}

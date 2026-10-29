@@ -9,11 +9,14 @@ import silk.num.u32
 import silk.num.usize
 import vector.strips { Coverage, BAND }
 import vector.pixmap { Rgba8 }
-import vector.paint { Gradient, ImagePattern }
+import vector.paint { Gradient, ImagePattern, packInverseHomography }
+import vector.geometry_error { GeometryError, NUMERIC_LIMIT }
 
 /// Bytes per run record: x, y, width, alpha word index (or SOLID_RUN), paint word index, opacity.
 pub const RUN_BYTES: usize = 24
-/// Words per paint record.
+
+/// Words per solid/affine paint. Projective kinds 4, 5, 6 append wx wy ww,
+/// making 19 words. Runs store word offsets, not fixed-stride paint indices.
 pub const PAINT_WORDS: u32 = 16
 const SOLID_RUN: u32 = 0xffffffff
 /// Bytes per command record: op, then three operands.
@@ -154,62 +157,165 @@ impl Scene {
   }
 
   /// Draws `coverage` with `gradient`, like `paint.fill`. An unpaintable gradient draws nothing.
-  pub effect fn fillGradient(self: &mut Self, coverage: &Coverage, gradient: &Gradient, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
-    if !gradient.isPaintable() { return }
+  /// Projective inverses must fit the checked f32 shader contract; unsupported
+  /// precision fails before any paint/ramp/run bytes are appended.
+  pub effect fn fillGradient(
+    self: &mut Self,
+    coverage: &Coverage,
+    gradient: &Gradient,
+    opacity: u8,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    if !gradient.isPaintable() {
+      return
+    }
+    let matrix = if gradient.isProjective() {
+      run packInverseHomography(&gradient.inverseHomography())
+    } else {
+      let m = gradient.inverseTransform()
+      [
+        f64.toF32(m.a),
+        f64.toF32(m.b),
+        f64.toF32(m.c),
+        f64.toF32(m.d),
+        f64.toF32(m.e),
+        f64.toF32(m.f),
+        0.0,
+        0.0,
+        1.0,
+      ]
+    }
+    let g = gradient.geometry()
+    if gradient.isProjective() {
+      let mut i: usize = 0
+      while i < 6 {
+        let value = f64.toF32(g[i])
+        if !f32.isFinite(value) || (g[i] != 0.0 && f32.abs(value) < 1.17549435e-38) {
+          fail GeometryError { code: NUMERIC_LIMIT }
+        }
+        i = i + 1
+      }
+    }
     let paint = usize.toU32(self.paintBytes.length() / 4)
     let rampStart = usize.toU32(self.rampBytes.length() / 4)
     run self.rampBytes.appendSlice(gradient.rampBytes())
-    run pushU32(&mut self.paintBytes, if gradient.isRadial() { 2 } else { 1 })
+    let kind: u32 = if gradient.isRadial() {
+      2
+    } else {
+      1
+    }
+    run pushU32(
+      &mut self.paintBytes,
+      if gradient.isProjective() {
+        kind + 3
+      } else {
+        kind
+      },
+    )
     run pushU32(&mut self.paintBytes, rampStart)
     run pushU32(&mut self.paintBytes, u8.toU32(gradient.spreadMode()))
-    run pushU32(&mut self.paintBytes, if gradient.isSingle() { 1 } else { 0 })
-    let m = gradient.inverseTransform()
-    run pushF32(&mut self.paintBytes, m.a)
-    run pushF32(&mut self.paintBytes, m.b)
-    run pushF32(&mut self.paintBytes, m.c)
-    run pushF32(&mut self.paintBytes, m.d)
-    run pushF32(&mut self.paintBytes, m.e)
-    run pushF32(&mut self.paintBytes, m.f)
-    let g = gradient.geometry()
+    run pushU32(
+      &mut self.paintBytes,
+      if gradient.isSingle() {
+        1
+      } else {
+        0
+      },
+    )
+    let mut column: usize = 0
+    while column < 6 {
+      run pushU32(&mut self.paintBytes, f32.toBits(matrix[column]))
+      column = column + 1
+    }
     let mut i: usize = 0
     while i < 6 {
       run pushF32(&mut self.paintBytes, g[i])
       i = i + 1
+    }
+    if gradient.isProjective() {
+      run self.paintDenominator(&matrix)
     }
     run self.addRuns(coverage, paint, opacity)
   }
 
   /// Draws `coverage` with the image `pattern`, like `paint.fill`. An unpaintable pattern draws
   /// nothing. The image's texels are appended to [`ramps`].
-  pub effect fn fillImage(self: &mut Self, coverage: &Coverage, pattern: &ImagePattern, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
-    if !pattern.isPaintable() { return }
+  /// Projective matrix packing fails explicitly rather than encoding an affine substitute.
+  pub effect fn fillImage(
+    self: &mut Self,
+    coverage: &Coverage,
+    pattern: &ImagePattern,
+    opacity: u8,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    if !pattern.isPaintable() {
+      return
+    }
+    let matrix = if pattern.isProjective() {
+      run packInverseHomography(&pattern.inverseHomography())
+    } else {
+      let m = pattern.inverseTransform()
+      [
+        f64.toF32(m.a),
+        f64.toF32(m.b),
+        f64.toF32(m.c),
+        f64.toF32(m.d),
+        f64.toF32(m.e),
+        f64.toF32(m.f),
+        0.0,
+        0.0,
+        1.0,
+      ]
+    }
     let paint = usize.toU32(self.paintBytes.length() / 4)
     let image = pattern.pixmap()
     let start = usize.toU32(self.rampBytes.length() / 4)
     run self.rampBytes.appendSlice(image.data())
-    run pushU32(&mut self.paintBytes, 3)
+    run pushU32(
+      &mut self.paintBytes,
+      if pattern.isProjective() {
+        6
+      } else {
+        3
+      },
+    )
     run pushU32(&mut self.paintBytes, start)
     run pushU32(&mut self.paintBytes, image.width())
     run pushU32(&mut self.paintBytes, image.height())
-    let m = pattern.inverseTransform()
-    run pushF32(&mut self.paintBytes, m.a)
-    run pushF32(&mut self.paintBytes, m.b)
-    run pushF32(&mut self.paintBytes, m.c)
-    run pushF32(&mut self.paintBytes, m.d)
-    run pushF32(&mut self.paintBytes, m.e)
-    run pushF32(&mut self.paintBytes, m.f)
+    let mut column: usize = 0
+    while column < 6 {
+      run pushU32(&mut self.paintBytes, f32.toBits(matrix[column]))
+      column = column + 1
+    }
     run pushU32(&mut self.paintBytes, u8.toU32(pattern.samplingMode()))
     run pushU32(&mut self.paintBytes, u8.toU32(pattern.extendMode()))
     let mut i: u32 = 12
-    while i < PAINT_WORDS {
+    while i < 16 {
       run pushU32(&mut self.paintBytes, 0)
       i = i + 1
+    }
+    if pattern.isProjective() {
+      run self.paintDenominator(&matrix)
     }
     run self.addRuns(coverage, paint, opacity)
   }
 
-  effect fn addRuns(self: &mut Self, coverage: &Coverage, paint: u32, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
-    if opacity == 0 { return }
+  effect fn paintDenominator(self: &mut Self, matrix: &[f32; 9]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    run pushU32(&mut self.paintBytes, f32.toBits(matrix[6]))
+    run pushU32(&mut self.paintBytes, f32.toBits(matrix[7]))
+    run pushU32(&mut self.paintBytes, f32.toBits(matrix[8]))
+  }
+
+  effect fn addRuns(self: &mut Self, coverage: &Coverage, paint: u32, opacity: u8) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if opacity == 0 {
+      return
+    }
     let fills = coverage.fills()
     let mut f: usize = 0
     while f < fills.length {

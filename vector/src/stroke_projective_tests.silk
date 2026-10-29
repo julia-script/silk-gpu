@@ -1,0 +1,759 @@
+//! SVG 2 §13.5.5–8: source-space dashing, joins and caps precede transforms.
+//! https://www.w3.org/TR/SVG2/painting.html#StrokeShape
+//! CSS Transforms 2 §4.2: homogeneous eye-plane clipping precedes division.
+//! https://www.w3.org/TR/css-transforms-2/#processing-of-perspective-transformed-boxes
+//! SVG 2 §8.10: bounding boxes ignore clipping and retain degenerate geometry.
+//! https://www.w3.org/TR/SVG2/coords.html#BoundingBoxes
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import geometry { Point, Rect, Affine }
+import geometry_error { GeometryError, ACCURACY_LIMIT, NUMERIC_LIMIT }
+import path { Path }
+import flatten { Line }
+import projective { Homography, Bounds }
+import projective
+import stroke { Stroker, Stroke, StrokeBounds, CAP_SQUARE, CAP_ROUND, JOIN_MITER }
+
+fn mapping(k: f64) -> Homography {
+  return Homography {
+    xx: 2.0 * k,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 3.0 * k,
+    yw: 0.0,
+    wx: 0.02 * k,
+    wy: 0.01 * k,
+    ww: k,
+  }
+}
+
+// Independent formula; never calls the implementation's inverse/project helpers.
+fn mapped(x: f64, y: f64) -> Point {
+  let w = 1.0 + 0.02 * x + 0.01 * y
+  return Point.make(2.0 * x / w, 3.0 * y / w)
+}
+
+fn area(lines: &[Line]) -> f64 {
+  let mut result = 0.0
+  let mut i: usize = 0
+  while i < lines.length {
+    let l = lines[i]
+    result = result
+      + (f32.toF64(l.x0) + f32.toF64(l.x1)) * (f32.toF64(l.y1) - f32.toF64(l.y0)) * 0.5
+    i = i + 1
+  }
+  return f64.abs(result)
+}
+
+fn rectangleArea(x0: f64, y0: f64, x1: f64, y1: f64) -> f64 {
+  let a = mapped(x0, y0)
+  let b = mapped(x1, y0)
+  let c = mapped(x1, y1)
+  let d = mapped(x0, y1)
+  return f64.abs(
+    a.x * b.y - a.y * b.x + b.x * c.y - b.y * c.x + c.x * d.y - c.y * d.x + d.x * a.y - d.y * a.x,
+  )
+    * 0.5
+}
+
+fn nearest(p: Point, lines: &[Line]) -> f64 {
+  let mut best = 1.0e100
+  let mut i: usize = 0
+  while i < lines.length {
+    let l = lines[i]
+    let x = f32.toF64(l.x0)
+    let y = f32.toF64(l.y0)
+    let dx = f32.toF64(l.x1) - x
+    let dy = f32.toF64(l.y1) - y
+    let dd = dx * dx + dy * dy
+    let t = if dd == 0.0 {
+      0.0
+    } else {
+      f64.max(0.0, f64.min(1.0, ((p.x - x) * dx + (p.y - y) * dy) / dd))
+    }
+    let ex = p.x - x - t * dx
+    let ey = p.y - y - t * dy
+    best = f64.min(best, f64.sqrt(ex * ex + ey * ey))
+    i = i + 1
+  }
+  return best
+}
+
+effect fn projectedStroke(p: &Path, style: &Stroke, h: &Homography, clip: Rect) -> List<Line>
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  run stroker.strokeProjective(p, style, h, clip, 0.01, &mut outline)
+  let mut lines = List<Line>.make()
+  run projective.fill(&outline, h, clip, 0.001, &mut lines)
+  return move lines
+}
+
+test effect fn projectiveSquareCapsMatchIndependentSourceRectangle() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  style.cap = CAP_SQUARE
+  let lines = run projectedStroke(&p, &style, &mapping(1.0), Rect.make(-20.0, -20.0, 100.0, 100.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - rectangleArea(-2.0, -2.0, 12.0, 2.0)) < 0.0001,
+    "projected source square caps, not device-width square caps",
+  )
+  run Testing.expect(
+    nearest(mapped(-2.0, -2.0), lines.asSlice()) < 0.001
+      && nearest(mapped(12.0, 2.0), lines.asSlice()) < 0.001,
+    "independent source-outline corners",
+  )
+}
+
+test effect fn projectiveDashesRetainSourceLengthsAndWideOffsets() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(30.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(8.0)
+  run style.setDashes(&[6.0, 4.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let lines = run projectedStroke(&p, &style, &mapping(1.0), Rect.make(-20.0, -20.0, 100.0, 100.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let expected = rectangleArea(0.0, -4.0, 6.0, 4.0) + rectangleArea(10.0, -4.0, 16.0, 4.0)
+    + rectangleArea(20.0, -4.0, 26.0, 4.0)
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - expected) < 0.001,
+    "dash endpoints are measured before perspective",
+  )
+  run Testing.expect(
+    nearest(mapped(16.0, 4.0), lines.asSlice()) < 0.001,
+    "wide dash's independent true offset corner",
+  )
+}
+
+test effect fn projectiveWideDashedCircleTracksTrueOffsets() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(20.0, 0.0),
+    Point.make(0.0, 20.0),
+    0.0,
+    1.5707963267948966,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(16.0)
+  run style.setDashes(&[10.0, 5.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let lines = run projectedStroke(&p, &style, &mapping(1.0), Rect.make(-20.0, -20.0, 120.0, 120.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 2048 {
+    let theta = 1.5707963267948966 * u32.toF64(i) / 2048.0
+    let length = 20.0 * theta
+    let phase = length - 15.0 * f64.floor(length / 15.0)
+    if phase < 9.99 {
+      // Circle's exact offset radii are 20 +/- 8; no stroker/Curve oracle.
+      run Testing.expect(
+        nearest(mapped(28.0 * f64.cos(theta), 28.0 * f64.sin(theta)), lines.asSlice()) <= 0.011,
+        "wide outer circular offset after perspective",
+      )
+      run Testing.expect(
+        nearest(mapped(12.0 * f64.cos(theta), 12.0 * f64.sin(theta)), lines.asSlice()) <= 0.011,
+        "wide inner circular offset after perspective",
+      )
+    }
+    i = i + 1
+  }
+  run Testing.expect(
+    nearest(mapped(28.0 * f64.cos(0.5), 28.0 * f64.sin(0.5)), lines.asSlice()) <= 0.011,
+    "first dash ends at true source arclength 10, angle 0.5",
+  )
+}
+
+test effect fn projectiveRoundCapsUseSourceSemicircles() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(8.0)
+  style.cap = CAP_ROUND
+  let lines = run projectedStroke(&p, &style, &mapping(1.0), Rect.make(-30.0, -30.0, 120.0, 120.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 512 {
+    let theta = -1.5707963267948966 + 3.141592653589793 * u32.toF64(i) / 512.0
+    run Testing.expect(
+      nearest(mapped(20.0 + 4.0 * f64.cos(theta), 4.0 * f64.sin(theta)), lines.asSlice()) <= 0.011,
+      "right cap follows projected source semicircle",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn eyePlaneCrossingStrokeHasFiniteClippedOutline() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(-2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let lines = run projectedStroke(&p, &Stroke.make(0.5), &h, Rect.make(-4.0, -4.0, 8.0, 8.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // x' = x/(x+1), y' = +/- .25/(x+1) = +/- .25*(1-x').
+  // Clipped trapezoid: x' in [-4,2/3], widths 2.5 and 1/6.
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - 56.0 / 9.0) < 0.001,
+    "eye-plane crossing uses the positive-w source rectangle, not projected centerline",
+  )
+}
+
+test effect fn projectiveStrokePositiveMatrixScaleInvariance() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(10.0, 20.0, 20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let style = Stroke.make(8.0)
+  let clip = Rect.make(-30.0, -30.0, 120.0, 120.0)
+  let a = run projectedStroke(&p, &style, &mapping(1.0e200), clip)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let b = run projectedStroke(&p, &style, &mapping(1.0e-200), clip)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(a.length() == b.length(), "positive matrix scale does not alter refinement")
+  run Testing.expect(
+    f64.abs(area(a.asSlice()) - area(b.asSlice())) < 0.0001,
+    "positive scale preserves filled stroke",
+  )
+  let mut i: usize = 0
+  while i < a.length() {
+    let l = a.asSlice()[i]
+    run Testing.expect(
+      nearest(Point.make(f32.toF64(l.x0), f32.toF64(l.y0)), b.asSlice()) < 0.0001,
+      "positive scale preserves every outline endpoint",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn projectiveStrokeRejectsUnattainableAccuracy() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  let result = run Effect.result(
+    stroker.strokeProjective(
+      &p,
+      &Stroke.make(8.0),
+      &mapping(1.0),
+      Rect.make(-30.0, -30.0, 120.0, 120.0),
+      1.0e-20,
+      &mut out,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(e.code == ACCURACY_LIMIT, "explicit source-precision refusal")
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "impossible source precision must not emit a guessed outline")
+    }
+  }
+}
+
+test effect fn projectiveReferenceBoundsAreUnclippedAndRetainDegenerates() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(4.0, 7.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let empty = run projective.bounds(&p, &mapping(1.0), 0.001)
+  run Testing.expect(empty.empty, "move-only reference bounds are empty")
+  run p.lineTo(4.0, 7.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let box = run projective.bounds(&p, &mapping(1.0), 0.001)
+  let q = mapped(4.0, 7.0)
+  run Testing.expect(
+    !box.empty && box.bounds.x0 <= q.x && box.bounds.x1 >= q.x && box.bounds.y0 <= q.y
+      && box.bounds.y1 >= q.y,
+    "positioned degenerate segment remains positioned",
+  )
+  run Testing.expect(
+    q.x - box.bounds.x0 <= 0.001 && box.bounds.x1 - q.x <= 0.001 && q.y - box.bounds.y0 <= 0.001
+      && box.bounds.y1 - q.y <= 0.001,
+    "every reference face is tolerance-tight",
+  )
+  let behind = run projective.bounds(&p, &mapping(-1.0), 0.001)
+  run Testing.expect(behind.empty, "entirely behind geometry contributes no reference box")
+}
+
+test effect fn projectiveReferenceBoundsRejectUnboundedEyePlaneCrossing() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(-2.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(2.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let result = run Effect.result(projective.bounds(&p, &h, 0.01))
+  match &result {
+    Result<Bounds, GeometryError>.Failure { error } => {
+      run Testing.expect(
+        error.code == NUMERIC_LIMIT || error.code == ACCURACY_LIMIT,
+        "unbounded getBBox must not become a clipped reference box",
+      )
+    }
+    _ => {
+      run Testing.expect(false, "unbounded eye-plane geometry has no finite reference bounds")
+    }
+  }
+}
+
+test effect fn projectiveMiterJoinMatchesIndependentOffsetIntersection() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  style.join = JOIN_MITER
+  let lines = run projectedStroke(&p, &style, &mapping(1.0), Rect.make(-20.0, -20.0, 100.0, 100.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Source strip intersections, not intersection of device-normal offsets.
+  let polygon = [
+    mapped(0.0, -2.0),
+    mapped(12.0, -2.0),
+    mapped(12.0, 10.0),
+    mapped(8.0, 10.0),
+    mapped(8.0, 2.0),
+    mapped(0.0, 2.0),
+  ]
+  let mut expected = 0.0
+  let mut i: usize = 0
+  while i < 6 {
+    let a = polygon[i]
+    let b = polygon[(i + 1) % 6]
+    expected = expected + a.x * b.y - a.y * b.x
+    run Testing.expect(
+      nearest(a, lines.asSlice()) < 0.001,
+      "true source miter and inner intersection",
+    )
+    i = i + 1
+  }
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - f64.abs(expected) * 0.5) < 0.001,
+    "joined projected outline matches independent source polygon",
+  )
+}
+
+test effect fn projectiveAffineFastPathRetainsExistingOutline() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(10.0, 20.0, 20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let style = Stroke.make(8.0)
+  let affine = Affine { a: 2.0, b: 0.25, c: 0.5, d: 3.0, e: 5.0, f: 7.0 }
+  let mut a = Path.make()
+  let mut b = Path.make()
+  run stroker.stroke(&p, &style, &affine, 0.01, &mut a)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run stroker.strokeProjective(
+    &p,
+    &style,
+    &Homography.fromAffine(&affine),
+    Rect.make(-30.0, -30.0, 120.0, 120.0),
+    0.01,
+    &mut b,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    a.pointList().length == b.pointList().length,
+    "affine fast path retains source refinement",
+  )
+  let mut i: usize = 0
+  while i < a.pointList().length {
+    let x = a.pointList()[i]
+    let y = b.pointList()[i]
+    run Testing.expect(x.x == y.x && x.y == y.y, "affine output is unchanged")
+    i = i + 1
+  }
+}
+
+test effect fn projectiveReferenceBoundsMeasureRationalCurveExtrema() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(1.0, 2.0, 2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let result = run projective.bounds(&p, &h, 0.0001)
+  let box = result.bounds
+  let top = 4.0 - 2.0 * f64.sqrt(3.0)
+  run Testing.expect(
+    !result.empty && box.x0 <= 0.0 && box.x0 >= -0.0001 && box.x1 >= 2.0 / 3.0
+      && box.x1 <= 2.0 / 3.0 + 0.0001
+      && box.y0 <= 0.0
+      && box.y0 >= -0.0001
+      && box.y1 >= top
+      && box.y1 <= top + 0.0001,
+    "independent rational quadratic extrema, not mapped source AABB or control hull",
+  )
+}
+
+test effect fn projectiveReferenceBoundsMeasureExactEllipseExtrema() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(20.0, 0.0),
+    Point.make(0.0, 20.0),
+    0.0,
+    6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.02,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let result = run projective.bounds(&p, &h, 0.001)
+  let box = result.bounds
+
+  // Differentiate x/(1+.02*x), y/(1+.02*x), x²+y²=400.
+  let left = -20.0 / 0.6
+  let right = 20.0 / 1.4
+  let vertical = 20.0 / f64.sqrt(0.84)
+  run Testing.expect(
+    !result.empty && box.x0 <= left && box.x0 >= left - 0.001 && box.x1 >= right
+      && box.x1 <= right + 0.001
+      && box.y0 <= -vertical
+      && box.y0 >= -vertical - 0.001
+      && box.y1 >= vertical
+      && box.y1 <= vertical + 0.001,
+    "exact projected ellipse extrema with f64 tolerance-tight faces",
+  )
+}
+
+test effect fn projectiveStrokeRejectsUncertifiableProjectionScale() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 0.0,
+    yw: 0.0,
+    wx: 0.02,
+    wy: 0.01,
+    ww: 1.0,
+  }
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  let result = run Effect.result(
+    stroker.strokeProjective(
+      &p,
+      &Stroke.make(8.0),
+      &h,
+      Rect.make(-30.0, -30.0, 120.0, 120.0),
+      0.01,
+      &mut out,
+    ),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(
+          e.code == NUMERIC_LIMIT,
+          "singular projection has no reciprocal-w certificate",
+        )
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "must not invent a scale for an uncertifiable inverse identity")
+    }
+  }
+}
+
+effect fn expectTightStrokeBox(actual: StrokeBounds, expected: Rect, tolerance: f64) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    !actual.empty && actual.bounds.x0 <= expected.x0 && expected.x0 - actual.bounds.x0 <= tolerance
+      && actual.bounds.y0 <= expected.y0
+      && expected.y0 - actual.bounds.y0 <= tolerance
+      && actual.bounds.x1 >= expected.x1
+      && actual.bounds.x1 - expected.x1 <= tolerance
+      && actual.bounds.y1 >= expected.y1
+      && actual.bounds.y1 - expected.y1 <= tolerance,
+    "every unclipped projected stroke face contains the true extremum and is tolerance-tight",
+  )
+}
+
+test effect fn unclippedProjectiveStrokeBoundsUseTrueSourceCaps() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  style.cap = CAP_SQUARE
+  let mut stroker = Stroker.make()
+  let result = run stroker.boundsProjective(&p, &style, &mapping(1.0), 0.001, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let leftBottom = mapped(-2.0, -2.0)
+  let rightBottom = mapped(12.0, -2.0)
+  let leftTop = mapped(-2.0, 2.0)
+  run expectTightStrokeBox(
+    result,
+    Rect { x0: leftBottom.x, y0: leftBottom.y, x1: rightBottom.x, y1: leftTop.y },
+    0.001,
+  )
+}
+
+test effect fn unclippedProjectiveStrokeBoundsFollowTrueCircularOffsets() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(20.0, 0.0),
+    Point.make(0.0, 20.0),
+    0.0,
+    6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 0.02,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let mut stroker = Stroker.make()
+  let result = run stroker.boundsProjective(&p, &Stroke.make(8.0), &h, 0.01, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // The source outer offset is the circle of radius 24. The inner radius 16
+  // cannot determine an outer face. These are analytic conic extrema.
+  let vertical = 24.0 / f64.sqrt(1.0 - 0.48 * 0.48)
+  run expectTightStrokeBox(
+    result,
+    Rect { x0: -24.0 / 0.52, y0: -vertical, x1: 24.0 / 1.48, y1: vertical },
+    0.01,
+  )
+}
+
+test effect fn unclippedStrokeBoundsIgnoreDisconnectedBehindContours() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.moveTo(-100.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(-80.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  style.cap = CAP_SQUARE
+  let mut stroker = Stroker.make()
+  let result = run stroker.boundsProjective(&p, &style, &mapping(1.0), 0.001, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let leftBottom = mapped(-2.0, -2.0)
+  let rightBottom = mapped(12.0, -2.0)
+  let leftTop = mapped(-2.0, 2.0)
+  run expectTightStrokeBox(
+    result,
+    Rect { x0: leftBottom.x, y0: leftBottom.y, x1: rightBottom.x, y1: leftTop.y },
+    0.001,
+  )
+}
+
+test effect fn unclippedStrokeBoundsDoNotRejectCrossingSourceAabb() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(4.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 1.0,
+    ww: -1.0,
+  }
+  let mut stroker = Stroker.make()
+  let result = run stroker.boundsProjective(&p, &Stroke.make(0.2), &h, 0.001, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // The source AABB includes (0,0), behind w=0. Every actual source-outline
+  // point has x+y between 4 +/- .1*sqrt(2), safely in front.
+  let n = 0.1 / f64.sqrt(2.0)
+  let small = -n / (3.0 - 2.0 * n)
+  let large = (4.0 - n) / (3.0 - 2.0 * n)
+  run expectTightStrokeBox(result, Rect { x0: small, y0: small, x1: large, y1: large }, 0.001)
+}
+
+test effect fn unclippedStrokeBoundsRespectIgnoreDashes() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(30.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  run style.setDashes(&[6.0, 4.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let dashed = run stroker.boundsProjective(&p, &style, &mapping(1.0), 0.001, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let solid = run stroker.boundsProjective(&p, &style, &mapping(1.0), 0.001, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let bottom = mapped(0.0, -2.0)
+  let top = mapped(0.0, 2.0)
+  run expectTightStrokeBox(
+    dashed,
+    Rect { x0: 0.0, y0: bottom.y, x1: mapped(26.0, -2.0).x, y1: top.y },
+    0.001,
+  )
+  run expectTightStrokeBox(
+    solid,
+    Rect { x0: 0.0, y0: bottom.y, x1: mapped(30.0, -2.0).x, y1: top.y },
+    0.001,
+  )
+}
+
+test effect fn unclippedStrokeBoundsRejectActualEyePlaneCrossing() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(-2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(2.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let h = Homography {
+    xx: 1.0,
+    xy: 0.0,
+    xw: 0.0,
+    yx: 0.0,
+    yy: 1.0,
+    yw: 0.0,
+    wx: 1.0,
+    wy: 0.0,
+    ww: 1.0,
+  }
+  let mut stroker = Stroker.make()
+  let result = run Effect.result(stroker.boundsProjective(&p, &Stroke.make(0.5), &h, 0.001, false))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<StrokeBounds, GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(
+          e.code == NUMERIC_LIMIT,
+          "actual source-stroke crossing has unbounded reference bounds",
+        )
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "unclipped stroke-box must not hide an eye-plane crossing")
+    }
+  }
+}
+
+test effect fn unclippedStrokeBoundsRejectUnattainableAccuracy() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let result = run Effect.result(
+    stroker.boundsProjective(&p, &Stroke.make(4.0), &mapping(1.0), 1.0e-20, false),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  match &result {
+    Result<StrokeBounds, GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(e.code == ACCURACY_LIMIT, "stroke-box source precision fails explicitly")
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "stroke-box cannot silently relax its requested precision")
+    }
+  }
+}
