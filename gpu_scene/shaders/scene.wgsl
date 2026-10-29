@@ -96,7 +96,7 @@ fn shadeImage(p: u32, pixel: vec2u) -> vec4u {
 }
 
 // Solid/affine records are 16 words: kind (0 solid, 1 linear, 2 radial, 3 image),
-// color or ramp start, spread, single, inverse a b c d e f, then x0 y0 r0 x1 y1 r1.
+// color or ramp start, spread, flags (bit0 single, bit1 tangent limit), inverse a b c d e f, then x0 y0 r0 x1 y1 r1.
 // Projective kinds 4 linear, 5 radial, 6 image append inverse wx wy ww (19 words).
 // Runs carry word offsets, so mixed affine/projective records need no padding.
 fn shade(p: u32, pixel: vec2u) -> vec4u {
@@ -104,7 +104,7 @@ fn shade(p: u32, pixel: vec2u) -> vec4u {
   if kind == 0u { return unpack(paints[p + 1u]); }
   if kind == 3u || kind == 6u { return shadeImage(p, pixel); }
   var index = 1023u;
-  if paints[p + 3u] == 0u || kind >= 4u {
+  if (paints[p + 3u] & 1u) == 0u || kind >= 4u {
     let fx = f32(pixel.x) + 0.5;
     let fy = f32(pixel.y) + 0.5;
     var gx = word(p, 4u) * fx + word(p, 6u) * fy + word(p, 8u);
@@ -115,7 +115,7 @@ fn shade(p: u32, pixel: vec2u) -> vec4u {
       gx = gx / w;
       gy = gy / w;
       if !(abs(gx) <= 3.402823e38) || !(abs(gy) <= 3.402823e38) { return vec4u(0u); }
-      if paints[p + 3u] != 0u { return unpack(ramps[paints[p + 1u] + index]); }
+      if (paints[p + 3u] & 1u) != 0u { return unpack(ramps[paints[p + 1u] + index]); }
     }
     let x0 = word(p, 10u);
     let y0 = word(p, 11u);
@@ -137,10 +137,11 @@ fn shade(p: u32, pixel: vec2u) -> vec4u {
       let a = cdx * cdx + cdy * cdy - dr * dr;
       let b = pdx * cdx + pdy * cdy + r0 * dr;
       let c = pdx * pdx + pdy * pdy - r0 * r0;
-      if abs(a) < 1.0e-12 {
-        if b == 0.0 { return vec4u(0u); }
+      if (paints[p + 3u] & 2u) != 0u {
+        if b == 0.0 || ((b < 0.0) == (dr > 0.0)) {
+          return unpack(ramps[paints[p + 1u] + 1024u]);
+        }
         t = c / (2.0 * b);
-        if r0 + t * dr < 0.0 { return vec4u(0u); }
       } else {
         let disc = b * b - a * c;
         if disc < 0.0 { return vec4u(0u); }
