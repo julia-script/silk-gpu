@@ -230,17 +230,24 @@ pub fn compositeMasked(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u
 
 /// Composites the isolated group `layer` onto `target` with blend `mode` and group `opacity`.
 pub fn composite(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u8) -> () {
+  let width = target.width()
+  let height = target.height()
+  compositeWithin(&mut target, layer, mode, opacity, 0, 0, width, height)
+}
+
+/// [`composite`] limited to pixels `x0 .. x1` by `y0 .. y1`.
+pub fn compositeWithin(target: &mut Pixmap, layer: &Pixmap, mode: u8, opacity: u8, x0: u32, y0: u32, x1: u32, y1: u32) -> () {
   if opacity == 0 { return }
-  let width = minU32(target.width(), layer.width())
-  let height = minU32(target.height(), layer.height())
+  let width = minU32(minU32(target.width(), layer.width()), x1)
+  let height = minU32(minU32(target.height(), layer.height()), y1)
   let stride = u32.toUsize(target.width()) * 4
   let layerStride = u32.toUsize(layer.width()) * 4
   let level = u8.toU32(opacity)
   let source = layer.data()
   let d = target.dataMut()
-  let mut y: u32 = 0
+  let mut y: u32 = y0
   while y < height {
-    let mut x: u32 = 0
+    let mut x: u32 = x0
     while x < width {
       let j = u32.toUsize(y) * layerStride + u32.toUsize(x) * 4
       if source[j + 3] != 0 {
