@@ -1,5 +1,10 @@
 # Silk WebGPU
 
+> **Moved.** This repository is archived. Its packages now live in
+> [silk-lang/nonstd](https://github.com/silk-lang/nonstd): `gpu/webgpu` (webgpu,
+> webgpu_sys, samples, benchmarks), `images/svg/vector` and `images/svg/gpu_scene`.
+> Open issues and pull requests there.
+
 Native Dawn and browser `navigator.gpu` bindings for Silk. `webgpu_sys` is the
 generated unsafe C layer; `webgpu` owns resources and supplies borrowed descriptors,
 typed failures, asynchronous requests, and host-owned surfaces. Samples, GLFW,
