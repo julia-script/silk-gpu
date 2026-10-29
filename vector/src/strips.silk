@@ -12,6 +12,7 @@
 //! the canvas are skipped, because rows do not interact.
 import silk.core.ownership { Copy }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.f64
@@ -94,10 +95,11 @@ impl Coverage {
 pub struct Rasterizer {
   lines: List<Line>,
   clipped: List<Line>,
-  bandStarts: List<u32>,
-  bandLines: List<u32>,
   area: List<f32>,
   bandAlphas: List<u8>,
+  columnKinds: List<u8>,
+  /// Per column of the band: nonzero when a line put area in it.
+  touched: List<u8>,
 }
 
 struct Bounds {
@@ -118,8 +120,9 @@ fn clampX(value: f32, low: f32, high: f32) -> f32 { return f32.min(f32.max(value
 impl Rasterizer {
   pub fn make() -> Rasterizer {
     return Rasterizer {
-      lines: List<Line>.make(), clipped: List<Line>.make(), bandStarts: List<u32>.make(),
-      bandLines: List<u32>.make(), area: List<f32>.make(), bandAlphas: List<u8>.make(),
+      lines: List<Line>.make(), clipped: List<Line>.make(),
+      area: List<f32>.make(), bandAlphas: List<u8>.make(), columnKinds: List<u8>.make(),
+      touched: List<u8>.make(),
     }
   }
 
@@ -199,94 +202,46 @@ impl Rasterizer {
     let firstBand = by0 / BAND
     let bandCount = (by1 - 1) / BAND - firstBand + 1
 
-    // Counting sort of line indices by the bands they touch.
-    self.bandStarts.clear()
-    run self.bandStarts.appendRepeated(0, u32.toUsize(bandCount) + 1)
-    let mut k: usize = 0
-    while k < self.clipped.length() {
-      let line = self.clipped.asSlice()[k]
-      let low = f32.max(f32.min(line.y0, line.y1), 0.0)
-      let high = f32.min(f32.max(line.y0, line.y1), heightF)
-      if low < high {
-        let b0 = f32.toU32(low) / BAND - firstBand
-        let b1 = (f32.toU32(f32.ceil(high)) - 1) / BAND - firstBand
-        let mut b = b0
-        while b <= b1 {
-          let slot = u32.toUsize(b) + 1
-          let count = self.bandStarts.asSlice()[slot]
-          self.bandStarts.set(slot, count + 1)
-          b = b + 1
-        }
-      }
-      k = k + 1
-    }
-    let mut total: u32 = 0
-    let mut s: usize = 0
-    while s <= u32.toUsize(bandCount) {
-      total = total + self.bandStarts.asSlice()[s]
-      self.bandStarts.set(s, total)
-      s = s + 1
-    }
-    self.bandLines.clear()
-    run self.bandLines.appendRepeated(0, u32.toUsize(total))
-    // bandStarts[b] is now the end of band b - 1; use it as band b's insertion cursor.
-    let mut m: usize = 0
-    while m < self.clipped.length() {
-      let line = self.clipped.asSlice()[m]
-      let low = f32.max(f32.min(line.y0, line.y1), 0.0)
-      let high = f32.min(f32.max(line.y0, line.y1), heightF)
-      if low < high {
-        let b0 = f32.toU32(low) / BAND - firstBand
-        let b1 = (f32.toU32(f32.ceil(high)) - 1) / BAND - firstBand
-        let mut b = b0
-        while b <= b1 {
-          let slot = u32.toUsize(b)
-          let cursor = self.bandStarts.asSlice()[slot]
-          self.bandLines.set(u32.toUsize(cursor), usize.toU32(m))
-          self.bandStarts.set(slot, cursor + 1)
-          b = b + 1
-        }
-      }
-      m = m + 1
-    }
-    // After insertion, bandStarts[b] is the end of band b and bandStarts[b - 1] its start.
-
     let localWidth = bx1 - bx0
     let stride = u32.toUsize(localWidth) + 2
-    self.area.clear()
-    run self.area.appendRepeated(0.0, stride * u32.toUsize(BAND))
+    let top = firstBand * BAND
+    let bandCells = stride * u32.toUsize(BAND)
+    // The cells of every band at once. Both buffers are all zero between calls: resolving zeroes
+    // what it reads, so only growth needs filling.
+    let cells = bandCells * u32.toUsize(bandCount)
+    let haveCells = self.area.length()
+    if haveCells < cells { run self.area.appendRepeated(0.0, cells - haveCells) }
+    let flags = stride * u32.toUsize(bandCount)
+    let haveFlags = self.touched.length()
+    if haveFlags < flags { run self.touched.appendRepeated(0, flags - haveFlags) }
     self.bandAlphas.clear()
     run self.bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND))
+    self.columnKinds.clear()
+    run self.columnKinds.appendRepeated(0, u32.toUsize(localWidth))
     let originX = u32.toF32(bx0)
+    let lines = self.clipped.asSlice()
+    let mut k: usize = 0
+    while k < lines.length {
+      accumulate(self.area.asMutSlice(), self.touched.asMutSlice(), stride, lines[k], originX, u32.toF32(localWidth), top, by1)
+      k = k + 1
+    }
     let mut band: u32 = 0
     while band < bandCount {
-      let top = (firstBand + band) * BAND
-      let rows = minU32(BAND, canvasHeight - top)
-      let start = if band == 0 { 0 } else { self.bandStarts.asSlice()[u32.toUsize(band) - 1] }
-      let end = self.bandStarts.asSlice()[u32.toUsize(band)]
-      if start < end {
-        let mut z: usize = 0
-        while z < stride * u32.toUsize(BAND) {
-          self.area.set(z, 0.0)
-          z = z + 1
-        }
-        let mut q = start
-        while q < end {
-          let line = self.clipped.asSlice()[u32.toUsize(self.bandLines.asSlice()[u32.toUsize(q)])]
-          accumulate(self.area.asMutSlice(), stride, line, originX, u32.toF32(localWidth), top, rows)
-          q = q + 1
-        }
-        resolve(self.area.asSlice(), stride, localWidth, rows, rule, self.bandAlphas.asMutSlice())
-        run emitBand(self.bandAlphas.asSlice(), localWidth, rows, bx0, top, &mut out)
-      }
+      let bandTop = top + band * BAND
+      let rows = minU32(BAND, canvasHeight - bandTop)
+      let at = u32.toUsize(band)
+      resolve(Slice.viewMut(self.area.asMutSlice(), at * bandCells, bandCells), Slice.viewMut(self.touched.asMutSlice(), at * stride, stride),
+        stride, localWidth, rows, rule, self.bandAlphas.asMutSlice(), self.columnKinds.asMutSlice())
+      run emitBand(self.bandAlphas.asSlice(), self.columnKinds.asSlice(), localWidth, bx0, bandTop, &mut out)
       band = band + 1
     }
   }
 }
 
-/// Adds the signed area of `line` to the cells of rows `top .. top + rows`. Cell `c` of row `r`
-/// lives at `area[r * stride + c]`, in coordinates relative to `originX`.
-fn accumulate(area: &mut [f32], stride: usize, line: Line, originX: f32, localWidth: f32, top: u32, rows: u32) -> () {
+/// Adds the signed area of `line` to the cells of rows `top .. bottom`. Cell `c` of row `r` lives
+/// at `area[(r - top) * stride + c]`, in coordinates relative to `originX`; `touched` flags each
+/// column of each band that received area.
+fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, originX: f32, localWidth: f32, top: u32, bottom: u32) -> () {
   let mut dir: f32 = 1.0
   let mut ax = line.x0 - originX
   let mut ay = line.y0
@@ -301,10 +256,11 @@ fn accumulate(area: &mut [f32], stride: usize, line: Line, originX: f32, localWi
   }
   let dxdy = (bx - ax) / (by - ay)
   let topF = u32.toF32(top)
-  let bottomF = u32.toF32(top + rows)
+  let bottomF = u32.toF32(bottom)
   if by <= topF || ay >= bottomF { return }
-  let firstRow = f32.toU32(f32.floor(f32.max(ay, topF)))
-  let lastRow = f32.toU32(f32.ceil(f32.min(by, bottomF)))
+  // Both are in top ..= bottom, so the conversions need no check.
+  let firstRow = Intrinsic.f32ToU32(f32.max(ay, topF))
+  let lastRow = Intrinsic.f32ToU32(f32.ceil(f32.min(by, bottomF)))
   let mut y = firstRow
   while y < lastRow {
     let rowTop = f32.max(u32.toF32(y), ay)
@@ -314,17 +270,25 @@ fn accumulate(area: &mut [f32], stride: usize, line: Line, originX: f32, localWi
     let xb = clampX(ax + (rowBottom - ay) * dxdy, 0.0, localWidth)
     let d = dy * dir
     let line0 = u32.toUsize(y - top) * stride
+    let flags = Slice.viewMut(&mut touched, u32.toUsize((y - top) / BAND) * stride, stride)
     let x0 = f32.min(xa, xb)
     let x1 = f32.max(xa, xb)
     let x0floor = f32.floor(x0)
-    let x0i = f32.toUsize(x0floor)
+    let x0i = Intrinsic.f32ToUsize(x0floor)
     let x1ceil = f32.ceil(x1)
-    let x1i = f32.toUsize(x1ceil)
+    let x1i = Intrinsic.f32ToUsize(x1ceil)
     if x1i <= x0i + 1 {
+      flags[x0i] = 1
+      flags[x0i + 1] = 1
       let xmf = 0.5 * (xa + xb) - x0floor
       area[line0 + x0i] = area[line0 + x0i] + (d - d * xmf)
       area[line0 + x0i + 1] = area[line0 + x0i + 1] + d * xmf
     } else {
+      let mut ti = x0i
+      while ti <= x1i {
+        flags[ti] = 1
+        ti = ti + 1
+      }
       let s = 1.0 / (x1 - x0)
       let x0f = x0 - x0floor
       let a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
@@ -350,77 +314,81 @@ fn accumulate(area: &mut [f32], stride: usize, line: Line, originX: f32, localWi
   }
 }
 
-/// Prefix-sums each row's cells into column-major alphas; rows past `rows` stay zero.
-fn resolve(area: &[f32], stride: usize, localWidth: u32, rows: u32, rule: u8, alphas: &mut [u8]) -> () {
+/// Prefix-sums each row's cells into column-major alphas and classifies each column, zeroing the
+/// cells and `touched` flags it reads. Rows past `rows` have no area (lines were clipped to the
+/// canvas), so they resolve to zero. A column no line touched repeats the column before it.
+fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32, rows: u32, rule: u8, alphas: &mut [u8], kinds: &mut [u8]) -> () {
   let width = u32.toUsize(localWidth)
-  let band = u32.toUsize(BAND)
-  let mut r: usize = 0
-  while r < band {
-    if r < u32.toUsize(rows) {
-      let mut acc: f32 = 0.0
-      let mut c: usize = 0
-      while c < width {
-        acc = acc + area[r * stride + c]
-        let mut coverage = f32.abs(acc)
-        if rule == EVENODD {
-          coverage = f32.abs(acc - 2.0 * f32.round(acc * 0.5))
-        }
-        alphas[c * band + r] = f32.toU8(f32.min(coverage, 1.0) * 255.0 + 0.5)
-        c = c + 1
-      }
-    } else {
-      let mut c: usize = 0
-      while c < width {
-        alphas[c * band + r] = 0
-        c = c + 1
-      }
+  // The packed column word of a fully covered column: 255 in each row inside the canvas.
+  let all: u32 = 0xffffffff
+  let full = if rows >= BAND { all } else { u32.shiftLeft(1, rows * 8) - 1 }
+  let mut a0: f32 = 0.0
+  let mut a1: f32 = 0.0
+  let mut a2: f32 = 0.0
+  let mut a3: f32 = 0.0
+  let mut word: u32 = 0
+  let mut kind = EMPTY
+  let mut c: usize = 0
+  while c < width {
+    if touched[c] != 0 {
+      touched[c] = 0
+      a0 = a0 + area[c]
+      a1 = a1 + area[stride + c]
+      a2 = a2 + area[2 * stride + c]
+      a3 = a3 + area[3 * stride + c]
+      area[c] = 0.0
+      area[stride + c] = 0.0
+      area[2 * stride + c] = 0.0
+      area[3 * stride + c] = 0.0
+      word = alphaOf(a0, rule) | u32.shiftLeft(alphaOf(a1, rule), 8) | u32.shiftLeft(alphaOf(a2, rule), 16) | u32.shiftLeft(alphaOf(a3, rule), 24)
+      kind = if word == 0 { EMPTY } else if word == full { SOLID } else { PARTIAL }
     }
-    r = r + 1
+    kinds[c] = kind
+    if kind == PARTIAL {
+      alphas[c * 4] = u32.wrappingToU8(word)
+      alphas[c * 4 + 1] = u32.wrappingToU8(u32.shiftRight(word, 8))
+      alphas[c * 4 + 2] = u32.wrappingToU8(u32.shiftRight(word, 16))
+      alphas[c * 4 + 3] = u32.wrappingToU8(u32.shiftRight(word, 24))
+    }
+    c = c + 1
   }
+  // Cells right of the canvas collect area that no column reads.
+  while c < stride {
+    touched[c] = 0
+    area[c] = 0.0
+    area[stride + c] = 0.0
+    area[2 * stride + c] = 0.0
+    area[3 * stride + c] = 0.0
+    c = c + 1
+  }
+}
+
+/// The 0..=255 coverage of an accumulated winding area.
+fn alphaOf(acc: f32, rule: u8) -> u32 {
+  let mut coverage = f32.abs(acc)
+  if rule == EVENODD { coverage = f32.abs(acc - 2.0 * f32.round(acc * 0.5)) }
+  // In range by construction (0 <= coverage * 255 + 0.5 < 256).
+  return Intrinsic.f32ToU32(f32.min(coverage, 1.0) * 255.0 + 0.5)
 }
 
 const EMPTY: u8 = 0
 const PARTIAL: u8 = 1
 const SOLID: u8 = 2
 
-fn classify(alphas: &[u8], column: usize, rows: u32) -> u8 {
-  let base = column * u32.toUsize(BAND)
-  let mut zero = true
-  let mut full = true
-  let mut r: usize = 0
-  while r < u32.toUsize(rows) {
-    let a = alphas[base + r]
-    if a != 0 { zero = false }
-    if a != 255 { full = false }
-    r = r + 1
-  }
-  if zero { return EMPTY }
-  if full { return SOLID }
-  return PARTIAL
-}
-
-effect fn emitBand(alphas: &[u8], localWidth: u32, rows: u32, originX: u32, top: u32, out: &mut Coverage) -> ()
+effect fn emitBand(alphas: &[u8], kinds: &[u8], localWidth: u32, originX: u32, top: u32, out: &mut Coverage) -> ()
   ! OutOfMemoryError ? &mut Allocator {
   let width = u32.toUsize(localWidth)
   let band = u32.toUsize(BAND)
   let mut c: usize = 0
   while c < width {
-    let kind = classify(alphas, c, rows)
+    let kind = kinds[c]
     let mut end = c + 1
-    while end < width && classify(alphas, end, rows) == kind { end = end + 1 }
+    while end < width && kinds[end] == kind { end = end + 1 }
     let x = originX + usize.toU32(c)
     let runWidth = usize.toU32(end - c)
     if kind == PARTIAL {
       let offset = usize.toU32(out.alphaList.length())
-      let mut column = c
-      while column < end {
-        let mut r: usize = 0
-        while r < band {
-          run out.alphaList.append(alphas[column * band + r])
-          r = r + 1
-        }
-        column = column + 1
-      }
+      run out.alphaList.appendSlice(Slice.view(alphas, c * band, (end - c) * band))
       run out.stripList.append(Strip { x: x, y: top, width: runWidth, alphaOffset: offset })
     } else if kind == SOLID {
       run out.fillList.append(Fill { x: x, y: top, width: runWidth })
