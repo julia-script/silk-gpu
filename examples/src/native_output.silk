@@ -1,0 +1,56 @@
+//! Native-only sample artifact output. Filesystem access is kept out of rendering.
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.core.effect { Effect }
+  static if Intrinsic.targetOperatingSystem() != "windows" {
+    import silk.system.filesystem { FileSystem, Path, FileError }
+    import silk.system.filesystem_native { OsFileSystem }
+    import silk.system.host_input { HostInput, HostInputError }
+    import silk.system.host_input_native { OsHostInput }
+    import silk.platform.native.host_input { NativeHostInput }
+    import silk.collections.bytes { Bytes }
+    pub effect fn save(name: string, bytes: &[u8]) -> () ! FileError | HostInputError | OutOfMemoryError {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      run saveAllocated(name, bytes) |> Effect.provideMut<Allocator>(&mut allocator)
+    }
+    effect fn saveAllocated(name: string, bytes: &[u8]) -> () ! FileError | HostInputError | OutOfMemoryError ? &mut Allocator {
+      // No concurrent code in this sample mutates the process environment.
+      let snapshot = run unsafe NativeHostInput.environmentSnapshot()
+      let mut inputs = OsHostInput.make(move snapshot)
+      let cwd = run HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs)
+      let mut files = run OsFileSystem.makeBytes(Bytes.asSlice(&cwd))
+      let root = run Path.root()
+      let path = run Path.join(&root, name)
+      run FileSystem.writeFile(&path, bytes) |> Effect.provideMut<FileSystem>(&mut files)
+    }
+  } else {
+    // dev.27 has no Windows filesystem provider. Only this dev sample boundary
+    // uses ISO C stdio; GPU code remains the same safe Silk on every target.
+    import silk.mem.pointer { Pointer }
+    import silk.collections.list { List }
+    import silk.text.string { String }
+    import silk.core.ownership { Drop }
+    pub struct FileError {}
+    unsafe extern "C" fn fopen(path: ?[*]const u8, mode: ?[*]const u8) -> ?*mut u8 with Intrinsic.foreign(noCapture: ("path", "mode"))
+    unsafe extern "C" fn fwrite(data: ?[*]const u8, size: usize, count: usize, file: ?*mut u8) -> usize with Intrinsic.foreign(noCapture: ("data", "file"))
+    unsafe extern "C" fn fclose(file: ?*mut u8) -> i32 with Intrinsic.foreign(noCapture: ("file",))
+    struct File { handle: ?*mut u8 }
+    impl Drop for File {
+      fn drop(self: &mut Self) -> () { if !Pointer.isNull(self.handle) { let ignored = unsafe fclose(self.handle) } }
+    }
+    pub effect fn save(name: string, bytes: &[u8]) -> () ! FileError | OutOfMemoryError {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      let mut path = List<u8>.make()
+      run path.appendBytes(String.utf8Bytes(name)) |> Effect.provideMut<Allocator>(&mut allocator)
+      run path.appendRepeated(0, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+      let handle = unsafe fopen(Pointer.fromSlice(path.asSlice()), Pointer.fromSlice(b"wb\0"))
+      if Pointer.isNull(handle) { fail FileError {} }
+      let mut file = File { handle: handle }
+      let count = unsafe fwrite(Pointer.fromSlice(bytes), 1, bytes.length, file.handle)
+      if count != bytes.length { fail FileError {} }
+      let result = unsafe fclose(file.handle)
+      file.handle = Pointer.null<u8>()
+      if result != 0 { fail FileError {} }
+    }
+  }
+}

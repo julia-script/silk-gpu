@@ -1,0 +1,181 @@
+//! Test-only canvas presentation through the compiled safe Silk surface API.
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import silk.mem.pointer { Pointer }
+  import silk.mem.box { Box }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.core.effect { Effect }
+  import webgpu.runtime {
+    Instance, Adapter, Device, GpuError, RequestAdapterOptions, AdapterRequest,
+    DeviceRequest, StatusRequest, onSubmittedWorkDoneStart,
+  }
+  import webgpu.diagnostics { Diagnostics }
+  import webgpu.surface { Surface, SurfaceTarget, SurfaceConfiguration }
+  import webgpu.resources { createCommandEncoder, getQueue }
+  import webgpu.descriptors {
+    DeviceDescriptor, TextureViewDescriptor, Color,
+    RenderPassColorAttachment, RenderPassDescriptor,
+  }
+  import webgpu_sys.generated_webgpu as flags
+
+  unsafe extern "C" fn hostOutput(kind: u32, bytes: ?[*]const u8, length: usize) -> ()
+    as "sample_output" with Intrinsic.foreign(module: "host", name: "sample_output", noCapture: ("bytes",))
+
+  struct Unrooted {}
+  struct Root { storage: Box<State> }
+  struct Failed {}
+  struct FindingAdapter { request: AdapterRequest<'static> }
+  struct FindingDevice { adapter: Adapter, request: DeviceRequest }
+  struct Ready { device: Device, surface: Surface<'static>, format: u32, width: u32, height: u32 }
+  struct Checking { ready: Ready, work: StatusRequest, validation: StatusRequest }
+  struct State {
+    instance: Instance,
+    observer: Diagnostics,
+    stage: Failed | FindingAdapter | FindingDevice | Ready | Checking,
+    root: Unrooted | Root,
+  }
+  struct FrameRequests { work: StatusRequest, validation: StatusRequest }
+
+  fn output(bytes: &[u8]) -> () { unsafe hostOutput(3, Pointer.fromSlice(bytes), bytes.length) }
+  effect fn start() -> ?*mut u8 ! GpuError | OutOfMemoryError {
+    let instance = run Instance.create()
+    let observer = instance.diagnostics()
+    let request = run instance.requestAdapterStart(&RequestAdapterOptions.default())
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut storage = run Box<State>.make(State {
+      instance: move instance, observer: move observer,
+      stage: FindingAdapter { request: move request }, root: Unrooted {},
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+    let mut anchor = ()
+    // Stable self-root: only the host's token can poll or drop this state. The
+    // host must not reenter a poll or reuse the token after canvas_drop.
+    let fresh = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    fresh.root = Root { storage: move storage }
+    return unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pinned)
+  }
+  effect fn startFailed<E>(error: E) -> ?*mut u8 {
+    drop error
+    output(b"canvas_start failed: adapter or allocation")
+    return Pointer.null<u8>()
+  }
+  effect fn pollFailed<E>(error: E) -> i32 {
+    drop error
+    output(b"canvas_poll failed: surface, submission, validation or device loss")
+    return -1
+  }
+  effect fn draw(ready: &mut Ready, width: u32, height: u32) -> FrameRequests ! GpuError | OutOfMemoryError {
+    if width == 0 || height == 0 { fail GpuError.status(flags.WGPUStatus_Error) }
+    ready.device.pushErrorScope(flags.WGPUErrorFilter_Validation)
+    if width != ready.width || height != ready.height {
+      let mut configuration = SurfaceConfiguration.make(&ready.device, ready.format, width, height)
+      ready.surface.resize(&mut configuration, width, height)
+      ready.width = width
+      ready.height = height
+    }
+    let frame = run ready.surface.getCurrentTexture()
+    let view = run frame.texture.createView(&TextureViewDescriptor.default())
+    let mut clear = Color.default()
+    clear.setR(0.25)
+    clear.setG(0.5)
+    clear.setB(0.75)
+    clear.setA(1.0)
+    let mut attachment = RenderPassColorAttachment.default().withView(&view)
+    attachment.setClearValue(clear)
+    attachment.setLoadOp(flags.WGPULoadOp_Clear)
+    attachment.setStoreOp(flags.WGPUStoreOp_Store)
+    let attachments = [attachment]
+    let descriptor = RenderPassDescriptor.default().withColorAttachments(&attachments)
+    let mut encoder = run createCommandEncoder(&ready.device, b"canvas-clear")
+    let pass = run encoder.beginRenderPass(&descriptor)
+    pass.end()
+    let command = run encoder.finish(b"canvas-clear")
+    let queue = run getQueue(&ready.device)
+    queue.submit(&[command.reference()])
+    run ready.surface.present()
+    let work = run onSubmittedWorkDoneStart(&ready.device, &queue)
+    let validation = run ready.device.popErrorScopeStart()
+    return FrameRequests { work: move work, validation: move validation }
+  }
+  effect fn poll(state: &mut State, width: u32, height: u32) -> i32 ! GpuError | OutOfMemoryError {
+    let previous = Intrinsic.replace(state.stage, Failed {})
+    match move previous {
+      Failed failed => { fail GpuError.status(flags.WGPUStatus_Error) }
+      FindingAdapter { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let adapter = run pending.finish()
+          let next = run adapter.requestDeviceStart(&DeviceDescriptor.default())
+          state.stage = FindingDevice { adapter: move adapter, request: move next }
+        } else { state.stage = FindingAdapter { request: move pending } }
+      }
+      FindingDevice { adapter, request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let device = run pending.finish()
+          let target = SurfaceTarget.canvasId(b"gpu-test")
+          let surface = run Surface.create(&state.instance, &target, b"canvas-test")
+          let capabilities = run surface.getCapabilities(&adapter)
+          let formats = capabilities.formats()
+          if formats.length == 0 { fail GpuError.status(flags.WGPUStatus_Error) }
+          state.stage = Ready { device: move device, surface: move surface, format: formats[0], width: 0, height: 0 }
+        } else { state.stage = FindingDevice { adapter: move adapter, request: move pending } }
+      }
+      Ready ready => {
+        let mut active = move ready
+        run active.device.checkErrors()
+        let requests = run draw(&mut active, width, height)
+        state.stage = Checking { ready: move active, work: move requests.work, validation: move requests.validation }
+      }
+      Checking { ready, work, validation } => {
+        let mut submitted = move work
+        let mut scoped = move validation
+        run ready.device.checkErrors()
+        let workDone = submitted.poll()
+        let validationDone = scoped.poll()
+        if workDone && validationDone {
+          run submitted.finish()
+          run scoped.finish()
+          run ready.device.checkErrors()
+          state.stage = move ready
+          return 1
+        }
+        state.stage = Checking { ready: move ready, work: move submitted, validation: move scoped }
+      }
+    }
+    return 0
+  }
+  export "C" fn canvasStart() -> ?*mut u8 as "canvas_start" {
+    return run Effect.catchAll(start(), startFailed)
+  }
+  export "C" fn canvasPoll(token: ?*mut u8, width: u32, height: u32) -> i32 as "canvas_poll" {
+    if Pointer.isNull(token) { return -1 }
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+    let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(pointer)
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    return run Effect.catchAll(poll(&mut state, width, height), pollFailed)
+  }
+  export "C" fn canvasDrop(token: ?*mut u8) -> i32 as "canvas_drop" {
+    if Pointer.isNull(token) { return -1 }
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+    let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(pointer)
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    let observer = state.observer.dup()
+    match &state.stage {
+      Ready ready => ready.surface.unconfigure()
+      Checking checking => checking.ready.surface.unconfigure()
+      _ => ()
+    }
+    let root = Intrinsic.replace(state.root, Unrooted {})
+    match move root {
+      Root { storage } => { drop storage }
+      Unrooted empty => ()
+    }
+    if observer.liveHandles() != 0 || observer.failureCount() != 0 {
+      output(b"canvas_drop failed: live GPU handles or uncaptured failures remain")
+      return -1
+    }
+    return 0
+  }
+}

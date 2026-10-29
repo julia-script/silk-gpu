@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Install the published native compiler locally; print its absolute bin directory."""
+import json
+from _install import CACHE, LOCK, asset_for, digest, download, fail, install
+
+native, asset = asset_for("silk")
+version = LOCK["silk"]["version"]
+seed = json.loads(download(LOCK["silk"]["native_seed"]).read_text())
+entry = seed["seeds"][native]
+if entry["tag"] != "v" + version or entry["target"] != native:
+    fail("native-seed.json does not describe the pinned compiler")
+home = install("silk", CACHE / "silk" / version / native, "bin/silkc")
+if digest(home / "bin/silkc") != entry["sha256"]:
+    fail(f"Native compiler checksum differs from published native-seed.json: {home}")
+print(home / "bin")

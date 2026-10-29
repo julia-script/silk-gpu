@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Provision the documented Ubuntu26 hosted runner; no compiler or browser source builds."""
+import argparse
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+from _install import CACHE, ROOT, download, extract, fail
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--browser", action="store_true", help="install pinned Playwright JS packages, never Chromium")
+args = parser.parse_args()
+lock = json.loads((ROOT / "scripts/ci-lock.json").read_text())
+if platform.system() != "Linux" or platform.machine() != "x86_64" or platform.freedesktop_os_release().get("VERSION_ID") != "26.04":
+    fail("setup-ci requires the documented ubuntu-26.04 x86_64 runner")
+
+
+def export(name, value):
+    print(f"{name}={value}")
+    if os.environ.get("GITHUB_ENV"):
+        with open(os.environ["GITHUB_ENV"], "a") as stream:
+            stream.write(f"{name}={value}\n")
+    os.environ[name] = str(value)
+
+
+clang = shutil.which("clang-22")
+if not clang:
+    fail("Runner prerequisite missing: preinstalled clang-22")
+version = subprocess.check_output([clang, "--version"], text=True)
+if f"clang version {lock['runner_clang_version']} " not in version:
+    fail(f"Runner LLVM changed; review scripts/ci-lock.json rather than downloading implicitly: {version}")
+export("SILK_CLANG", str(Path(clang).resolve()))
+if args.browser:
+    wasm_ld = Path(clang).resolve().parent / "wasm-ld"
+    if not wasm_ld.is_file():
+        fail(f"Runner prerequisite missing: {wasm_ld} (lld-22)")
+    chromium = shutil.which("chromium") or shutil.which("chromium-browser")
+    if not chromium:
+        fail("Runner prerequisite missing: preinstalled Chromium; browser downloads are prohibited")
+    # Canvas presentation needs the headed compositor, even on a GPU-less runner.
+    display_tools = ("xvfb-run", "Xvfb", "xauth")
+    if any(shutil.which(name) is None for name in display_tools):
+        subprocess.run(["sudo", "apt-get", "update", "-qq"], check=True)
+        subprocess.run(["sudo", "apt-get", "install", "--yes", "--no-install-recommends", "xvfb", "xauth"], check=True)
+    missing = [name for name in display_tools if shutil.which(name) is None]
+    if missing:
+        fail(f"Headed Chromium prerequisites missing after installation: {', '.join(missing)}")
+    home = CACHE / "playwright" / lock["playwright"]["version"] / "node_modules"
+    for name, asset in lock["playwright"]["packages"].items():
+        destination = home / name
+        marker = destination / ".silk-gpu-sha256"
+        if not destination.exists():
+            extract(asset, destination)
+            marker.write_text(asset["sha256"] + "\n")
+        if not marker.is_file() or marker.read_text().strip() != asset["sha256"]:
+            fail(f"Unverified Playwright installation: {destination}")
+    export("PLAYWRIGHT_MODULE", str(home / "playwright"))
+    export("PLAYWRIGHT_CHROMIUM_EXECUTABLE", chromium)
+else:
+    archive = download(lock["mesa"])
+    subprocess.run(["sudo", "apt-get", "update", "-qq"], check=True)
+    subprocess.run(["sudo", "apt-get", "install", "--yes", "--no-install-recommends", "--allow-downgrades", str(archive)], check=True)
+    installed = subprocess.check_output(["dpkg-query", "-W", "-f=${Version}", "mesa-vulkan-drivers"], text=True).strip()
+    if installed != lock["mesa"]["version"]:
+        fail(f"Expected pinned Mesa {lock['mesa']['version']}, found {installed}")
+    files = subprocess.check_output(["dpkg-query", "-L", "mesa-vulkan-drivers"], text=True).splitlines()
+    icds = [path for path in files if Path(path).name.startswith("lvp_icd") and path.endswith(".json")]
+    if len(icds) != 1 or not Path(icds[0]).is_file():
+        fail(f"Expected exactly one lavapipe ICD, found {icds}")
+    # Explicitly select lavapipe rather than accidentally depending on runner GPU hardware.
+    export("VK_DRIVER_FILES", icds[0])
+    export("VK_ICD_FILENAMES", icds[0])
+    runtime = CACHE / "xdg-runtime"
+    runtime.mkdir(exist_ok=True, mode=0o700)
+    export("XDG_RUNTIME_DIR", str(runtime))

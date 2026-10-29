@@ -1,0 +1,108 @@
+//! Native safe-wrapper hot loops. C shares only untimed resource fixtures,
+//! checked readback, and timing markers with the equivalent C implementation.
+import webgpu.runtime { Instance, RequestAdapterOptions, GpuError }
+import webgpu.descriptors { DeviceDescriptor, RenderPassColorAttachment, RenderPassDescriptor, Color }
+import webgpu.resources { Buffer, TextureView, RenderPipeline, BindGroup }
+import webgpu.resources as resource
+import webgpu_sys.generated_webgpu as sys
+import silk.core.ownership { Drop }
+import silk.core.effect { Effect }
+import silk.mem.allocator { OutOfMemoryError }
+
+unsafe extern "C" fn bench_case() -> u32
+unsafe extern "C" fn bench_count() -> u32
+unsafe extern "C" fn bench_frames() -> u32
+unsafe extern "C" fn bench_begin() -> ()
+unsafe extern "C" fn bench_end() -> ()
+unsafe extern "C" fn bench_report(language: u32, checksum: u64) -> ()
+unsafe extern "C" fn bench_setup(device: sys.WGPUDevice) -> *mut u8
+unsafe extern "C" fn bench_destroy(fixture: *mut u8) -> () with Intrinsic.foreign(invokesDeferredCallbacks: true)
+unsafe extern "C" fn bench_buffer(fixture: *mut u8) -> sys.WGPUBuffer
+unsafe extern "C" fn bench_view(fixture: *mut u8) -> sys.WGPUTextureView
+unsafe extern "C" fn bench_pipeline(fixture: *mut u8) -> sys.WGPURenderPipeline
+unsafe extern "C" fn bench_group(fixture: *mut u8, index: u32) -> sys.WGPUBindGroup
+unsafe extern "C" fn bench_drain(fixture: *mut u8, instance: sys.WGPUInstance) -> () with Intrinsic.foreign(invokesDeferredCallbacks: true)
+unsafe extern "C" fn bench_check(fixture: *mut u8, instance: sys.WGPUInstance) -> u64 with Intrinsic.foreign(invokesDeferredCallbacks: true)
+
+struct Fixture { handle: *mut u8 }
+impl Drop for Fixture {
+  fn drop(self: &mut Self) -> () { unsafe bench_destroy(self.handle) }
+}
+
+effect fn program() -> i32 ! GpuError | OutOfMemoryError {
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let fixture = Fixture { handle: unsafe bench_setup(unsafe device.raw()) }
+  // Each fixture getter transfers an extra native reference to its owned wrapper.
+  let queue = run resource.getQueue(&device)
+  let buffer = unsafe Buffer.adopt(unsafe bench_buffer(fixture.handle))
+  let view = unsafe TextureView.adopt(unsafe bench_view(fixture.handle))
+  let pipeline = unsafe RenderPipeline.adopt(unsafe bench_pipeline(fixture.handle))
+  let group0 = unsafe BindGroup.adopt(unsafe bench_group(fixture.handle, 0))
+  let group1 = unsafe BindGroup.adopt(unsafe bench_group(fixture.handle, 1))
+  let mut clear = Color.default()
+  clear.setA(1.0)
+  let mut color = RenderPassColorAttachment.default().withView(&view)
+  color.setLoadOp(sys.WGPULoadOp_Clear)
+  color.setStoreOp(sys.WGPUStoreOp_Store)
+  color.setClearValue(clear)
+  let colors = [color]
+  let descriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+  let bytes: [u8; 16] = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]
+  let offsets: [u32; 0] = []
+  let emptyCommands: [resource.CommandBufferRef; 0] = []
+  let kind = unsafe bench_case()
+  let n = unsafe bench_count()
+  let frames = unsafe bench_frames()
+  let rawInstance = unsafe instance.raw()
+  let rawFixture = fixture.handle
+  unsafe bench_drain(rawFixture, rawInstance)
+  let mut frame: u32 = 0
+  while frame < frames + 2 {
+    if frame >= 2 { unsafe bench_begin() }
+    if kind == 1 {
+      let mut i: u32 = 0
+      while i < n {
+        queue.writeBuffer(&buffer, 0, &bytes)
+        i = i + 1
+      }
+      queue.submit(&emptyCommands)
+    } else {
+      let mut encoder = run resource.createCommandEncoder(&device, b"")
+      let mut pass = run encoder.beginRenderPass(&descriptor)
+      pass.setPipeline(&pipeline)
+      pass.setBindGroup(0, &group0, &offsets)
+      if kind == 0 || kind == 2 {
+        let mut i: u32 = 0
+        while i < n {
+          if kind == 2 {
+            if i % 2 == 0 { pass.setBindGroup(0, &group0, &offsets) }
+            else { pass.setBindGroup(0, &group1, &offsets) }
+          }
+          pass.draw(6, 1, 0, i % 64)
+          i = i + 1
+        }
+      } else { pass.draw(6, if kind == 3 { 10000 } else { 100000 }, 0, 0) }
+      pass.end()
+      let commands = run encoder.finish(b"")
+      queue.submit(&[commands.reference()])
+    }
+    if frame >= 2 { unsafe bench_end() }
+    unsafe bench_drain(rawFixture, rawInstance)
+    instance.processEvents()
+    run device.checkErrors()
+    frame = frame + 1
+  }
+  let checksum = unsafe bench_check(rawFixture, rawInstance)
+  run device.checkErrors()
+  unsafe bench_report(1, checksum)
+  return 0
+}
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
+}

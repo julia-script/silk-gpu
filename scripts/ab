@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Compare OLD NEW executable CPU instructions in measured benchmark regions.
+
+Both binaries must be built with BENCH_CALLGRIND=1. Run on native Linux with
+Valgrind and the real Dawn/Vulkan software adapter installed. Startup, warmup,
+GPU waits and output checks are excluded. Collection toggles on the calling
+thread; worker-thread GPU execution is not the metric. Annotated call counts
+also include uncollected startup/warmup: use scoped Ir for attribution, not
+those call counts as an allocation census. Full measured call trees are saved.
+"""
+import argparse
+import json
+import math
+from pathlib import Path
+import statistics
+import sys
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "bench"))
+from runner import LOCAL, WORKLOADS, callgrind, metadata
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("old", type=Path)
+    parser.add_argument("new", type=Path)
+    parser.add_argument("--n", type=int, default=10000)
+    parser.add_argument("--frames", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--output", type=Path, default=LOCAL / "ab")
+    args = parser.parse_args()
+    if not 64 <= args.n <= 1000000 or not 1 <= args.frames <= 10000 or args.repeats < 1:
+        parser.error("n must be 64..1000000, frames 1..10000, repeats >=1")
+    binaries = {"old": args.old.resolve(), "new": args.new.resolve()}
+    args.output.mkdir(parents=True, exist_ok=True)
+    report = metadata(binaries)
+    report["valgrind_version"] = subprocess.check_output(["valgrind", "--version"], text=True).strip()
+    report["metric"] = "Ir"
+    report["scope"] = "calling-thread marked CPU encode/write and submit regions; setup, warmup, GPU waits and worker-thread execution excluded"
+    report["callgrind_options"] = ["--collect-atstart=no", "--instr-atstart=yes"]
+    report["call_count_scope"] = "annotated call counts include uncollected startup/warmup; only Ir is region-scoped"
+    report["results"] = []
+    ratios = []
+    for case, name in enumerate(WORKLOADS):
+        samples = {label: [] for label in binaries}
+        checksums = set()
+        for repeat in range(args.repeats):
+            for label, binary in binaries.items():
+                row = callgrind(binary, case, args.n, args.frames,
+                                args.output / f"{label}-{name}-{repeat}.callgrind")
+                samples[label].append(row["Ir"] / args.frames)
+                checksums.add(row["checksum"])
+        if len(checksums) != 1: raise ValueError(f"changed GPU output for {name}")
+        medians = {label: statistics.median(values) for label, values in samples.items()}
+        ratio = medians["new"] / medians["old"]
+        ratios.append(ratio)
+        report["results"].append({"workload": name, "n": 10000 if case == 3 else 100000 if case == 4 else args.n,
+            "frames": args.frames, "checked": True, "checksum": next(iter(checksums)),
+            "samples": samples, "median_Ir_per_frame": medians, "new_over_old": ratio})
+        print(f"{name:12} old={medians['old']:.0f} new={medians['new']:.0f} Ir/frame {ratio:.4f}x", flush=True)
+    report["geomean_new_over_old"] = math.exp(statistics.mean(map(math.log, ratios)))
+    (args.output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+    print(f"geomean {report['geomean_new_over_old']:.4f}x; call trees in {args.output}")
+    print("Allocation evidence: inspect *.calls.txt allocator callees and their caller chains; backend allocations are not wrapper allocations.")
+
+
+if __name__ == "__main__": main()

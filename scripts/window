@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Build/run the dev-only GLFW host. GLFW >= 3.4 must be installed separately."""
+import argparse
+import os
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+
+from _build import build
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def glfw_links():
+    prefix = os.environ.get("GLFW_PREFIX")
+    if prefix:
+        return [
+            {"search-path": str(Path(prefix).resolve() / "lib")},
+            {"library": "glfw3" if sys.platform == "win32" else "glfw", "mode": "dynamic"},
+        ]
+    if not shutil.which("pkg-config"):
+        raise SystemExit("Install GLFW >= 3.4 and pkg-config, or set GLFW_PREFIX to its installation root.")
+    subprocess.run(["pkg-config", "--atleast-version=3.4", "glfw3"], check=True)
+    flags = shlex.split(subprocess.check_output(["pkg-config", "--libs", "glfw3"], text=True))
+    links = []
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        if flag.startswith("-L"):
+            links.append({"search-path": flag[2:]})
+        elif flag.startswith("-l"):
+            links.append({"library": flag[2:], "mode": "dynamic"})
+        elif flag == "-framework" and i + 1 < len(flags):
+            i += 1
+            links.append({"framework": flags[i]})
+        else:
+            raise SystemExit(f"Unsupported GLFW pkg-config link argument: {flag}")
+        i += 1
+    return links
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--release", action="store_true")
+    args = parser.parse_args()
+    links = glfw_links()
+    if sys.platform == "darwin":
+        out = ROOT / ".cache" / "window-native"
+        out.mkdir(parents=True, exist_ok=True)
+        sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        cc = os.environ.get("SILK_CLANG", "/usr/bin/clang")
+        obj = out / "metal_layer.o"
+        archive = out / "libsilk_gpu_window.a"
+        subprocess.run([cc, "-isysroot", sdk, "-fobjc-arc", "-O2", "-c", str(ROOT / "examples_window/native/metal_layer.m"), "-o", str(obj)], check=True)
+        subprocess.run(["ar", "rcs", str(archive), str(obj)], check=True)
+        links.extend([{"static-archive": str(archive)}, {"framework": "Cocoa"}, {"framework": "QuartzCore"}])
+    elif sys.platform == "win32":
+        links.append({"library": "kernel32", "mode": "dynamic"})
+    executable = build(ROOT / "examples_window", release=args.release, extra_links=links)
+    if args.build_only:
+        print(executable)
+        return 0
+    return subprocess.run([str(executable)], cwd=ROOT).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

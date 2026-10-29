@@ -1,0 +1,4 @@
+//! Raw WebGPU C ABI. Generated declarations live in generated_webgpu.
+//! Native callbacks require live exported addresses and same-thread pumping.
+//! Wasm callback fields are host-registered tokens, not native code addresses.
+import generated_webgpu

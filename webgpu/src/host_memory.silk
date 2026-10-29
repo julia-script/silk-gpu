@@ -1,0 +1,51 @@
+//! Stateless wasm host allocations. The allocation owner lives after the payload,
+//! so JavaScript receives ordinary bytes without a global allocation registry.
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.mem.raw_buffer { RawBuffer }
+  import silk.mem.slot { Slot }
+  import silk.mem.pointer { Pointer }
+  import silk.layout { Layout }
+  import silk.core.effect { Effect }
+  import silk.core.result { Result }
+  import silk.num.usize
+
+  effect fn allocate(size: usize) -> ?*mut u8 ! OutOfMemoryError {
+    let header = Layout.of<Intrinsic.RawBuffer<u8>>()
+    let padding = header.alignment - 1
+    if size > usize.MAX - padding - header.bytes { fail OutOfMemoryError {} }
+    let offset = (size + padding) / header.alignment * header.alignment
+    let total = offset + header.bytes
+    let mut allocator = Allocator.systemAllocatorProvider()
+    // C records and mapped-range pointers need up to 16-byte base alignment.
+    let alignment = if header.alignment > 16 { header.alignment } else { 16 }
+    let allocation = run Allocator.allocate(Layout { bytes: total, alignment: alignment })
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let mut storage = unsafe RawBuffer.from<u8>(move allocation, total)
+    let pointer = Slot.address(RawBuffer.slot(&mut storage, 0))
+    let many = unsafe Pointer.assumeManyMut(pointer)
+    let headerBytes = unsafe Pointer.atMut(many, offset)
+    let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Intrinsic.RawBuffer<u8>>(headerBytes)
+    unsafe Pointer.put(owner, move storage)
+    return pointer
+  }
+
+  pub fn hostAllocate(size: usize) -> ?*mut u8 {
+    return match move run Effect.result(allocate(size)) {
+      Result<?*mut u8, OutOfMemoryError>.Success { value } => value
+      Result<?*mut u8, OutOfMemoryError>.Failure { error } => Pointer.null<u8>()
+    }
+  }
+  // Host contract: pointer and size are an outstanding pair returned by alloc;
+  // no JS view or pending callback may use the bytes after this call.
+  pub unsafe fn release(pointer: ?*mut u8, size: usize) -> () {
+    if Pointer.isNull(pointer) { return () }
+    let header = Layout.of<Intrinsic.RawBuffer<u8>>()
+    let offset = (size + header.alignment - 1) / header.alignment * header.alignment
+    let many = unsafe Intrinsic.pointerRequalify<?*mut u8, [*]mut u8>(pointer)
+    let headerBytes = unsafe Pointer.atMut(many, offset)
+    let owner = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut Intrinsic.RawBuffer<u8>>(headerBytes)
+    let storage = unsafe Pointer.take(owner)
+    drop storage
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "repository": "webgpu-native/webgpu-headers",
+  "revision": "a1dc77409bb2b8bd80540cbf4b8db219e123e909",
+  "representation": "webgpu.json is upstream-generated directly from webgpu.yml at this same revision; both are fetched and hash-checked.",
+  "sha256": {
+    "webgpu.yml": "9268864efc29edc2e4fa40949643d14ae5bf6664447eadfccdeaefe7e14d130b",
+    "webgpu.json": "5f576cc34ae066e32e2d0fcbe8f5af11a0de8cf01a52c745e7e2d17e8c86641f",
+    "webgpu.h": "0314dc40d4641dfe9638ae82071926c0a4136a4bf525c54098b58be345e9b4ed"
+  }
+}

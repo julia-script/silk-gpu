@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+"""Generate the wasm32 C ABI and WebGPU semantic mapping from the pinned schema."""
+import argparse
+import json
+import runpy
+from pathlib import Path
+from schema_source import fetch_sources
+
+ROOT = Path(__file__).resolve().parent.parent
+
+# Share the raw generator's upstream-compatible spelling, including doubled
+# underscores inside numeric vertex formats. run_path does not run its CLI main.
+raw_generator = runpy.run_path(str(ROOT / 'scripts/generate'))
+pascal = raw_generator['pascal']
+camel = raw_generator['camel']
+
+# Tokens belong to this explicit browser ABI, not a wasm function table.
+CALLBACK_EXPORTS = {
+    'WGPURequestAdapterCallback': (1, 'adapter', 'wasmAdapter'),
+    'WGPURequestDeviceCallback': (2, 'device', 'wasmDevice'),
+    'WGPUBufferMapCallback': (3, 'bufferMap', 'wasmMap'),
+    'WGPUPopErrorScopeCallback': (4, 'popErrorScope', 'wasmScope'),
+    'WGPUQueueWorkDoneCallback': (5, 'queueDone', 'wasmQueue'),
+    'WGPUDeviceLostCallback': (6, 'deviceLost', 'wasmLost'),
+    'WGPUUncapturedErrorCallback': (7, 'uncapturedError', 'wasmError'),
+    'WGPUCompilationInfoCallback': (8, 'compilation', 'wasmCompilation'),
+    'WGPUCreateComputePipelineAsyncCallback': (9, 'computePipeline', 'wasmComputePipeline'),
+    'WGPUCreateRenderPipelineAsyncCallback': (10, 'renderPipeline', 'wasmRenderPipeline'),
+}
+
+def generate():
+    lock, paths = fetch_sources()
+    schema = json.loads(paths['webgpu.json'].read_text())
+    abi = json.loads((ROOT / 'webgpu_sys/abi/generated_schema.json').read_text())
+    if abi['schema_revision'] != lock['revision']:
+        raise SystemExit('Run scripts/generate first: raw/browser schema revisions differ')
+    records = abi['records']
+    flags = {'WGPU' + pascal(item['name']) for item in schema['bitflags']}
+    objects = {'WGPU' + pascal(item['name']): item['name'] for item in schema['objects']}
+    layouts = {}
+    def shape(t):
+        if t.startswith('?') or t.endswith('Callback') or t in objects:
+            return 4, 4
+        if t in records:
+            layout(t)
+            return layouts[t]['size'], layouts[t]['align']
+        if t in ('u64', 'i64', 'f64') or t in flags:
+            return 8, 8
+        if t in ('u8', 'i8'): return 1, 1
+        if t in ('u16', 'i16'): return 2, 2
+        return 4, 4
+    def layout(name):
+        if name in layouts: return
+        offset, alignment, fields = 0, 1, []
+        for field in records[name]:
+            size, align = shape(field['type'])
+            offset = (offset + align - 1) // align * align
+            fields.append(dict(field, offset=offset))
+            offset += size
+            alignment = max(alignment, align)
+        layouts[name] = dict(size=(offset + alignment - 1) // alignment * alignment, align=alignment, fields=fields)
+    for name in records: layout(name)
+    # LLVM's wasm C ABI scalarizes records containing exactly one scalar member,
+    # recursively; multi-member aggregates remain indirect. Observed in dev.27:
+    # requestAdapter/requestDevice/popErrorScope imports return i64 for WGPUFuture.
+    scalar_records = {}
+    def scalar_record(name):
+        fields = records[name]
+        if len(fields) != 1:
+            return None
+        field = fields[0]
+        if field['type'] in records:
+            nested = scalar_record(field['type'])
+            if nested is None:
+                return None
+            return dict(path=[field['name']] + nested['path'], type=nested['type'])
+        return dict(path=[field['name']], type=field['type'])
+    for name in records:
+        scalar = scalar_record(name)
+        if scalar is not None:
+            scalar_records[name] = scalar
+    enums = {}
+    for enum in schema['enums']:
+        name = 'WGPU' + pascal(enum['name'])
+        entries = {}
+        for entry in enum['entries']:
+            if entry is None: continue
+            key = name + '_' + pascal(entry['name'])
+            value = abi['constants'][key]
+            text = entry['name'].replace('_', '-').lower()
+            if enum['name'] == 'WGSL_language_feature_name':
+                text = entry['name']
+            if enum['name'] == 'texture_format':
+                words = entry['name'].lower().split('_')
+                if words[0].startswith(('bc', 'etc', 'eac', 'astc')):
+                    text = '-'.join(words)
+                else:
+                    text = ''.join(words).replace('srgb', '-srgb')
+                    text = text.replace('plusstencil', 'plus-stencil').replace('floatstencil', 'float-stencil')
+            if enum['name'] == 'vertex_format':
+                text = entry['name'].lower().replace('__', '-').replace('_', '-')
+                text = text.replace('-b-g-r-a', '-bgra')
+            if enum['name'] == 'feature_name':
+                text = text.replace('depth32-float-stencil8', 'depth32float-stencil8')
+                text = text.replace('rg11b10-ufloat', 'rg11b10ufloat').replace('bgra8-unorm', 'bgra8unorm')
+                text = text.replace('tier-1', 'tier1').replace('tier-2', 'tier2')
+            # C's legal identifier prefix does not belong in the WebIDL value.
+            if text.startswith('e1d') or text.startswith('e2d') or text.startswith('e3d'): text = text[1:]
+            entries[str(value)] = text
+        enums[name] = entries
+    methods = {}
+    for obj in schema['objects']:
+        prefix = 'wgpu' + pascal(obj['name'])
+        for method in obj['methods']:
+            methods[prefix + pascal(method['name'])] = dict(owner='WGPU' + pascal(obj['name']), method=camel(method['name']))
+    exports = [
+        '// Generated by scripts/generate-browser; do not edit.',
+        '// Imports must live in the root application package: dependencies do not export wasm symbols.',
+        '// Host contract: callback userdata addresses remain pinned until completion or cancellation.',
+        '// Invoke callbacks only inside explicit pumps, with no outstanding loans to their slots.',
+        '// Allocator exports run synchronously; promise settlement must only enqueue JS-owned data.',
+        'static if Intrinsic.targetArchitecture() == "wasm32" {',
+        '  import webgpu_sys.generated_webgpu as sys',
+        '  import webgpu.runtime as runtime',
+        '  import webgpu.host_memory as hostMemory',
+        '',
+    ]
+    for callback in abi['callbacks']:
+        token, suffix, target = CALLBACK_EXPORTS[callback['name']]
+        fields = []
+        for arg in callback['args']:
+            if arg['type'] == 'WGPUStringView':
+                fields.extend([(arg['name'] + 'Data', '?[*]const u8'), (arg['name'] + 'Length', 'usize')])
+            else:
+                fields.append((raw_generator['identifier'](arg['name']), arg['type'].replace('WGPU', 'sys.WGPU')))
+        parameters = ', '.join(name + ': ' + typ for name, typ in fields)
+        arguments = ', '.join(name for name, _ in fields)
+        exports.extend([
+            f'  export "C" fn {target}({parameters}) -> () as "webgpu_callback_{suffix}" {{',
+            f'    unsafe runtime.{target}({arguments})',
+            '  }',
+        ])
+    exports.extend([
+        '  export "C" fn allocate(size: usize) -> ?*mut u8 as "webgpu_alloc" {',
+        '    return hostMemory.hostAllocate(size)',
+        '  }',
+        '  export "C" fn free(pointer: ?*mut u8, size: usize) -> () as "webgpu_free" {',
+        '    unsafe hostMemory.release(pointer, size)',
+        '  }',
+        '}',
+        '',
+    ])
+    callback_exports = sorted([[token, 'webgpu_callback_' + suffix] for token, suffix, _ in CALLBACK_EXPORTS.values()])
+    data = dict(revision=lock['revision'], layouts=layouts, scalarRecords=scalar_records, flags=sorted(flags), objects=objects,
+                enums=enums, constants=abi['constants'], functions=abi['functions'], methods=methods, callbackExports=callback_exports)
+    return {
+        'browser/generated_schema.ts': '// Generated by scripts/generate-browser; do not edit.\nexport const schema = ' + json.dumps(data, separators=(',', ':')) + ';\n',
+        'examples/src/generated_webgpu_exports.silk': '\n'.join(exports),
+    }
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--check', action='store_true')
+    args = parser.parse_args()
+    for relative, text in generate().items():
+        output = ROOT / relative
+        if args.check:
+            if not output.exists() or output.read_text() != text:
+                raise SystemExit(f'{relative} is stale; run scripts/generate-browser')
+        else:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(text)
+
+if __name__ == '__main__': main()

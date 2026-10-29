@@ -1,0 +1,40 @@
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import browser
+  import canvas
+  pub fn main() -> i32 { return 0 }
+} else {
+  import webgpu.runtime { GpuError }
+  import silk.mem.allocator { OutOfMemoryError }
+  import silk.core.effect { Effect }
+  import silk.system.host_input { HostInputError }
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    import native_output { FileError }
+  } else {
+    import silk.system.filesystem { FileError }
+  }
+  import session { Session }
+  import samples
+  import native_output
+
+  effect fn program() -> i32 ! GpuError | OutOfMemoryError | FileError | HostInputError {
+    let mut index: u32 = 0
+    while index < 6 {
+      let mut sample = run Session.start(index)
+      let observer = sample.diagnostics()
+      // Native ProcessEvents drives retained callbacks. The browser uses the
+      // identical state machine, but yields between polls to promises and RAF.
+      while !run sample.poll() {}
+      run native_output.save(samples.name(index), sample.rgba())
+      if index == 4 { run native_output.save("compute.u32", sample.computeValues()) }
+      drop sample
+      if observer.liveHandles() != 0 || observer.failureCount() != 0 { fail GpuError.status(0xfffffffb) }
+      index = index + 1
+    }
+    return 0
+  }
+  effect fn failed<E>(error: E) -> i32 {
+    drop error
+    return 1
+  }
+  pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }
+}

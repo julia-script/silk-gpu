@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Run native ownership, callback, readback and validation scenarios against pinned Dawn."""
+import subprocess
+from _build import ROOT, build
+
+binary = build(ROOT / "native_tests")
+subprocess.run([str(binary)], check=True, timeout=120)

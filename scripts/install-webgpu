@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Install Dawn's pinned release archive; print its absolute installation root."""
+from _install import CACHE, LOCK, asset_for, install
+
+native, asset = asset_for("webgpu")
+home = install("webgpu", CACHE / "webgpu" / LOCK["webgpu"]["version"] / native, asset["library"])
+print(home)

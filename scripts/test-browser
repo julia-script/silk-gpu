@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Build the real Silk samples for wasm and test them in already-installed Chromium."""
+import shutil
+import subprocess
+import sys
+from _build import ROOT, build
+
+subprocess.run(["node", "--test", str(ROOT / "browser/host.test.mjs")], cwd=ROOT, check=True, timeout=60)
+binary = build(ROOT / "examples", target="wasm32-unknown-unknown")
+command = ["node", str(ROOT / "browser/test.mjs"), "--wasm", str(binary), "--fixtures", str(ROOT / "browser/fixtures.json")]
+if sys.platform == "linux":
+    # Chromium's Linux headless compositor omits presenting WebGPU canvases.
+    # A private virtual display tests real browser presentation without a GPU.
+    if not shutil.which("xvfb-run") or not shutil.which("xauth"):
+        raise SystemExit("Linux browser presentation tests require xvfb-run and xauth; run scripts/setup-ci --browser")
+    command = ["xvfb-run", "--auto-servernum", "--server-args=-screen 0 1280x720x24", *command]
+subprocess.run(command, cwd=ROOT, check=True, timeout=180)

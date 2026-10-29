@@ -1,0 +1,80 @@
+//! Debug-only reference and uncaptured-failure accounting, surviving device teardown.
+//! Release builds erase counters and leases; native implementation allocation is separate.
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.ownership { Drop }
+import silk.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.concurrency.sync { Arc }
+import silk.concurrency.atomic { Atomic, MemoryOrder }
+
+static if Intrinsic.profileText("optimization") == "none" {
+  struct Counts { handles: usize, failures: usize }
+  pub struct Diagnostics { counts: Arc<Counts> }
+  impl Diagnostics {
+    pub effect fn make() -> Diagnostics ! OutOfMemoryError {
+      let mut allocator = Allocator.systemAllocatorProvider()
+      let counts = run Arc<Counts>.make(Counts { handles: 0, failures: 0 })
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      return Diagnostics { counts: move counts }
+    }
+    pub fn dup(self: &Self) -> Diagnostics { return Diagnostics { counts: self.counts.clone() } }
+    pub fn liveHandles(self: &Self) -> usize {
+      return unsafe Atomic.load<usize>(Pointer.fromRef(&self.counts.get().handles), MemoryOrder.Relaxed)
+    }
+    pub fn failureCount(self: &Self) -> usize {
+      return unsafe Atomic.load<usize>(Pointer.fromRef(&self.counts.get().failures), MemoryOrder.Relaxed)
+    }
+    pub fn recordFailure(self: &Self) -> () {
+      let pointer = unsafe Intrinsic.pointerRequalify<*const usize, *mut usize>(Pointer.fromRef(&self.counts.get().failures))
+      let ignored = unsafe Atomic.fetchAdd<usize>(pointer, 1, MemoryOrder.Relaxed)
+    }
+    pub fn retain(self: &Self) -> () {
+      let pointer = unsafe Intrinsic.pointerRequalify<*const usize, *mut usize>(Pointer.fromRef(&self.counts.get().handles))
+      let ignored = unsafe Atomic.fetchAdd<usize>(pointer, 1, MemoryOrder.Relaxed)
+    }
+    pub fn release(self: &Self) -> () {
+      let pointer = unsafe Intrinsic.pointerRequalify<*const usize, *mut usize>(Pointer.fromRef(&self.counts.get().handles))
+      let ignored = unsafe Atomic.fetchSubtract<usize>(pointer, 1, MemoryOrder.Relaxed)
+    }
+  }
+  pub struct HandleLease { observer: Option<Diagnostics> }
+  impl HandleLease {
+    pub fn untracked() -> HandleLease { return HandleLease { observer: Option<Diagnostics>.none() } }
+    pub fn track(observer: &Diagnostics) -> HandleLease {
+      observer.retain()
+      return HandleLease { observer: Option<Diagnostics>.some(observer.dup()) }
+    }
+    pub fn dup(self: &Self) -> HandleLease {
+      return match &self.observer {
+        Option<Diagnostics>.Some { value } => HandleLease.track(&value)
+        Option<Diagnostics>.None => HandleLease.untracked()
+      }
+    }
+  }
+  impl Drop for HandleLease {
+    fn drop(self: &mut Self) -> () {
+      match &self.observer {
+        Option<Diagnostics>.Some { value } => value.release()
+        Option<Diagnostics>.None => ()
+      }
+    }
+  }
+} else {
+  pub struct Diagnostics {}
+  impl Diagnostics {
+    pub effect fn make() -> Diagnostics ! OutOfMemoryError { return Diagnostics {} }
+    pub fn dup(self: &Self) -> Diagnostics { return Diagnostics {} }
+    pub fn liveHandles(self: &Self) -> usize { return 0 }
+    pub fn failureCount(self: &Self) -> usize { return 0 }
+    pub fn recordFailure(self: &Self) -> () {}
+    pub fn retain(self: &Self) -> () {}
+    pub fn release(self: &Self) -> () {}
+  }
+  pub struct HandleLease {}
+  impl HandleLease {
+    pub fn untracked() -> HandleLease { return HandleLease {} }
+    pub fn track(observer: &Diagnostics) -> HandleLease { return HandleLease {} }
+    pub fn dup(self: &Self) -> HandleLease { return HandleLease {} }
+  }
+}
