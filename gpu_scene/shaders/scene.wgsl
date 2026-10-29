@@ -38,6 +38,8 @@ fn word(p: u32, i: u32) -> f32 { return bitcast<f32>(paints[p + i]); }
 // a b c d e f, sampling (0 nearest, 1 bilinear), extend (0 clamp, 1 repeat).
 // Native SceneRenderer compiles this module with strict math: relaxed contraction/reassociation
 // can move a transformed coordinate across a nearest-texel boundary relative to vector.paint.
+// Browser WGSL has no strict-math parity guarantee. Projective matrices are
+// checked and normalized by the recorder; zero inverse w paints nothing.
 fn texel(p: u32, x: f32, y: f32) -> vec4u {
   let w = f32(paints[p + 2u]);
   let h = f32(paints[p + 3u]);
@@ -61,11 +63,29 @@ fn bilerp(a: vec4u, b: vec4u, c: vec4u, d: vec4u, wx: f32, wy: f32) -> vec4u {
   return vec4u(floor(top + (bottom - top) * wy + 0.5));
 }
 
+// Match vector.paint's explicit one-rounding operations. Plain multiply/add can
+// contract at a different point on Metal even with the module's strictMath flag.
+fn projectiveImagePoint(p: u32, fx: f32, fy: f32) -> vec3f {
+  let first = fma(vec3f(word(p, 4u), word(p, 5u), word(p, 16u)), vec3f(fx),
+    vec3f(word(p, 8u), word(p, 9u), word(p, 18u)));
+  return fma(vec3f(word(p, 6u), word(p, 7u), word(p, 17u)), vec3f(fy), first);
+}
+
 fn shadeImage(p: u32, pixel: vec2u) -> vec4u {
   let fx = f32(pixel.x) + 0.5;
   let fy = f32(pixel.y) + 0.5;
-  let x = word(p, 4u) * fx + word(p, 6u) * fy + word(p, 8u);
-  let y = word(p, 5u) * fx + word(p, 7u) * fy + word(p, 9u);
+  var x = 0.0;
+  var y = 0.0;
+  if paints[p] == 6u {
+    let mapped = projectiveImagePoint(p, fx, fy);
+    let w = mapped.z;
+    if w == 0.0 || !(abs(w) <= 3.402823e38) { return vec4u(0u); }
+    x = mapped.x / w;
+    y = mapped.y / w;
+  } else {
+    x = word(p, 4u) * fx + word(p, 6u) * fy + word(p, 8u);
+    y = word(p, 5u) * fx + word(p, 7u) * fy + word(p, 9u);
+  }
   if abs(x) > 1.0e15 || abs(y) > 1.0e15 || x != x || y != y { return vec4u(0u); }
   if paints[p + 10u] == 0u { return texel(p, floor(x), floor(y)); }
   let x0 = floor(x - 0.5);
@@ -75,18 +95,28 @@ fn shadeImage(p: u32, pixel: vec2u) -> vec4u {
   return bilerp(texel(p, x0, y0), texel(p, x0 + 1.0, y0), texel(p, x0, y0 + 1.0), texel(p, x0 + 1.0, y0 + 1.0), wx, wy);
 }
 
-// Paint records are 16 words: kind (0 solid, 1 linear, 2 radial, 3 image), color or ramp start,
-// spread, single, the device-to-gradient inverse a b c d e f, then x0 y0 r0 x1 y1 r1.
+// Solid/affine records are 16 words: kind (0 solid, 1 linear, 2 radial, 3 image),
+// color or ramp start, spread, single, inverse a b c d e f, then x0 y0 r0 x1 y1 r1.
+// Projective kinds 4 linear, 5 radial, 6 image append inverse wx wy ww (19 words).
+// Runs carry word offsets, so mixed affine/projective records need no padding.
 fn shade(p: u32, pixel: vec2u) -> vec4u {
   let kind = paints[p];
   if kind == 0u { return unpack(paints[p + 1u]); }
-  if kind == 3u { return shadeImage(p, pixel); }
+  if kind == 3u || kind == 6u { return shadeImage(p, pixel); }
   var index = 1023u;
-  if paints[p + 3u] == 0u {
+  if paints[p + 3u] == 0u || kind >= 4u {
     let fx = f32(pixel.x) + 0.5;
     let fy = f32(pixel.y) + 0.5;
-    let gx = word(p, 4u) * fx + word(p, 6u) * fy + word(p, 8u);
-    let gy = word(p, 5u) * fx + word(p, 7u) * fy + word(p, 9u);
+    var gx = word(p, 4u) * fx + word(p, 6u) * fy + word(p, 8u);
+    var gy = word(p, 5u) * fx + word(p, 7u) * fy + word(p, 9u);
+    if kind >= 4u {
+      let w = word(p, 16u) * fx + word(p, 17u) * fy + word(p, 18u);
+      if w == 0.0 || !(abs(w) <= 3.402823e38) { return vec4u(0u); }
+      gx = gx / w;
+      gy = gy / w;
+      if !(abs(gx) <= 3.402823e38) || !(abs(gy) <= 3.402823e38) { return vec4u(0u); }
+      if paints[p + 3u] != 0u { return unpack(ramps[paints[p + 1u] + index]); }
+    }
     let x0 = word(p, 10u);
     let y0 = word(p, 11u);
     let r0 = word(p, 12u);
@@ -94,7 +124,7 @@ fn shade(p: u32, pixel: vec2u) -> vec4u {
     let y1 = word(p, 14u);
     let r1 = word(p, 15u);
     var t = 0.0;
-    if kind == 1u {
+    if kind == 1u || kind == 4u {
       let dx = x1 - x0;
       let dy = y1 - y0;
       t = ((gx - x0) * dx + (gy - y0) * dy) / (dx * dx + dy * dy);
@@ -126,6 +156,7 @@ fn shade(p: u32, pixel: vec2u) -> vec4u {
         }
       }
     }
+    if !(abs(t) <= 3.402823e38) { return vec4u(0u); }
     let spread = paints[p + 2u];
     var s = clamp(t, 0.0, 1.0);
     if spread == 2u {

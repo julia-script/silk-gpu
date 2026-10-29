@@ -12,6 +12,8 @@ import path { Path, MOVE, LINE, QUAD, CUBIC, ARC, CLOSE }
 import stroke_curve { Curve, norm }
 import stroke_arcs
 import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import projective { Homography, strokeScale }
+import projective
 
 pub const JOIN_MITER: u8 = 0
 pub const JOIN_MITER_CLIP: u8 = 1
@@ -209,45 +211,161 @@ impl Stroker {
     if style.width == 0.0 || maxScale(transform) == 0.0 {
       return
     }
-    run self.flatten(path, pen, style.dashes.length() > 0)
-    if style.dashes.length() > 0 {
-      run self.dash(style.dashes.asSlice(), style.dashOffset, pen)
-      run outlines(
-        self.dashVertices.asSlice(),
-        self.dashSubpaths.asSlice(),
-        self.curves.asSlice(),
-        pen,
-        &mut out,
-      )
-    } else {
-      run outlines(
-        self.vertices.asSlice(),
-        self.subpaths.asSlice(),
-        self.curves.asSlice(),
-        pen,
-        &mut out,
-      )
-    }
+    run self.emit(path, style, pen, &mut out)
     run validateOutput(&out.*, transform, tolerance)
   }
 
-  /// Bounds the actual stroke in arbitrary affine target coordinates, not a transformed source
-  /// AABB. `ignoreDashes` selects the undashed shape used by stroke-box reference geometry.
-  pub effect fn bounds(
+  /// SVG 2 §13.5: construct offsets, caps, joins and dash lengths in source space.
+  /// The result is a source-space outline, NOT a stroked projected centerline.
+  /// Within `clip`, projection changes this outline by at most `tolerance`.
+  /// Reserve a separate budget for the subsequent projective.fill tessellation.
+  /// Uncertifiable projection/source precision fails explicitly, never using epsilon-w.
+  pub effect fn strokeProjective(
     self: &mut Self,
     path: &Path,
     style: &Stroke,
-    transform: &Affine,
+    transform: &Homography,
+    clip: Rect,
+    tolerance: f64,
+    out: &mut Path,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    if !transform.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance)
+      || !Point.make(clip.x0, clip.y0).isFinite()
+      || !Point.make(clip.x1, clip.y1).isFinite()
+      || clip.x0 > clip.x1
+      || clip.y0 > clip.y1 {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    if transform.wx == 0.0 && transform.wy == 0.0 {
+      if transform.ww <= 0.0 {
+        drop run prepare(path, style, &Affine.identity(), tolerance)
+        return
+      }
+      let affine = Affine {
+        a: transform.xx / transform.ww,
+        b: transform.yx / transform.ww,
+        c: transform.xy / transform.ww,
+        d: transform.yy / transform.ww,
+        e: transform.xw / transform.ww,
+        f: transform.yw / transform.ww,
+      }
+      if !f64.isFinite(affine.a) || !f64.isFinite(affine.b) || !f64.isFinite(affine.c)
+        || !f64.isFinite(affine.d)
+        || !f64.isFinite(affine.e)
+        || !f64.isFinite(affine.f) {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      run self.stroke(path, style, &affine, tolerance, &mut out)
+      return
+    }
+    let scale = run strokeScale(transform, clip, tolerance)
+    let pen = run prepareScaled(path, style, scale, tolerance)
+    if style.width == 0.0 || clip.x0 == clip.x1 || clip.y0 == clip.y1 {
+      return
+    }
+    run self.emit(path, style, pen, &mut out)
+
+    // Validate source arithmetic, not a fictitious enormous affine target.
+    run validateOutput(&out.*, &Affine.identity(), pen.tolerance)
+  }
+
+  /// Unclipped projective stroke-box (SVG 2 §8.10). Each successful face is
+  /// conservative and at most tolerance outside the actual projected stroke.
+  /// `ignoreDashes` selects the undashed stroke-box reference geometry.
+  /// Independent contours behind the eye plane are ignored; a connected
+  /// crossing or uncertifiable numeric case fails instead of clipping the box.
+  pub effect fn boundsProjective(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    transform: &Homography,
     tolerance: f64,
     ignoreDashes: bool,
   ) -> StrokeBounds
-    ! OutOfMemoryError | GeometryError
+    ! GeometryError | OutOfMemoryError
     ? &mut Allocator {
-    let pen = run prepare(path, style, transform, tolerance)
-    self.scratch.clear()
-    if style.width == 0.0 {
-      return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+    if !transform.isFinite() || !(tolerance > 0.0) || !f64.isFinite(tolerance) {
+      fail GeometryError { code: INVALID_INPUT }
     }
+    if transform.wx == 0.0 && transform.wy == 0.0 {
+      if transform.ww <= 0.0 {
+        drop run prepare(path, style, &Affine.identity(), tolerance)
+        return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+      }
+      let affine = Affine {
+        a: transform.xx / transform.ww,
+        b: transform.yx / transform.ww,
+        c: transform.xy / transform.ww,
+        d: transform.yy / transform.ww,
+        e: transform.xw / transform.ww,
+        f: transform.yw / transform.ww,
+      }
+      if !f64.isFinite(affine.a) || !f64.isFinite(affine.b) || !f64.isFinite(affine.c)
+        || !f64.isFinite(affine.d)
+        || !f64.isFinite(affine.e)
+        || !f64.isFinite(affine.f) {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      return run self.bounds(path, style, &affine, tolerance, ignoreDashes)
+    }
+    let mut sourceTolerance = tolerance
+    let mut iteration: u32 = 0
+    while iteration < 64 {
+      let pen = run prepareScaled(path, style, 1.0, sourceTolerance)
+      if style.width == 0.0 {
+        return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+      }
+      run self.outlineScratch(path, style, pen, ignoreDashes)
+      run validateOutput(&self.scratch, &Affine.identity(), sourceTolerance)
+      let region = run projective.strokeRegion(&self.scratch, transform, sourceTolerance)
+      if !region.uncertain {
+        if region.empty {
+          return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+        }
+        if sourceTolerance * region.scale <= tolerance * 0.0625 {
+          let measured = run projective.bounds(&self.scratch, transform, tolerance * 0.25)
+          if measured.empty {
+            return StrokeBounds { empty: true, bounds: measured.bounds }
+          }
+          let mut box = measured.bounds
+
+          // Source approximation <= tolerance/16; f64 curve bounds <=
+          // tolerance/4. This padding covers the former and face arithmetic,
+          // while their combined outward error remains strictly < tolerance.
+          let pad = tolerance * 0.25
+          box.x0 = box.x0 - pad
+          box.y0 = box.y0 - pad
+          box.x1 = box.x1 + pad
+          box.y1 = box.y1 + pad
+          if !Point.make(box.x0, box.y0).isFinite() || !Point.make(box.x1, box.y1).isFinite() {
+            fail GeometryError { code: NUMERIC_LIMIT }
+          }
+          return StrokeBounds { empty: false, bounds: box }
+        }
+        sourceTolerance = f64.min(sourceTolerance * 0.25, tolerance * 0.03125 / region.scale)
+      } else {
+        sourceTolerance = sourceTolerance * 0.25
+      }
+      if !(sourceTolerance > 0.0) {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+      iteration = iteration + 1
+    }
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+
+  effect fn outlineScratch(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    pen: Pen,
+    ignoreDashes: bool,
+  ) -> ()
+    ! GeometryError | OutOfMemoryError
+    ? &mut Allocator {
+    self.scratch.clear()
     run self.flatten(path, pen, !ignoreDashes && style.dashes.length() > 0)
     if !ignoreDashes && style.dashes.length() > 0 {
       run self.dash(style.dashes.asSlice(), style.dashOffset, pen)
@@ -267,6 +385,49 @@ impl Stroker {
         &mut self.scratch,
       )
     }
+  }
+
+  effect fn emit(self: &mut Self, path: &Path, style: &Stroke, pen: Pen, out: &mut Path) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    run self.flatten(path, pen, style.dashes.length() > 0)
+    if style.dashes.length() > 0 {
+      run self.dash(style.dashes.asSlice(), style.dashOffset, pen)
+      run outlines(
+        self.dashVertices.asSlice(),
+        self.dashSubpaths.asSlice(),
+        self.curves.asSlice(),
+        pen,
+        &mut out,
+      )
+    } else {
+      run outlines(
+        self.vertices.asSlice(),
+        self.subpaths.asSlice(),
+        self.curves.asSlice(),
+        pen,
+        &mut out,
+      )
+    }
+  }
+
+  /// Bounds the actual stroke in arbitrary affine target coordinates, not a transformed source
+  /// AABB. `ignoreDashes` selects the undashed shape used by stroke-box reference geometry.
+  pub effect fn bounds(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    transform: &Affine,
+    tolerance: f64,
+    ignoreDashes: bool,
+  ) -> StrokeBounds
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
+    let pen = run prepare(path, style, transform, tolerance)
+    if style.width == 0.0 {
+      return StrokeBounds { empty: true, bounds: Rect.make(0.0, 0.0, 0.0, 0.0) }
+    }
+    run self.outlineScratch(path, style, pen, ignoreDashes)
     run validateOutput(&self.scratch, transform, tolerance)
     let points = self.scratch.pointList()
     if points.length == 0 {
@@ -776,16 +937,7 @@ impl Stroker {
 
 effect fn prepare(path: &Path, style: &Stroke, transform: &Affine, tolerance: f64) -> Pen
   ! GeometryError {
-  if !(tolerance > 0.0) || !f64.isFinite(tolerance) || !(style.width >= 0.0)
-    || !f64.isFinite(style.width)
-    || !(style.miterLimit >= 1.0)
-    || !f64.isFinite(style.miterLimit)
-    || !f64.isFinite(style.dashOffset)
-    || style.join > JOIN_ARCS
-    || style.cap > CAP_SQUARE
-    || !f64.isFinite(transform.a)
-    || !f64.isFinite(transform.b)
-    || !f64.isFinite(transform.c)
+  if !f64.isFinite(transform.a) || !f64.isFinite(transform.b) || !f64.isFinite(transform.c)
     || !f64.isFinite(transform.d)
     || !f64.isFinite(transform.e)
     || !f64.isFinite(transform.f) {
@@ -795,8 +947,23 @@ effect fn prepare(path: &Path, style: &Stroke, transform: &Affine, tolerance: f6
   if !f64.isFinite(scale) {
     fail GeometryError { code: NUMERIC_LIMIT }
   }
+  let pen = run prepareScaled(path, style, scale, tolerance)
   if !f64.isFinite(style.width * 0.5 * scale) {
     fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  return pen
+}
+
+effect fn prepareScaled(path: &Path, style: &Stroke, scale: f64, tolerance: f64) -> Pen
+  ! GeometryError {
+  if !(tolerance > 0.0) || !f64.isFinite(tolerance) || !(style.width >= 0.0)
+    || !f64.isFinite(style.width)
+    || !(style.miterLimit >= 1.0)
+    || !f64.isFinite(style.miterLimit)
+    || !f64.isFinite(style.dashOffset)
+    || style.join > JOIN_ARCS
+    || style.cap > CAP_SQUARE {
+    fail GeometryError { code: INVALID_INPUT }
   }
   let userTolerance = if scale > 0.0 {
     tolerance / scale

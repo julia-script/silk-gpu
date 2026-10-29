@@ -2,6 +2,7 @@
 import geometry
 import path
 import flatten
+import projective
 import strips
 import pixmap
 import stroke

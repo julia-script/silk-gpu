@@ -1,4 +1,7 @@
 import ellipse_tests
+import projective_tests
+import stroke_projective_tests
+import projective_paint_tests
 import silk.testing.testing { AssertionError, Testing }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }

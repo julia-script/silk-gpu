@@ -19,7 +19,24 @@ import silk.num.i32
 import silk.option { Option }
 import strips { Coverage, BAND, minU32 }
 import geometry { Affine, Point }
-import pixmap { Pixmap, Rgba8, div255, over, overPacked, overSpan, overMaskedFour, pack, unpack, scalePacked, storePacked, floorF64, truncateToI64, truncateF64ToU8 }
+import projective { Homography }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT }
+import pixmap {
+  Pixmap,
+  Rgba8,
+  div255,
+  over,
+  overPacked,
+  overSpan,
+  overMaskedFour,
+  pack,
+  unpack,
+  scalePacked,
+  storePacked,
+  floorF64,
+  truncateToI64,
+  truncateF64ToU8
+}
 import silk.simd.u8x16
 import silk.simd.u16x16
 import silk.simd.u32x4
@@ -86,6 +103,8 @@ pub struct Gradient {
   r1: f64,
   spread: u8,
   inverse: Affine,
+  projective: bool,
+  homography: Homography,
   valid: bool,
   /// True when the paint is the last stop color everywhere (a degenerate vector or radius).
   single: bool,
@@ -93,7 +112,162 @@ pub struct Gradient {
   ramp: List<u8>,
 }
 
-fn clamp01(value: f64) -> f64 { return f64.min(f64.max(value, 0.0), 1.0) }
+// Distinguish a singular map (SVG paint-none) from an unrepresentable inverse.
+effect fn paintInverse(h: &Homography) -> Option<Homography>
+  ! GeometryError {
+  if !h.isFinite() {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  if let Option<Homography>.Some { value: inverse } = h.inverse() {
+    return Option<Homography>.some(inverse)
+  }
+  let sx = f64.max(f64.abs(h.xx), f64.max(f64.abs(h.xy), f64.abs(h.xw)))
+  let sy = f64.max(f64.abs(h.yx), f64.max(f64.abs(h.yy), f64.abs(h.yw)))
+  let sw = f64.max(f64.abs(h.wx), f64.max(f64.abs(h.wy), f64.abs(h.ww)))
+  if sx == 0.0 || sy == 0.0 || sw == 0.0 {
+    return Option<Homography>.none()
+  }
+
+  // Only this failure path needs an exact determinant: cancellation in a
+  // floating determinant must not misclassify a nonsingular map as paint-none.
+  let scales = [rowPower(sx), rowPower(sy), rowPower(sw)]
+  let original = [h.xx, h.xy, h.xw, h.yx, h.yy, h.yw, h.wx, h.wy, h.ww]
+  let mut m: [f64; 9] = [0.0; 9]
+  let mut i: usize = 0
+  while i < 9 {
+    m[i] = original[i] / scales[i / 3]
+    if m[i] * scales[i / 3] != original[i] {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    i = i + 1
+  }
+  let permutations: [usize; 18] = [0, 4, 8, 1, 5, 6, 2, 3, 7, 2, 4, 6, 1, 3, 8, 0, 5, 7]
+  let mut expansion: [f64; 24] = [0.0; 24]
+  let mut length: usize = 0
+  i = 0
+  while i < 6 {
+    let a = m[permutations[i * 3]]
+    let b = m[permutations[i * 3 + 1]]
+    let c = m[permutations[i * 3 + 2]]
+      * if i < 3 {
+        1.0
+      } else {
+        -1.0
+      }
+    let ab = run exactPaintProduct(a, b)
+    let high = run exactPaintProduct(ab[0], c)
+    let low = run exactPaintProduct(ab[1], c)
+    length = addPaintExpansion(&mut expansion, length, low[1])
+    length = addPaintExpansion(&mut expansion, length, low[0])
+    length = addPaintExpansion(&mut expansion, length, high[1])
+    length = addPaintExpansion(&mut expansion, length, high[0])
+    i = i + 1
+  }
+  if length == 0 {
+    return Option<Homography>.none()
+  }
+  fail GeometryError { code: NUMERIC_LIMIT }
+}
+
+fn rowPower(maximum: f64) -> f64 {
+  let bits = f64.toBits(maximum) & 0x7ff0000000000000
+  return f64.fromBits(
+    if bits == 0 {
+      0x0010000000000000
+    } else {
+      bits
+    },
+  )
+}
+
+// Dekker's error-free product. The normalized operands are bounded by two;
+// refuse tiny intermediate products rather than losing their residual bits.
+effect fn exactPaintProduct(a: f64, b: f64) -> [f64; 2]
+  ! GeometryError {
+  if a == 0.0 || b == 0.0 {
+    return [0.0, 0.0]
+  }
+  let product = a * b
+  if f64.abs(product) < 1.0e-250 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let sa = 134217729.0 * a
+  let sb = 134217729.0 * b
+  let ah = sa - (sa - a)
+  let bh = sb - (sb - b)
+  let al = a - ah
+  let bl = b - bh
+  let error = ((ah * bh - product) + ah * bl + al * bh) + al * bl
+  return [product, error]
+}
+
+// Grow an exact nonoverlapping expansion, eliminating zero components.
+fn addPaintExpansion(e: &mut [f64; 24], length: usize, value: f64) -> usize {
+  let mut sum = value
+  let mut out: usize = 0
+  let mut i: usize = 0
+  while i < length {
+    let next = sum + e[i]
+    let virtual = next - sum
+    let error = (sum - (next - virtual)) + (e[i] - virtual)
+    if error != 0.0 {
+      e[out] = error
+      out = out + 1
+    }
+    sum = next
+    i = i + 1
+  }
+  if sum != 0.0 {
+    e[out] = sum
+    out = out + 1
+  }
+  return out
+}
+
+/// Canonical f32 inverse for native scene sampling: a b c d e f wx wy ww.
+/// Rejects lost nonzero coefficients, subnormals (WGSL may flush them), and
+/// singular rounded matrices. Common positive scaling preserves the mapping.
+/// This is an f32 sampling contract, not a browser byte-parity guarantee.
+pub effect fn packInverseHomography(h: &Homography) -> [f32; 9]
+  ! GeometryError {
+  if !h.isFinite() {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let values = [h.xx, h.yx, h.xy, h.yy, h.xw, h.yw, h.wx, h.wy, h.ww]
+  let mut scale = 0.0
+  let mut i: usize = 0
+  while i < 9 {
+    scale = f64.max(scale, f64.abs(values[i]))
+    i = i + 1
+  }
+  if scale == 0.0 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let mut packed: [f32; 9] = [0.0; 9]
+  let mut rounded: [f64; 9] = [0.0; 9]
+  i = 0
+  while i < 9 {
+    let value = values[i] / scale
+    let narrow = f64.toF32(value)
+    if !f32.isFinite(narrow) || (values[i] != 0.0 && f32.abs(narrow) < 1.17549435e-38) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    packed[i] = narrow
+    rounded[i] = f32.toF64(narrow)
+    i = i + 1
+  }
+  let a = rounded[0] * (rounded[3] * rounded[8] - rounded[5] * rounded[7])
+  let b = rounded[2] * (rounded[5] * rounded[6] - rounded[1] * rounded[8])
+  let c = rounded[4] * (rounded[1] * rounded[7] - rounded[3] * rounded[6])
+  if f64.abs(a + b + c) <= 7.105427357601002e-15 * (f64.abs(a) + f64.abs(b) + f64.abs(c)) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  return packed
+}
+
+fn clamp01(value: f64) -> f64 {
+  return f64.min(f64.max(value, 0.0), 1.0)
+}
 
 impl Gradient {
   fn make(kind: u8, x0: f64, y0: f64, r0: f64, x1: f64, y1: f64, r1: f64, spread: u8, transform: &Affine) -> Gradient {
@@ -104,8 +278,21 @@ impl Gradient {
       valid = true
     }
     return Gradient {
-      kind: kind, x0: x0, y0: y0, r0: r0, x1: x1, y1: y1, r1: r1, spread: spread, inverse: inverse,
-      valid: valid, single: false, premultipliedInterpolation: false, ramp: List<u8>.make(),
+      kind: kind,
+      x0: x0,
+      y0: y0,
+      r0: r0,
+      x1: x1,
+      y1: y1,
+      r1: r1,
+      spread: spread,
+      inverse: inverse,
+      projective: false,
+      homography: Homography.fromAffine(&inverse),
+      valid: valid,
+      single: false,
+      premultipliedInterpolation: false,
+      ramp: List<u8>.make(),
     }
   }
   /// A linear gradient from `(x1, y1)` to `(x2, y2)` in gradient space; `transform` maps gradient
@@ -123,6 +310,59 @@ impl Gradient {
     g.single = !(r > 0.0)
     return move g
   }
+
+  /// A linear gradient with true inverse homogeneous pixel-center mapping.
+  /// Singular transforms paint nothing; nonfinite or unrepresentable inverses fail explicitly.
+  pub effect fn linearProjective(
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+    spread: u8,
+    transform: &Homography,
+  ) -> Gradient
+    ! GeometryError {
+    let mut g = Gradient.linear(x1, y1, x2, y2, spread, &Affine.identity())
+    run g.setProjective(transform)
+    return move g
+  }
+
+  /// The SVG 2 two-circle radial gradient under a projective transform.
+  pub effect fn radialProjective(
+    cx: f64,
+    cy: f64,
+    r: f64,
+    fx: f64,
+    fy: f64,
+    fr: f64,
+    spread: u8,
+    transform: &Homography,
+  ) -> Gradient
+    ! GeometryError {
+    let mut g = Gradient.radial(cx, cy, r, fx, fy, fr, spread, &Affine.identity())
+    run g.setProjective(transform)
+    return move g
+  }
+
+  effect fn setProjective(self: &mut Self, transform: &Homography) -> ()
+    ! GeometryError {
+    self.projective = true
+    self.valid = false
+    if let Option<Homography>.Some { value: inverse } = run paintInverse(transform) {
+      self.homography = inverse
+      self.valid = true
+    }
+  }
+
+  pub fn isProjective(self: &Self) -> bool {
+    return self.projective
+  }
+
+  /// Device-to-paint homogeneous map; also valid for affine paints.
+  pub fn inverseHomography(self: &Self) -> Homography {
+    return self.homography
+  }
+
   /// Interpolate premultiplied colors (CSS Images 3) instead of straight colors (resvg, Skia's
   /// SVG default). Call before [`setStops`].
   pub fn setPremultipliedInterpolation(self: &mut Self, premultiplied: bool) -> () {
@@ -130,10 +370,20 @@ impl Gradient {
   }
   pub fn isRadial(self: &Self) -> bool { return self.kind == RADIAL }
   /// True when the gradient paints its last stop everywhere.
-  pub fn isSingle(self: &Self) -> bool { return self.single }
-  pub fn spreadMode(self: &Self) -> u8 { return self.spread }
-  /// The device-to-gradient-space transform.
-  pub fn inverseTransform(self: &Self) -> Affine { return self.inverse }
+  pub fn isSingle(self: &Self) -> bool {
+    return self.single
+  }
+
+  pub fn spreadMode(self: &Self) -> u8 {
+    return self.spread
+  }
+
+  /// Device-to-gradient transform for affine paints (`!isProjective()`).
+  /// Projective consumers must use [`inverseHomography`], including its denominator.
+  pub fn inverseTransform(self: &Self) -> Affine {
+    return self.inverse
+  }
+
   /// Linear: `x1 y1 0 x2 y2 0`. Radial: `fx fy fr cx cy r`.
   pub fn geometry(self: &Self) -> [f64; 6] { return [self.x0, self.y0, self.r0, self.x1, self.y1, self.r1] }
   /// The premultiplied RGBA8 ramp, [`RAMP_SIZE`] entries (empty before [`setStops`]).
@@ -256,13 +506,26 @@ with Intrinsic.inlineAlways() {
 }
 
 impl Shader for Gradient {
-  fn isUniform(self: &Self) -> bool { return !self.isPaintable() || self.single }
+  fn isUniform(self: &Self) -> bool {
+    return !self.isPaintable() || (self.single && !self.projective)
+  }
+
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8 {
     if !self.isPaintable() { return Rgba8.make(0, 0, 0, 0) }
     let ramp = self.ramp.asSlice()
     let mut index = RAMP_SIZE - 1
+    let device = Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5)
+    let mut p = Point.make(0.0, 0.0)
+    if self.projective {
+      if let Option<Point>.Some { value: mapped } = self.homography.project(device) {
+        p = mapped
+      } else {
+        return Rgba8.make(0, 0, 0, 0)
+      }
+    } else if !self.single {
+      p = self.inverse.apply(device)
+    }
     if !self.single {
-      let p = self.inverse.apply(Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5))
       let t = self.parameter(p)
       if t == NOTHING || !f64.isFinite(t) { return Rgba8.make(0, 0, 0, 0) }
       let s = spreadParameter(t, self.spread)
@@ -271,6 +534,14 @@ impl Shader for Gradient {
     return Rgba8 { r: ramp[index * 4], g: ramp[index * 4 + 1], b: ramp[index * 4 + 2], a: ramp[index * 4 + 3] }
   }
   fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    if self.projective {
+      let mut i: usize = 0
+      while i < count {
+        out[i] = pack(self.shade(x + usize.toU32(i), y))
+        i = i + 1
+      }
+      return
+    }
     if !self.isPaintable() || self.single {
       let word = pack(self.shade(x, y))
       let mut i: usize = 0
@@ -343,11 +614,15 @@ pub const EXTEND_REPEAT: u8 = 1
 ///
 /// Sampling runs in f32 with the same operations, in the same order, as the GPU scene shader
 /// (`gpu_scene/shaders/scene.wgsl`, `shadeImage`), on the inverse rounded to f32 as the GPU
-/// receives it. Native scene rendering requires strict shader math to preserve these rounding
-/// steps; standard browser WGSL arithmetic does not guarantee exact CPU image parity.
+/// receives it. Projective rows use explicit nested fused multiply-adds, so native
+/// backends cannot choose different contraction points. Native scene rendering
+/// also requires strict shader math; browser WGSL does not guarantee byte parity.
 pub struct ImagePattern<'a> {
   image: &'a Pixmap,
   inverse: Affine,
+  projective: bool,
+  homography: Homography,
+  denominator: [f32; 3],
   /// `inverse` in f32: a b c d e f.
   m: [f32; 6],
   valid: bool,
@@ -358,16 +633,81 @@ impl<'a> ImagePattern<'a> {
   pub fn make(image: &'a Pixmap, transform: &Affine, sampling: u8, extend: u8) -> ImagePattern<'a> {
     let mut inverse = Affine.identity()
     let mut valid = image.width() > 0 && image.height() > 0
-    if let Option<Affine>.Some { value: found } = transform.invert() { inverse = found } else { valid = false }
-    let m = [f64.toF32(inverse.a), f64.toF32(inverse.b), f64.toF32(inverse.c), f64.toF32(inverse.d), f64.toF32(inverse.e), f64.toF32(inverse.f)]
-    return ImagePattern { image: image, inverse: inverse, m: m, valid: valid, sampling: sampling, extend: extend }
+    if let Option<Affine>.Some { value: found } = transform.invert() {
+      inverse = found
+    } else {
+      valid = false
+    }
+    let m = [
+      f64.toF32(inverse.a),
+      f64.toF32(inverse.b),
+      f64.toF32(inverse.c),
+      f64.toF32(inverse.d),
+      f64.toF32(inverse.e),
+      f64.toF32(inverse.f),
+    ]
+    return ImagePattern {
+      image: image,
+      inverse: inverse,
+      m: m,
+      valid: valid,
+      sampling: sampling,
+      extend: extend,
+      projective: false,
+      homography: Homography.fromAffine(&inverse),
+      denominator: [0.0, 0.0, 1.0],
+    }
+  }
+
+  /// Borrows the original pixels, sampling through the inverse homogeneous map.
+  /// Uses the same checked f32 matrix and operation order as native strict-math WGSL.
+  /// Browser shader arithmetic does not promise byte parity.
+  pub effect fn makeProjective(
+    image: &'a Pixmap,
+    transform: &Homography,
+    sampling: u8,
+    extend: u8,
+  ) -> ImagePattern<'a>
+    ! GeometryError {
+    let mut pattern = ImagePattern.make(image, &Affine.identity(), sampling, extend)
+    pattern.projective = true
+    pattern.valid = false
+    if let Option<Homography>.Some { value: inverse } = run paintInverse(transform) {
+      let m = run packInverseHomography(&inverse)
+      pattern.homography = inverse
+      pattern.m = [m[0], m[1], m[2], m[3], m[4], m[5]]
+      pattern.denominator = [m[6], m[7], m[8]]
+      pattern.valid = image.width() > 0 && image.height() > 0
+    }
+    return move pattern
+  }
+
+  pub fn isProjective(self: &Self) -> bool {
+    return self.projective
+  }
+
+  pub fn inverseHomography(self: &Self) -> Homography {
+    return self.homography
   }
   /// The premultiplied image being placed.
-  pub fn pixmap(self: &Self) -> &'a Pixmap { return self.image }
-  /// The device-to-image-pixel transform.
-  pub fn inverseTransform(self: &Self) -> Affine { return self.inverse }
-  pub fn samplingMode(self: &Self) -> u8 { return self.sampling }
-  pub fn extendMode(self: &Self) -> u8 { return self.extend }
+  pub fn pixmap(self: &Self) -> &'a Pixmap {
+    return self.image
+  }
+
+  /// Device-to-image transform for affine paints (`!isProjective()`).
+  /// Projective consumers must use [`inverseHomography`], including its denominator.
+  pub fn inverseTransform(self: &Self) -> Affine {
+    return self.inverse
+  }
+
+  pub fn samplingMode(self: &Self) -> u8 {
+    return self.sampling
+  }
+
+  pub fn extendMode(self: &Self) -> u8 {
+    return self.extend
+  }
+
   /// False for an empty image or a non-invertible transform: the pattern paints nothing.
   pub fn isPaintable(self: &Self) -> bool { return self.valid }
   /// The column (or row, with `size` the height) for the integer-valued image coordinate `v`,
@@ -390,9 +730,35 @@ impl<'a> ImagePattern<'a> {
   with Intrinsic.inlineAlways() {
     let fx = u32.toF32(px) + 0.5
     let fy = u32.toF32(py) + 0.5
-    let x = self.m[0] * fx + self.m[2] * fy + self.m[4]
-    let y = self.m[1] * fx + self.m[3] * fy + self.m[5]
-    if !(f32.abs(x) <= 1.0e15) || !(f32.abs(y) <= 1.0e15) { return 0 }
+    let mut x: f32 = 0.0
+    let mut y: f32 = 0.0
+    if self.projective {
+      // Three rows in SIMD lanes: fma(yCoefficient, fy, fma(xCoefficient, fx, offset)).
+      // Explicit one-rounding operations match WGSL even on Metal, where a plain
+      // multiply/add expression can contract despite the module's strictMath flag.
+      let first = f32x4.mulAdd(
+        f32x4.fromArray([self.m[0], self.m[1], self.denominator[0], 0.0]),
+        f32x4.splat(fx),
+        f32x4.fromArray([self.m[4], self.m[5], self.denominator[2], 0.0]),
+      )
+      let mapped = f32x4.mulAdd(
+        f32x4.fromArray([self.m[2], self.m[3], self.denominator[1], 0.0]),
+        f32x4.splat(fy),
+        first,
+      )
+      let w = f32x4.extract(mapped, 2)
+      if w == 0.0 || !f32.isFinite(w) {
+        return 0
+      }
+      x = f32x4.extract(mapped, 0) / w
+      y = f32x4.extract(mapped, 1) / w
+    } else {
+      x = self.m[0] * fx + self.m[2] * fy + self.m[4]
+      y = self.m[1] * fx + self.m[3] * fy + self.m[5]
+    }
+    if !(f32.abs(x) <= 1.0e15) || !(f32.abs(y) <= 1.0e15) {
+      return 0
+    }
     let w = u32.toF32(self.image.width())
     let h = u32.toF32(self.image.height())
     if self.sampling == SAMPLE_NEAREST { return self.word(self.wrap(floorF32(x), w), self.wrap(floorF32(y), h)) }
@@ -469,7 +835,7 @@ impl<'a> Shader for ImagePattern<'a> {
   }
   fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
     let mut i: usize = 0
-    if self.valid && self.sampling == SAMPLE_BILINEAR {
+    if self.valid && !self.projective && self.sampling == SAMPLE_BILINEAR {
       while i + 4 <= count {
         if !self.sampleFour(x + usize.toU32(i), y, &mut out, i) { break }
         i = i + 4
