@@ -172,15 +172,15 @@ run's times are in parentheses:
 
 | Filter | vector ms | resvg ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| blur4 | 6.8 (19.7) | 31.0 | 0.22x | 3.0% |
-| blur16 | 7.0 (19.8) | 30.7 | 0.23x | 11% |
-| saturate | 4.1 (13.6) | 7.3 | 0.55x | 0% |
-| dilate3 | 1.3 (24.0) | 18.2 | 0.07x | 11% |
-| gamma | 2.3 (2.7) | 28.3 | 0.08x | 0% |
-| sharpen | 12.5 (48.3) | 16.5 | 0.76x | 0% |
-| turbulence | 49.6 (116.7) | 74.5 | 0.66x | 0% |
-| lighting | 7.9 (17.7) | 10.4 | 0.76x | 0% |
-| displace | 2.0 (6.5) | 6.5 | 0.31x | 96% |
+| blur4 | 6.7 (19.7) | 32.4 | 0.21x | 3.0% |
+| blur16 | 6.9 (19.8) | 28.0 | 0.25x | 11% |
+| saturate | 2.1 (13.6) | 7.3 | 0.28x | 0% |
+| dilate3 | 1.3 (24.0) | 22.4 | 0.06x | 11% |
+| gamma | 2.5 (2.7) | 29.8 | 0.08x | 0% |
+| sharpen | 7.9 (48.3) | 18.1 | 0.44x | 0% |
+| turbulence | 32.2 (116.7) | 77.5 | 0.42x | 0% |
+| lighting | 4.8 (17.7) | 14.3 | 0.34x | 0% |
+| displace | 2.1 (6.5) | 6.3 | 0.33x | 96% |
 
 Image differences on blur, dilate and displace are resvg's choices (its box sizes, a `2 r` window
 and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the details.

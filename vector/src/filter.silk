@@ -27,7 +27,7 @@ import silk.simd.i32x4
 import silk.simd.f32x4
 import silk.num.usize
 import strips { minU32 }
-import pixmap { Pixmap, Rgba8, div255 }
+import pixmap { Pixmap, Rgba8, div255, truncateToU8, truncateF64ToU8, truncateToI64 }
 import layer as layering
 import geometry { Affine, Point }
 
@@ -310,7 +310,7 @@ pub fn matrixPixel(c: Rgba8, m: [f32; 20]) -> Rgba8 with Intrinsic.inlineAlways(
 fn clamp01(v: f32) -> f32 with Intrinsic.inlineAlways() { return f32.min(f32.max(v, 0.0), 1.0) }
 /// `floor(v * 255 + 0.5)` for `v` in `0 ..= 1`, where the floor is the conversion's truncation
 /// (x86-64's baseline has no SSE4.1 round, so an explicit floor is a dozen instructions).
-fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() { return f32.toU8(v * 255.0 + 0.5) }
+fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() { return truncateToU8(v * 255.0 + 0.5) }
 
 /// The passes of an `feGaussianBlur` along one axis with standard deviation `sigma` (device
 /// pixels): three box blurs for `sigma >= 2` as the spec prescribes, else one kernel of
@@ -850,7 +850,8 @@ impl ComponentTransfer {
   }
 }
 
-fn transferByte(v: f64) -> u8 with Intrinsic.inlineAlways() { return f64.toU8(f64.floor(f64.min(f64.max(v, 0.0), 1.0) * 255.0 + 0.5)) }
+/// The conversion truncates, which is the floor for these non-negative values.
+fn transferByte(v: f64) -> u8 with Intrinsic.inlineAlways() { return truncateF64ToU8(f64.min(f64.max(v, 0.0), 1.0) * 255.0 + 0.5) }
 
 /// `type="identity"`.
 pub fn transferIdentity() -> [u8; 256] {
@@ -1259,6 +1260,9 @@ pub struct Turbulence {
   latticeList: List<u32>,
   /// `(channel * 514 + index) * 2 + component`.
   gradientList: List<f64>,
+  /// The same gradients as `(index * 2 + component) * 4 + channel`, for the CPU's four
+  /// channels at once.
+  quadList: List<f64>,
 }
 
 fn nextRandom(seed: i64) -> i64 {
@@ -1314,7 +1318,20 @@ impl Turbulence {
       }
       i = i + 1
     }
-    return Turbulence { latticeList: move lattice, gradientList: move gradients }
+    let mut quads = List<f64>.make()
+    run quads.appendRepeated(0.0, 4 * LATTICE * 2)
+    let q = quads.asMutSlice()
+    i = 0
+    while i < LATTICE {
+      k = 0
+      while k < 4 {
+        q[(i * 2) * 4 + k] = g[(k * LATTICE + i) * 2]
+        q[(i * 2 + 1) * 4 + k] = g[(k * LATTICE + i) * 2 + 1]
+        k = k + 1
+      }
+      i = i + 1
+    }
+    return Turbulence { latticeList: move lattice, gradientList: move gradients, quadList: move quads }
   }
   /// The permutation, 514 entries.
   pub fn lattice(self: &Self) -> &[u32] { return self.latticeList.asSlice() }
@@ -1324,13 +1341,15 @@ impl Turbulence {
   /// The spec's `noise2` for all four channels at once: the lattice cell and its weights do not
   /// depend on the channel, so they are found once.
   fn noise4(self: &Self, vx: f64, vy: f64, stitch: &Stitch, width: i64, height: i64, wrapX: i64, wrapY: i64) -> [f64; 4] with Intrinsic.inlineAlways() {
+    // The conversion truncates, and converting back is exact, so these are the spec's
+    // `(int)t` and `t - (int)t` without a separate trunc.
     let tx = vx + i64.toF64(PERLIN_N)
-    let mut bx0 = f64.toI64(f64.trunc(tx))
-    let rx0 = tx - f64.trunc(tx)
+    let mut bx0 = truncateToI64(tx)
+    let rx0 = tx - i64.toF64(bx0)
     let rx1 = rx0 - 1.0
     let ty = vy + i64.toF64(PERLIN_N)
-    let mut by0 = f64.toI64(f64.trunc(ty))
-    let ry0 = ty - f64.trunc(ty)
+    let mut by0 = truncateToI64(ty)
+    let ry0 = ty - i64.toF64(by0)
     let ry1 = ry0 - 1.0
     // Compared before masking (resvg and browsers do; SVG 1.1's listing masks first, which
     // turns stitching off).
@@ -1353,16 +1372,19 @@ impl Turbulence {
     let b11 = u32.toUsize(l[j + y1])
     let sx = rx0 * rx0 * (3.0 - 2.0 * rx0)
     let sy = ry0 * ry0 * (3.0 - 2.0 * ry0)
-    let g = self.gradientList.asSlice()
+    let q = self.quadList.asSlice()
+    let g00 = Slice.view(q, b00 * 8, 8)
+    let g10 = Slice.view(q, b10 * 8, 8)
+    let g01 = Slice.view(q, b01 * 8, 8)
+    let g11 = Slice.view(q, b11 * 8, 8)
     let mut result: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
     let mut channel: usize = 0
     while channel < 4 {
-      let base = channel * LATTICE
-      let u0 = rx0 * g[(base + b00) * 2] + ry0 * g[(base + b00) * 2 + 1]
-      let v0 = rx1 * g[(base + b10) * 2] + ry0 * g[(base + b10) * 2 + 1]
+      let u0 = rx0 * g00[channel] + ry0 * g00[4 + channel]
+      let v0 = rx1 * g10[channel] + ry0 * g10[4 + channel]
       let a = u0 + sx * (v0 - u0)
-      let u1 = rx0 * g[(base + b01) * 2] + ry1 * g[(base + b01) * 2 + 1]
-      let v1 = rx1 * g[(base + b11) * 2] + ry1 * g[(base + b11) * 2 + 1]
+      let u1 = rx0 * g01[channel] + ry1 * g01[4 + channel]
+      let v1 = rx1 * g11[channel] + ry1 * g11[4 + channel]
       let b = u1 + sx * (v1 - u1)
       result[channel] = a + sy * (b - a)
       channel = channel + 1
@@ -1375,7 +1397,8 @@ impl Turbulence {
     let mut vx = x * stitch.frequencyX
     let mut vy = y * stitch.frequencyY
     let mut sum: [f64; 4] = [0.0, 0.0, 0.0, 0.0]
-    let mut ratio = 1.0
+    // Dividing by the power-of-two ratio is exact, so multiplying by its inverse is the same.
+    let mut inverse = 1.0
     let mut width = stitch.width
     let mut height = stitch.height
     let mut wrapX = stitch.wrapX
@@ -1385,12 +1408,12 @@ impl Turbulence {
       let n = self.noise4(vx, vy, stitch, width, height, wrapX, wrapY)
       let mut c: usize = 0
       while c < 4 {
-        sum[c] = sum[c] + (if settings.fractalNoise { n[c] } else { f64.abs(n[c]) }) / ratio
+        sum[c] = sum[c] + (if settings.fractalNoise { n[c] } else { f64.abs(n[c]) }) * inverse
         c = c + 1
       }
       vx = vx * 2.0
       vy = vy * 2.0
-      ratio = ratio * 2.0
+      inverse = inverse * 0.5
       width = width * 2
       wrapX = 2 * wrapX - PERLIN_N
       height = height * 2
