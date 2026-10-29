@@ -25,6 +25,22 @@ All reproductions below use the published **0.1.0-dev.27+323ceb59e7ee** compiler
 - Impact: native Windows build and runtime acceptance remain blocked, despite the available pinned Dawn Windows library. Platform-specific surface code is not evidence of Windows execution.
 - No fallback compiler, local compiler rebuild, or success-skipping Windows CI is used.
 
+## LIMITATION-4 — Mixed callback invocation modes
+
+- Report: [silk-lang/silk#2546](https://github.com/silk-lang/silk/issues/2546), including a standalone reproducer.
+- Observed: one foreign declaration cannot combine `deferredCallbacks` and `threadCallbacks`; even disjoint direct callback parameters fail with SEM0187. This is the published dev.27 rule, not an undocumented compiler behavior.
+- Workaround: two typed C boundaries. The first writes the spontaneous error callback into the device descriptor under `threadCallbacks`; the second installs the lost callback and requests the device under `deferredCallbacks`. Raw-pointer descriptor traversal remains the binding author's responsibility. No callback is falsely declared immediate or weakened to an untyped address.
+- Measured bridge cost: LLVM 22.1.8 `-O2`, macOS arm64, emits 2 instructions for the error setter and 13 for the request bridge including its Dawn call. The latter uses 64 stack bytes and copies the 40-byte completion-info argument; neither helper allocates. These are bridge-body disassembly counts, not caller-inclusive Ir or wall-time overhead. Both run once per device request, outside frame hot loops.
+- Sites: `webgpu/src/runtime.silk`, `webgpu/native/callbacks.c`, `scripts/_build.py`.
+
+## LIMITATION-5 — Apple linker compact-unwind personality limit
+
+- Report: [silk-lang/silk#2547](https://github.com/silk-lang/silk/issues/2547).
+- Observed: the macOS26 hosted ABI executable link fails with 25 distinct internal `___silk_foreign_personality` routines plus Dawn's C++ personality, exceeding the compact-unwind format's three-personality limit. A two-line standalone `getpid` package retains 25 internal personality symbols; its reduced link succeeds on the older local Apple ld 1167.4.1, so the upstream report distinguishes the reduced duplication evidence from the observed hosted link failure.
+- Workaround: use unmodified LLVM 22 `ld64.lld`, which preserves the Silk DWARF FDEs rather than promoting their personalities into the compact table. No foreign-unwind guards or unwind metadata are disabled. Silk resolves linker symlinks to generic `lld`, so the build helper caches an unchanged executable named `ld64.lld` with the original library-directory layout.
+- Measured: local LLD-linked ABI probe passes all 92 record layouts and 202 linked symbols; the native Metal ownership/mapping/validation/cancellation test passes in 2.05 seconds. Hosted results are recorded separately in CI; no instruction-count overhead claim.
+- Site: `scripts/_build.py:darwin_linker`.
+
 ## Browser callback ABI
 
 The browser backend uses explicit callback tokens and exported completion functions rather than assuming access to an exported wasm function table. This is an ABI design, **not** a demonstrated compiler limitation: a minimal native-function-pointer invocation compiled successfully to wasm32 on dev.27.

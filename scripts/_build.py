@@ -42,6 +42,7 @@ def callback_archive(clang, dawn):
 
 def darwin_linker(clang):
     """Keep LLVM's Mach-O driver name through Silk's executable realpath resolution."""
+    # LIMITATION-5: https://github.com/silk-lang/silk/issues/2547
     candidates = (clang.parent / "ld64.lld", Path("/opt/homebrew/opt/lld/bin/ld64.lld"),
                   Path("/usr/local/opt/lld/bin/ld64.lld"))
     source = next((path.resolve() for path in candidates if path.is_file()), None)

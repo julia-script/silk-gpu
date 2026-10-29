@@ -1,4 +1,5 @@
 import { WebGPUHost } from './host.ts';
+import { schema } from './generated_schema.ts';
 
 // Playwright serializes Error.message/stack, but not AggregateError.errors.
 // Keep all nested diagnostics in the thrown message at the browser boundary.
@@ -23,10 +24,18 @@ export async function runCanvas(wasmBytes, timeout = 30000) {
   document.body.append(canvas);
   const errors = [];
   const host = new WebGPUHost();
+  // Preserve the browser's scoped validation message before Silk turns the
+  // failed Result into the sample's status code. Always deliver the real callback.
+  const scopeCallback = host.callbacks.get(4);
+  host.registerCallback(4, (status, type, data, length, userdata1, userdata2) => {
+    if (status !== schema.constants.WGPUPopErrorScopeStatus_Success || type !== schema.constants.WGPUErrorType_NoError)
+      errors.push(`Canvas error scope (status ${status}, type ${type}): ${host.string(data, length)}`);
+    host.call(scopeCallback, status, type, data, length, userdata1, userdata2);
+  });
   let token = 0;
   let instance;
   let closed = false;
-  const failure = () => errors.length ? errors.join('\n') : 'compiled Silk canvas operation failed';
+  const failure = () => [...errors, ...host.failures].join('\n') || 'compiled Silk canvas operation failed';
   const cleanup = async () => {
     if (closed) return;
     closed = true;

@@ -1,3 +1,10 @@
+# Silk WebGPU
+
+Native Dawn and browser `navigator.gpu` bindings for Silk. `webgpu_sys` is the
+generated unsafe C layer; `webgpu` owns resources and supplies borrowed descriptors,
+typed failures, asynchronous requests, and host-owned surfaces. Samples, GLFW,
+and benchmarks are separate development packages. No scene renderer is included.
+
 ## Implementation selection
 
 The native implementation is **[Dawn v20261027.184652](https://github.com/google/dawn/releases/tag/v20261027.184652)**, commit `106704a9ac3fc21b1580ea85aea302ac17d416f1`. The binding uses the stable [`webgpu.h` schema at `a1dc77409bb2b8bd80540cbf4b8db219e123e909`](https://github.com/webgpu-native/webgpu-headers/tree/a1dc77409bb2b8bd80540cbf4b8db219e123e909), not Dawn's extension API. No implementation is built from source during installation.
@@ -49,25 +56,35 @@ WEBGPU_HOME=$(scripts/install-webgpu)
 
 | Native host | Silk dev.27 release | Dawn release | Current prerequisite |
 | --- | --- | --- | --- |
-| macOS arm64 | Available | Available | LLVM 22 and Apple SDK |
+| macOS arm64 | Available | Available | macOS 26+, LLVM 22 and Apple SDK |
 | macOS x86_64 | Not published | Available | Published native Silk compiler required |
 | Linux x86_64 | Available | Available | LLVM 22, C++ runtime, Vulkan loader and GPU driver (lavapipe for headless software rendering) |
 | Linux aarch64 | Available | Not published | Matching stable-header Dawn binary required; no implicit switch to wgpu-native |
 | Windows x86_64 | Not published | Available | Published native Silk compiler and supported Windows target required; MSVC/Windows SDK for Dawn |
 | Windows aarch64 | Not published | Not published | Published Silk and Dawn binaries required |
 
-Dawn's archive labels identify the upstream build runners, not a guaranteed minimum OS version. Cross-platform runtime support is not inferred merely from an archive being present. `toolchains.lock.json` also records available wgpu-native Linux/macOS/Windows binaries for reproducible comparison, not as an automatic fallback.
+Dawn's archive labels identify upstream build runners, not a guaranteed minimum OS version. The selected arm64 archive's Mach-O objects specify macOS 26.0; native helper compilation uses the same deployment target. Cross-platform runtime support is not inferred merely from an archive being present. `toolchains.lock.json` also records available wgpu-native Linux/macOS/Windows binaries for reproducible comparison, not as an automatic fallback.
 
 Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Link the host C++ runtime as well. Windows uses the MSVC archive and SDK libraries listed in the release's `lib/cmake/Dawn/DawnTargets.cmake`. No unverified cross-platform build or test success is claimed here.
+
+macOS builds use LLVM 22's `ld64.lld` with the active Apple SDK. Install `lld`
+alongside a supplied Homebrew Clang (`brew install llvm lld`); the pinned full LLVM
+distribution already includes it. The build helper preserves the Mach-O driver's
+executable name and DWARF unwind metadata. This avoids the hosted Apple linker's
+compact-unwind personality limit without disabling foreign-unwind guards; see
+[LIMITATION-5](LIMITATIONS.md#limitation-5--apple-linker-compact-unwind-personality-limit).
 
 ### Reproducible checks and CI
 
 `python3 scripts/check` is the PR gate: raw bindings, browser glue and embedded
-WGSL freshness, `silkc check --workspace`, native lifetime/readback/validation
-scenarios, and all six pixel samples. `--skip-native` runs only freshness and
-workspace checks; `--browser` adds compiled wasm sample execution. Native
-compiles run sequentially. `scripts/test-browser` builds `examples` for
-`wasm32-unknown-unknown` and invokes the real browser harness.
+WGSL freshness, `silkc check --workspace`, compiled C/Silk ABI comparison,
+native lifetime/readback/validation scenarios, and all six pixel samples.
+`scripts/test-abi` compares the size and alignment of every one of the 92 raw
+records against Dawn's C headers and links all 202 native functions.
+`--skip-native` runs only freshness and workspace checks; `--browser` adds compiled
+wasm sample and canvas execution. Native compiles run sequentially.
+`scripts/test-browser` builds `examples` for `wasm32-unknown-unknown` and invokes
+the real browser harness.
 
 The PR workflow uses the explicitly supported
 [`ubuntu-26.04` x86_64 runner](https://github.com/actions/runner-images/issues/14747),
@@ -77,9 +94,13 @@ also installs `lld-22`. `scripts/setup-ci` requires that exact Clang version
 and fails on an image change instead of silently downloading a 1.9 GB toolchain.
 Silk, Dawn, downloaded LLVM distributions, schema inputs, and download caches
 are keyed by platform and lockfile hashes. The preinstalled runner LLVM needs
-no separate cache. Every PR job has a **15-minute timeout**; a timeout is failure,
-not proof that a cold successful run fits the budget. Hosted-runner timings
-have not yet been measured.
+no separate cache. Every PR job has a **15-minute timeout**. The
+[complete phase-5 Linux gate](https://github.com/julia-script/silk-gpu/actions/runs/40795554783)
+passed in **76 seconds** of job time (**80 seconds** from run creation to completion),
+with an explicit cache miss. It checked all six packages, generated freshness,
+92 C/Silk record layouts and 202 linked functions, native scenarios, and all six
+pixel samples on pinned lavapipe. This cold result uses preinstalled LLVM 22.1.2,
+not a download of the 1.9 GB LLVM distribution.
 
 Linux tests explicitly select **Mesa lavapipe 26.0.8-1ubuntu0.3**.
 `scripts/ci-lock.json` pins the 19,109,714-byte amd64 `.deb` from Ubuntu's
@@ -106,16 +127,57 @@ fails when it cannot install a real native Silk compiler. Windows is blocked by
 as successful native coverage. This diagnostic intentionally keeps the
 scheduled workflow red until the upstream platform prerequisite is resolved.
 
+## Safe API and callback ownership
+
+Owned handles release exactly one native reference on `Drop`; `dup()` explicitly
+adds a reference. Borrowed handle entries and descriptor slices do not retain or
+allocate. Descriptor `with…` methods consume the builder and retain the input
+lifetime; scalar `set…` methods mutate stack state. Pass encoders borrow their
+parent encoder and are consumed when ended. Ordinary C-layout wrapper limitations
+and their checked array conversions are documented in [LIMITATIONS.md](LIMITATIONS.md).
+
+Native asynchronous operations offer a blocking convenience call and a
+`…Start` request with `poll()` / consuming `finish()`. Browser callers use the
+start/poll path; blocking waits are rejected. Adapter/device requests, mapping,
+queue completion, error-scope results, compilation information, and asynchronous
+pipeline creation use stable heap result slots—not borrowed stack locals.
+Callbacks copy transient messages before returning. Native request destruction
+drains completion; browser destruction unregisters completion before freeing its slot.
+
+Device errors and loss share a synchronized mailbox. Releasing the last native
+device reference only *readies* its loss callback: mailbox destruction waits for
+delivery before freeing userdata, including failed device creation. The native
+regression exercises that failure followed by event pumping under `MallocScribble=1`.
+The two small C helpers in `webgpu/native/callbacks.c` expose the descriptor's
+otherwise pointer-hidden callbacks: uncaptured errors use `threadCallbacks`,
+loss and request completion use `deferredCallbacks`. `scripts/_build.py` compiles
+and links their cached archive; external build integrations must link it too.
+See [the mixed-mode compiler limitation](LIMITATIONS.md#limitation-4--mixed-callback-invocation-modes).
+
+Failures use `GpuError` with an operation-specific native status/type and an owned
+message. Use `pushErrorScope` / `popErrorScope` to turn expected validation errors
+into typed failures, and `Device.checkErrors()` to observe uncaptured errors or
+unexpected loss. Debug diagnostics retain a failure count after teardown, so a
+late callback cannot disappear with its device. Expected destruction/cancellation
+is not treated as unexpected loss.
+
+`MappedBuffer` supplies checked copies and unmaps on drop; raw mapped pointers
+remain unsafe-only. `mapRead` returns owned readback bytes. Adapter/device info,
+feature lists, limits, and WGSL language features are available through owned
+capability snapshots with borrowed views. `GetProcAddress` remains in the raw
+layer rather than pretending arbitrary native addresses are safe callables.
+
 ## Surfaces and the dev-only GLFW example
 
 `webgpu.surface` accepts host-owned Metal layers, Wayland display/surface pairs,
 X11 display/window pairs, Win32 HWND/HINSTANCE pairs, and browser canvas selectors
 or ids. Native `SurfaceTarget` constructors are unsafe: the caller must supply
 valid handles, keep their owning host object alive, and honor its thread affinity.
-Each constructor borrows that owner; safe `Surface.create` borrows the typed
-target. `Surface` owns one WebGPU reference, releases it on drop, and explicitly
-duplicates it with `dup()`. Surface capability arrays are freed on drop; their
-slices cannot outlive their owner. Acquired frames contain an owned safe `Texture`.
+Each constructor borrows that owner; safe `Surface.create` retains the target's
+host-owner lifetime without extending the temporary `SurfaceTarget` storage borrow.
+`Surface` owns one WebGPU reference, releases it on drop, and explicitly duplicates
+it with `dup()`. Capability arrays are freed on drop; their slices cannot outlive
+their owner. Acquired frames contain an owned safe `Texture`.
 Surfaces, duplicated references, and acquired textures participate in their
 instance's debug live-handle accounting; release builds erase the counters.
 Configuration and resize use a borrowed device and view-format slice without a
@@ -146,6 +208,12 @@ than modifying the pinned generated core schema. Selectors use `querySelector`;
 ids use `getElementById`, with host canvas registration available for offscreen
 canvases.
 
+The macOS GLFW example was exercised on a real Metal window: visible clear,
+resize, minimize/restore, and Escape teardown with exit status zero. The compiled
+wasm canvas scenario configures 64×64, resizes to 96×48, checks compositor pixels,
+then requires clean handle/allocation/future teardown. It was also opened and
+visually inspected in installed Chromium; no browser errors were recorded.
+
 ## Headless samples and pixel fixtures
 
 `examples/` is the `gpu_examples` package. It runs six 64×64 cases without a
@@ -169,8 +237,9 @@ device loss, failed readback, or incorrect compute value fails the process.
 The compute check compares all 4,096 full-width integers to `3*i+7`; the PNG
 visualizes their low two bytes and is not a substitute for the buffer check.
 Debug builds also retain an independent diagnostics observer for each sample
-and require zero live owned GPU handles after its session is dropped. Release
-builds erase these counters; run the default debug pixel command for leak checks.
+and require zero live owned GPU handles and zero uncaptured-error/loss reports
+after its session is dropped. Release builds erase these counters; use the
+default debug pixel command for leak and late-callback failure checks.
 
 Small expected PNGs live in `tests/pixels/expected/`. Their independent CPU
 oracle uses pixel-space triangle half-planes, rectangle-and-circle membership,
@@ -221,3 +290,39 @@ The six compiled Silk samples have been exercised in installed Chromium through
 `browser/test.mjs`: all PNG comparisons, compute values, validation checks, and
 handle/allocation cleanup checks passed. The harness never substitutes JavaScript
 implementations of sample rendering.
+
+## CPU-side benchmarks
+
+`bench/` implements the same checked workloads in Silk, C against the same pinned
+Dawn binary, and Rust `wgpu` 30.0.1 with a committed Cargo lockfile. Each workload
+validates readback and requires equal peer checksums before accepting a timing.
+The timer covers encode/write and submit, not device/pipeline setup, GPU completion,
+or checked readback. Two warmup frames precede measurement.
+
+```sh
+scripts/bench --build --frames 20 --repeats 7 --n 10000 --record-baseline
+scripts/bench --compare old-results.json new-results.json
+# Linux with Valgrind installed:
+BENCH_CALLGRIND=1 scripts/bench --build --build-only
+scripts/ab .cache/bench/c .cache/bench/silk
+```
+
+The committed [wall baseline](bench/results/baseline.json) records actual samples,
+toolchains, shader/Cargo hashes, and executable hashes on macOS 27.0.1 arm64.
+These are medians of seven interleaved runs, twenty frames per run; values are
+**microseconds per frame**. Draw/write/bind cases use 10,000 operations; rectangle
+cases issue one instanced draw with the stated instance count.
+
+| Workload | Silk / Dawn | C / Dawn | Rust / wgpu |
+| --- | ---: | ---: | ---: |
+| 10k draws | 1,196.10 | 1,087.35 | 1,044.27 |
+| 10k buffer writes | 8,466.60 | 4,630.50 | 130,891.35 |
+| 10k bind-group switches | 6,793.45 | 6,500.85 | 5,954.62 |
+| 10k instanced rounded rectangles | 91.70 | 83.30 | 85.25 |
+| 100k instanced rounded rectangles | 101.60 | 86.55 | 85.80 |
+
+This shared-workstation wall baseline is noisy and does **not** establish the
+few-percent instruction-count target or prove allocation freedom. Rust uses a
+different WebGPU implementation, so its timings are a peer comparison, not
+isolated Silk wrapper overhead. Retain the raw samples rather than interpreting
+a single ratio as compiler quality.
