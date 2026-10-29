@@ -1,0 +1,7 @@
+[package]
+name = "vector_bench"
+version = "0.1.0"
+silk-version = "0.1.0-dev.27+323ceb59e7ee"
+
+[dependencies]
+vector = { path = "../vector" }

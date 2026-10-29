@@ -36,6 +36,11 @@ jobs:
         run: python3 scripts/bench --build-only
       - name: Measure five checked C and Silk workloads
         run: python3 scripts/ab .cache/bench/c .cache/bench/silk --n 10000 --frames 3 --repeats 3
+      - name: Time vector against tiny-skia and compare their images
+        run: |
+          set -o pipefail
+          mkdir -p .cache/bench/ab
+          python3 scripts/bench-vector | tee .cache/bench/ab/vector.txt
       - name: Retain instruction counts, binary hashes and allocator call trees
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

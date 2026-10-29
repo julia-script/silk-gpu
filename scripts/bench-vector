@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Time vector against tiny-skia on the shared CPU workloads and compare their images.
+
+Not part of the PR gate: it builds tiny-skia with cargo and takes about a minute.
+See bench/vector/WORKLOADS.md for the scenes.
+"""
+import subprocess
+from pathlib import Path
+
+from _build import ROOT, build
+
+OUT = ROOT / ".cache" / "bench" / "vector"
+SCENES = ("fills", "strokes", "gradients", "polygon")
+
+
+def timings(command):
+    completed = subprocess.run([str(c) for c in command], cwd=OUT, check=True, capture_output=True, text=True, timeout=600)
+    result = {}
+    for line in completed.stderr.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] in SCENES:
+            result[parts[0]] = float(parts[1])
+    return result
+
+
+def difference(name):
+    a = (OUT / f"vector-{name}.rgba").read_bytes()
+    b = (OUT / f"tiny-skia-{name}.rgba").read_bytes()
+    deltas = [abs(x - y) for x, y in zip(a, b)]
+    pixels = len(a) // 4
+    over = sum(1 for i in range(pixels) if max(deltas[i * 4:i * 4 + 4]) > 8)
+    return sum(deltas) / len(deltas), max(deltas), over / pixels
+
+
+OUT.mkdir(parents=True, exist_ok=True)
+silk = build(ROOT / "vector_bench", release=True)
+crate = ROOT / "bench" / "vector" / "tiny-skia"
+subprocess.run(["cargo", "build", "--release", "--quiet", "--manifest-path", str(crate / "Cargo.toml"),
+                "--target-dir", str(ROOT / ".cache" / "bench" / "vector-rust")], check=True)
+rust = ROOT / ".cache" / "bench" / "vector-rust" / "release" / "vector-bench-tiny-skia"
+ours = timings([silk])
+theirs = timings([rust, 20])
+print(f"{'scene':<10} {'vector ms':>10} {'tiny-skia ms':>13} {'ratio':>7}   image: mean |d|  max |d|  pixels > 8")
+for name in SCENES:
+    mean, worst, share = difference(name)
+    print(f"{name:<10} {ours[name]:>10.3f} {theirs[name]:>13.3f} {ours[name] / theirs[name]:>6.2f}x   {mean:>13.3f} {worst:>8} {share:>10.2%}")
