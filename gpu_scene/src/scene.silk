@@ -1,0 +1,133 @@
+//! A recorded scene: coverage runs, their alphas and paints, packed in the GPU layouts that
+//! `shaders/scene.wgsl` reads.
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import vector.strips { Coverage, BAND }
+import vector.pixmap { Rgba8 }
+import vector.paint { Gradient }
+
+/// Bytes per run record: x, y, width, alpha word index (or SOLID_RUN), paint word index, opacity.
+pub const RUN_BYTES: usize = 24
+/// Words per paint record.
+pub const PAINT_WORDS: u32 = 16
+const SOLID_RUN: u32 = 0xffffffff
+
+pub struct Scene {
+  canvasWidth: u32,
+  canvasHeight: u32,
+  runBytes: List<u8>,
+  alphaBytes: List<u8>,
+  paintBytes: List<u8>,
+  rampBytes: List<u8>,
+}
+
+effect fn pushU32(bytes: &mut List<u8>, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+  run bytes.append(u32.toU8(value & 255))
+  run bytes.append(u32.toU8(u32.shiftRight(value, 8) & 255))
+  run bytes.append(u32.toU8(u32.shiftRight(value, 16) & 255))
+  run bytes.append(u32.toU8(u32.shiftRight(value, 24)))
+}
+
+effect fn pushF32(bytes: &mut List<u8>, value: f64) -> () ! OutOfMemoryError ? &mut Allocator {
+  run pushU32(&mut bytes, f32.toBits(f64.toF32(value)))
+}
+
+fn pack(c: Rgba8) -> u32 {
+  return u8.toU32(c.r) | u32.shiftLeft(u8.toU32(c.g), 8) | u32.shiftLeft(u8.toU32(c.b), 16) | u32.shiftLeft(u8.toU32(c.a), 24)
+}
+
+impl Scene {
+  pub fn make(width: u32, height: u32) -> Scene {
+    return Scene {
+      canvasWidth: width, canvasHeight: height, runBytes: List<u8>.make(), alphaBytes: List<u8>.make(),
+      paintBytes: List<u8>.make(), rampBytes: List<u8>.make(),
+    }
+  }
+  pub fn width(self: &Self) -> u32 { return self.canvasWidth }
+  pub fn height(self: &Self) -> u32 { return self.canvasHeight }
+  pub fn runCount(self: &Self) -> u32 { return usize.toU32(self.runBytes.length() / RUN_BYTES) }
+  pub fn runs(self: &Self) -> &[u8] { return self.runBytes.asSlice() }
+  pub fn alphas(self: &Self) -> &[u8] { return self.alphaBytes.asSlice() }
+  pub fn paints(self: &Self) -> &[u8] { return self.paintBytes.asSlice() }
+  pub fn ramps(self: &Self) -> &[u8] { return self.rampBytes.asSlice() }
+  pub fn clear(self: &mut Self) -> () {
+    self.runBytes.clear()
+    self.alphaBytes.clear()
+    self.paintBytes.clear()
+    self.rampBytes.clear()
+  }
+
+  /// Draws `coverage` with a straight-alpha `color`, like `Pixmap.fillCoverage` or
+  /// `paint.fill` with a `Solid`, scaled by `opacity`.
+  pub effect fn fill(self: &mut Self, coverage: &Coverage, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    let paint = usize.toU32(self.paintBytes.length() / 4)
+    run pushU32(&mut self.paintBytes, 0)
+    run pushU32(&mut self.paintBytes, pack(color.premultiply()))
+    let mut i: u32 = 2
+    while i < PAINT_WORDS {
+      run pushU32(&mut self.paintBytes, 0)
+      i = i + 1
+    }
+    run self.addRuns(coverage, paint, opacity)
+  }
+
+  /// Draws `coverage` with `gradient`, like `paint.fill`. An unpaintable gradient draws nothing.
+  pub effect fn fillGradient(self: &mut Self, coverage: &Coverage, gradient: &Gradient, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !gradient.isPaintable() { return }
+    let paint = usize.toU32(self.paintBytes.length() / 4)
+    let rampStart = usize.toU32(self.rampBytes.length() / 4)
+    run self.rampBytes.appendSlice(gradient.rampBytes())
+    run pushU32(&mut self.paintBytes, if gradient.isRadial() { 2 } else { 1 })
+    run pushU32(&mut self.paintBytes, rampStart)
+    run pushU32(&mut self.paintBytes, u8.toU32(gradient.spreadMode()))
+    run pushU32(&mut self.paintBytes, if gradient.isSingle() { 1 } else { 0 })
+    let m = gradient.inverseTransform()
+    run pushF32(&mut self.paintBytes, m.a)
+    run pushF32(&mut self.paintBytes, m.b)
+    run pushF32(&mut self.paintBytes, m.c)
+    run pushF32(&mut self.paintBytes, m.d)
+    run pushF32(&mut self.paintBytes, m.e)
+    run pushF32(&mut self.paintBytes, m.f)
+    let g = gradient.geometry()
+    let mut i: usize = 0
+    while i < 6 {
+      run pushF32(&mut self.paintBytes, g[i])
+      i = i + 1
+    }
+    run self.addRuns(coverage, paint, opacity)
+  }
+
+  effect fn addRuns(self: &mut Self, coverage: &Coverage, paint: u32, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    if opacity == 0 { return }
+    let fills = coverage.fills()
+    let mut f: usize = 0
+    while f < fills.length {
+      let span = fills[f]
+      run self.addRun(span.x, span.y, span.width, SOLID_RUN, paint, opacity)
+      f = f + 1
+    }
+    let alphaBase = usize.toU32(self.alphaBytes.length() / 4)
+    run self.alphaBytes.appendSlice(coverage.alphas())
+    let strips = coverage.strips()
+    let mut s: usize = 0
+    while s < strips.length {
+      let strip = strips[s]
+      run self.addRun(strip.x, strip.y, strip.width, alphaBase + strip.alphaOffset / BAND, paint, opacity)
+      s = s + 1
+    }
+  }
+
+  effect fn addRun(self: &mut Self, x: u32, y: u32, width: u32, alpha: u32, paint: u32, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run pushU32(&mut self.runBytes, x)
+    run pushU32(&mut self.runBytes, y)
+    run pushU32(&mut self.runBytes, width)
+    run pushU32(&mut self.runBytes, alpha)
+    run pushU32(&mut self.runBytes, paint)
+    run pushU32(&mut self.runBytes, u8.toU32(opacity))
+  }
+}

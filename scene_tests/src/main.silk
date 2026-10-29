@@ -1,0 +1,236 @@
+//! Renders the same scenes with vector's CPU pixmap and with gpu_scene, then compares bytes.
+//! Solid paints must match exactly. Gradients evaluate their parameter in f32 on the GPU and
+//! f64 on the CPU, so a pixel may land one ramp entry apart; adjacent entries differ by at most a
+//! few levels, which the gradient tolerance allows (lavapipe currently matches exactly).
+import webgpu.runtime { Instance, RequestAdapterOptions, Device, GpuError }
+import webgpu.runtime as runtime
+import webgpu.resources as gpu
+import webgpu.resources { Queue }
+import webgpu.descriptors {
+  DeviceDescriptor, BufferDescriptor, TextureDescriptor, TextureViewDescriptor, Extent3D,
+  TexelCopyTextureInfo, TexelCopyBufferInfo, TexelCopyBufferLayout,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.io.writer_native { StderrWriter }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.collections.list { List }
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import silk.num.i32
+import silk.num.f64
+import vector.geometry { Affine, Rect }
+import vector.path { Path }
+import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
+import vector.stroke { Stroke, Stroker, JOIN_ROUND, JOIN_MITER_CLIP, CAP_ROUND, CAP_SQUARE }
+import vector.pixmap { Pixmap, Rgba8 }
+import vector.paint { Gradient, Stop, Solid, SPREAD_PAD, SPREAD_REFLECT, SPREAD_REPEAT }
+import vector.paint as painting
+import gpu_scene.scene { Scene }
+import gpu_scene.renderer { SceneRenderer, FORMAT }
+
+const WIDTH: u32 = 128
+const HEIGHT: u32 = 96
+
+struct Canvas {
+  cpu: Pixmap,
+  scene: Scene,
+  raster: Rasterizer,
+  stroker: Stroker,
+  coverage: Coverage,
+}
+
+impl Canvas {
+  effect fn make() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+    let mut cpu = run Pixmap.make(WIDTH, HEIGHT)
+    cpu.clear(background())
+    return Canvas { cpu: move cpu, scene: Scene.make(WIDTH, HEIGHT), raster: Rasterizer.make(), stroker: Stroker.make(), coverage: Coverage.make(WIDTH, HEIGHT) }
+  }
+  effect fn fill(self: &mut Self, path: &Path, transform: &Affine, rule: u8, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.raster.fill(path, transform, rule, &mut self.coverage)
+    painting.fill(&mut self.cpu, &self.coverage, &Solid.make(color), opacity)
+    run self.scene.fill(&self.coverage, color, opacity)
+  }
+  effect fn stroke(self: &mut Self, path: &Path, style: &Stroke, transform: &Affine, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut outline = Path.make()
+    run self.stroker.stroke(path, style, transform, &mut outline)
+    run self.fill(&outline, transform, NONZERO, color, opacity)
+  }
+  effect fn fillGradient(self: &mut Self, path: &Path, transform: &Affine, gradient: &Gradient, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.raster.fill(path, transform, NONZERO, &mut self.coverage)
+    painting.fill(&mut self.cpu, &self.coverage, gradient, opacity)
+    run self.scene.fillGradient(&self.coverage, gradient, opacity)
+  }
+}
+
+fn background() -> Rgba8 { return Rgba8.make(250, 248, 240, 255) }
+
+effect fn star(cx: f64, cy: f64, outer: f64, inner: f64) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut p = Path.make()
+  let mut i: u32 = 0
+  while i < 10 {
+    let angle = u32.toF64(i) * 3.141592653589793 / 5.0 - 1.5707963267948966
+    let r = if i % 2 == 0 { outer } else { inner }
+    let x = cx + r * f64.cos(angle)
+    let y = cy + r * f64.sin(angle)
+    if i == 0 { run p.moveTo(x, y) } else { run p.lineTo(x, y) }
+    i = i + 1
+  }
+  run p.close()
+  return move p
+}
+
+effect fn solids() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+  let mut c = run Canvas.make()
+  let id = Affine.identity()
+  let mut rect = Path.make()
+  run rect.rect(Rect.make(6.25, 5.5, 50.0, 30.75))
+  run c.fill(&rect, &id, NONZERO, Rgba8.make(220, 40, 30, 255), 255)
+  let mut circle = Path.make()
+  run circle.circle(48.0, 40.0, 26.3)
+  run c.fill(&circle, &id, NONZERO, Rgba8.make(20, 90, 230, 160), 255)
+  let s = run star(96.0, 46.0, 34.0, 14.0)
+  run c.fill(&s, &id, EVENODD, Rgba8.make(30, 160, 80, 255), 200)
+  let mut style = Stroke.make(3.5)
+  style.join = JOIN_ROUND
+  style.cap = CAP_ROUND
+  run c.stroke(&s, &style, &id, Rgba8.make(10, 10, 10, 255), 255)
+  let mut wave = Path.make()
+  run wave.moveTo(4.0, 80.0)
+  run wave.cubicTo(30.0, 50.0, 50.0, 110.0, 80.0, 74.0)
+  run wave.quadTo(100.0, 50.0, 124.0, 86.0)
+  let mut dashed = Stroke.make(5.0)
+  dashed.cap = CAP_SQUARE
+  dashed.join = JOIN_MITER_CLIP
+  run dashed.setDashes(&[9.0, 4.0, 2.0])
+  dashed.dashOffset = 3.0
+  run c.stroke(&wave, &dashed, &id, Rgba8.make(200, 120, 0, 230), 255)
+  // A rotated, skewed square exercises transformed coverage.
+  let mut small = Path.make()
+  run small.rect(Rect.make(-8.0, -8.0, 16.0, 16.0))
+  let m = Affine.translate(20.0, 60.0).then(&Affine.rotate(0.6)).then(&Affine.scale(1.0, 0.6))
+  run c.fill(&small, &m, NONZERO, Rgba8.make(120, 0, 160, 255), 128)
+  return move c
+}
+
+effect fn gradients() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+  let mut c = run Canvas.make()
+  let id = Affine.identity()
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(255, 60, 0, 255) }, Stop { offset: 0.45, color: Rgba8.make(255, 220, 0, 200) },
+    Stop { offset: 0.45, color: Rgba8.make(0, 140, 255, 255) }, Stop { offset: 1.0, color: Rgba8.make(40, 0, 120, 255) },
+  ]
+  let mut whole = Path.make()
+  run whole.rect(Rect.make(0.0, 0.0, 128.0, 48.0))
+  let mut linear = Gradient.linear(10.0, 0.0, 70.0, 20.0, SPREAD_REFLECT, &id)
+  run linear.setStops(&stops)
+  run c.fillGradient(&whole, &id, &linear, 255)
+  let mut disk = Path.make()
+  run disk.circle(40.0, 70.0, 24.0)
+  let mut radial = Gradient.radial(40.0, 70.0, 24.0, 32.0, 62.0, 2.0, SPREAD_PAD, &id)
+  run radial.setStops(&stops)
+  run c.fillGradient(&disk, &id, &radial, 255)
+  let mut box = Path.make()
+  run box.rect(Rect.make(72.0, 50.0, 52.0, 42.0))
+  let skew = Affine.translate(98.0, 71.0).then(&Affine.rotate(0.4))
+  let mut repeat = Gradient.radial(0.0, 0.0, 9.0, 0.0, 0.0, 0.0, SPREAD_REPEAT, &skew)
+  run repeat.setStops(&stops)
+  run c.fillGradient(&box, &id, &repeat, 220)
+  return move c
+}
+
+fn extent(width: u32, height: u32) -> Extent3D {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  return size
+}
+
+effect fn renderOnGpu(device: &Device, queue: &Queue, renderer: &SceneRenderer, scene: &Scene) -> List<u8> ! GpuError | OutOfMemoryError {
+  let mut descriptor = TextureDescriptor.default().withLabel(b"scene target")
+  descriptor.setSize(extent(WIDTH, HEIGHT))
+  descriptor.setFormat(FORMAT)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(1)
+  descriptor.setUsage(flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  let texture = run gpu.createTexture(device, &descriptor)
+  let view = run texture.createView(&TextureViewDescriptor.default())
+  run renderer.render(device, queue, scene, &view, background())
+  let size = u32.toUsize(WIDTH * HEIGHT * 4)
+  let readback = run gpu.createBuffer(device, &BufferDescriptor.make(b"scene readback", usize.toU64(size), flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead, false))
+  let mut encoder = run gpu.createCommandEncoder(device, b"scene readback")
+  let source = TexelCopyTextureInfo.default().withTexture(&texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(WIDTH * 4)
+  layout.setRowsPerImage(HEIGHT)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(WIDTH, HEIGHT))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"scene readback")
+  queue.submit(&[commands.reference()])
+  run device.checkErrors()
+  return run runtime.mapRead(device, &readback, 0, size)
+}
+
+/// Prints the comparison and returns whether it is within `tolerance` per channel.
+fn compare(name: string<'static>, cpu: &[u8], gpu: &[u8], tolerance: i32) -> bool {
+  if cpu.length != gpu.length {
+    StderrWriter.print("{}: size mismatch\n", &(name,))
+    return false
+  }
+  let mut differing: u32 = 0
+  let mut worst: i32 = 0
+  let mut i: usize = 0
+  while i < cpu.length {
+    let d = u8.toI32(cpu[i]) - u8.toI32(gpu[i])
+    let a = if d < 0 { 0 - d } else { d }
+    if a != 0 { differing = differing + 1 }
+    if a > worst { worst = a }
+    i = i + 1
+  }
+  StderrWriter.print("{}: {} of {} channels differ; max channel delta {}\n", &(name, differing, usize.toU32(cpu.length), worst))
+  return worst <= tolerance
+}
+
+/// Guards against a vacuous pass: the scene must have painted many pixels.
+fn painted(name: string<'static>, cpu: &[u8], minimum: u32) -> bool {
+  let b = background().premultiply()
+  let mut count: u32 = 0
+  let mut i: usize = 0
+  while i < cpu.length {
+    if cpu[i] != b.r || cpu[i + 1] != b.g || cpu[i + 2] != b.b { count = count + 1 }
+    i = i + 4
+  }
+  if count < minimum { StderrWriter.print("{}: only {} pixels painted\n", &(name, count)) }
+  return count >= minimum
+}
+
+effect fn program() -> i32 ! GpuError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let instance = run Instance.create()
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let queue = run gpu.getQueue(&device)
+  let renderer = run SceneRenderer.make(&device)
+  let solid = run solids() |> Effect.provideMut<Allocator>(&mut allocator)
+  let solidGpu = run renderOnGpu(&device, &queue, &renderer, &solid.scene)
+  let gradient = run gradients() |> Effect.provideMut<Allocator>(&mut allocator)
+  let gradientGpu = run renderOnGpu(&device, &queue, &renderer, &gradient.scene)
+  let solidOk = compare("solids", solid.cpu.data(), solidGpu.asSlice(), 0)
+  let gradientOk = compare("gradients", gradient.cpu.data(), gradientGpu.asSlice(), 2)
+  let drawn = painted("solids", solid.cpu.data(), 4000) && painted("gradients", gradient.cpu.data(), 8000)
+  return if solidOk && gradientOk && drawn { 0 } else { 1 }
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  StderrWriter.print("scene test failed with a GPU or allocation error\n", &())
+  return 2
+}
+
+pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }

@@ -12,7 +12,8 @@ pixel parity.
 | Package | Role | Depends on |
 | --- | --- | --- |
 | `vector` | Pure Silk, no GPU: geometry, paths, flattening, stroking, coverage strips, paints, CPU reference pixmap | stdlib only |
-| `gpu_scene` (planned) | Uploads strips and paints, records the paint and composite passes | `vector`, `webgpu` |
+| `gpu_scene` | Packs strips, alphas and paints into storage buffers and draws them in one instanced render pass | `vector`, `webgpu` |
+| `scene_tests` | Renders the same scenes on the CPU and the GPU and compares bytes (`scripts/test-scene`, in the gate) | all of the above |
 
 `vector` has no WebGPU dependency, so an SVG renderer, a test suite or a headless tool can use it
 without Dawn.
@@ -75,6 +76,16 @@ without Dawn.
    paths become masks from coverage and intersect by multiplication; `mask` content becomes a
    mask from its alpha or its luminance (CSS Masking coefficients 0.2125, 0.7154, 0.0721 on
    premultiplied values). `fillClipped` draws a path through a clip without a layer.
+
+8. **GPU** (`gpu_scene`): a `Scene` records each coverage as runs (one instance per strip or fill:
+   x, y, width, alpha word index or solid, paint index, opacity) plus the coverage alphas (one
+   `u32` per column), paint records and gradient ramps. `SceneRenderer.render` uploads them and
+   draws `6 x runs` vertices in one pass on an RGBA8Unorm target. The fragment shader masks the
+   premultiplied paint with the same integer `div255` as the CPU, and the blend unit's
+   `One, OneMinusSrcAlpha` computes `s + d (1 - as)`, which for unorm8 equals the CPU's
+   `s + div255(d (255 - as))`, so solid fills match the CPU pixmap byte for byte. Gradients use
+   the same formulas in f32. Layers (offscreen targets for groups, masks and blend modes) and
+   image paints come next; buffers are recreated per frame for now.
 
 ## Planned work
 
