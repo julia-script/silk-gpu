@@ -11,7 +11,7 @@ args = parser.parse_args()
 # (shader directory, Silk module, shader names)
 sets = (
     ('examples/shaders', 'examples/src/generated_shaders.silk', ('clear', 'triangle', 'textured-quad', 'instanced-rects', 'compute', 'msaa')),
-    ('gpu_scene/shaders', 'gpu_scene/src/generated_shaders.silk', ('scene',)),
+    ('gpu_scene/shaders', 'gpu_scene/src/generated_shaders.silk', ('scene', 'compose')),
 )
 stale = []
 for directory, module, names in sets:

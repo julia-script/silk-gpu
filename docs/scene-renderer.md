@@ -47,8 +47,9 @@ without Dawn.
 5. **Strips**: the canvas is cut into bands of 4 rows aligned to y = 0. Within each band, a pixel
    column is empty, solid or partial. Runs of partial columns become a `Strip` with 4 alpha bytes
    per column, stored column major so a column is one `u32` on the GPU. Runs of solid columns
-   become a `Fill`, which carries no alphas. Lines are binned into bands with a counting sort, and
-   only the path's bounding box is visited.
+   become a `Fill`, which carries no alphas. Every line is accumulated once into an area buffer
+   covering the path's bounding box; each band then resolves only the columns a line touched (an
+   untouched column repeats the one before it) and zeroes the cells it read for the next path.
 6. **Paint and composite** (CPU: `vector.pixmap` and `vector.paint`; GPU: `gpu_scene`): each
    strip or fill is drawn with its paint, a `Shader` that returns the premultiplied color at a
    device pixel center. Paints carry one transform from their own space to device space (callers
@@ -84,8 +85,20 @@ without Dawn.
    premultiplied paint with the same integer `div255` as the CPU, and the blend unit's
    `One, OneMinusSrcAlpha` computes `s + d (1 - as)`, which for unorm8 equals the CPU's
    `s + div255(d (255 - as))`, so solid fills match the CPU pixmap byte for byte. Gradients use
-   the same formulas in f32. Layers (offscreen targets for groups, masks and blend modes) and
-   image paints come next; buffers are recreated per frame for now.
+   the same formulas in f32. Image paints (`Scene.fillImage`) append the image's texels to the
+   ramp buffer and sample them like `ImagePattern` (nearest or bilinear, clamp or repeat). Buffers
+   are recreated per frame for now.
+
+9. **GPU layers** (`gpu_scene`): `Scene.pushLayer` starts a group, `popLayer(mode, opacity,
+   mask)` composites it onto its parent, and `popMask(kind, clip)` turns the group into a mask
+   (alpha or luminance, optionally multiplied by another mask, as `Mask.intersect` does) and
+   returns its id. A scene with layers renders into textures: one for the root, one per group and
+   mask, and one for a copy of the parent. Popping a group copies its parent and draws a
+   full-target pass of `shaders/compose.wgsl` that computes `vector.layer`'s compositing on the
+   bytes (integer source-over for `normal`, the same f32 formulas for the other modes), and the
+   root is copied to the target at the end. The scene test renders all 16 blend modes, a
+   luminance mask through a clip, and image patterns, and matches the CPU byte for byte on lavapipe. Textures are
+   allocated per render; pooling them is future work.
 
 ## Planned work
 

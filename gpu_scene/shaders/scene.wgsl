@@ -34,11 +34,51 @@ fn unpack(c: u32) -> vec4u {
 
 fn word(p: u32, i: u32) -> f32 { return bitcast<f32>(paints[p + i]); }
 
-// Paint records are 16 words: kind (0 solid, 1 linear, 2 radial), color or ramp start, spread,
-// single, the device-to-gradient inverse a b c d e f, then x0 y0 r0 x1 y1 r1.
+// Image paints (kind 3): texel start in `ramps`, width, height, the device-to-image inverse
+// a b c d e f, sampling (0 nearest, 1 bilinear), extend (0 clamp, 1 repeat).
+fn texel(p: u32, x: f32, y: f32) -> vec4u {
+  let w = f32(paints[p + 2u]);
+  let h = f32(paints[p + 3u]);
+  var tx = 0.0;
+  var ty = 0.0;
+  if paints[p + 11u] == 1u {
+    // Rounding can land exactly on w or h; keep the index inside the image.
+    tx = min(x - w * floor(x / w), w - 1.0);
+    ty = min(y - h * floor(y / h), h - 1.0);
+  } else {
+    tx = clamp(x, 0.0, w - 1.0);
+    ty = clamp(y, 0.0, h - 1.0);
+  }
+  let index = u32(ty) * paints[p + 2u] + u32(tx);
+  return unpack(ramps[paints[p + 1u] + index]);
+}
+
+fn bilerp(a: vec4u, b: vec4u, c: vec4u, d: vec4u, wx: f32, wy: f32) -> vec4u {
+  let top = vec4f(a) + (vec4f(b) - vec4f(a)) * wx;
+  let bottom = vec4f(c) + (vec4f(d) - vec4f(c)) * wx;
+  return vec4u(floor(top + (bottom - top) * wy + 0.5));
+}
+
+fn shadeImage(p: u32, pixel: vec2u) -> vec4u {
+  let fx = f32(pixel.x) + 0.5;
+  let fy = f32(pixel.y) + 0.5;
+  let x = word(p, 4u) * fx + word(p, 6u) * fy + word(p, 8u);
+  let y = word(p, 5u) * fx + word(p, 7u) * fy + word(p, 9u);
+  if abs(x) > 1.0e15 || abs(y) > 1.0e15 || x != x || y != y { return vec4u(0u); }
+  if paints[p + 10u] == 0u { return texel(p, floor(x), floor(y)); }
+  let x0 = floor(x - 0.5);
+  let y0 = floor(y - 0.5);
+  let wx = x - 0.5 - x0;
+  let wy = y - 0.5 - y0;
+  return bilerp(texel(p, x0, y0), texel(p, x0 + 1.0, y0), texel(p, x0, y0 + 1.0), texel(p, x0 + 1.0, y0 + 1.0), wx, wy);
+}
+
+// Paint records are 16 words: kind (0 solid, 1 linear, 2 radial, 3 image), color or ramp start,
+// spread, single, the device-to-gradient inverse a b c d e f, then x0 y0 r0 x1 y1 r1.
 fn shade(p: u32, pixel: vec2u) -> vec4u {
   let kind = paints[p];
   if kind == 0u { return unpack(paints[p + 1u]); }
+  if kind == 3u { return shadeImage(p, pixel); }
   var index = 1023u;
   if paints[p + 3u] == 0u {
     let fx = f32(pixel.x) + 0.5;
