@@ -1,7 +1,7 @@
 [package]
 name = "webgpu"
 version = "0.1.0"
-silk-version = "0.1.0-dev.27+323ceb59e7ee"
+silk-version = "0.1.0-dev.29+94cf9559bf47"
 kind = "library"
 exports = ["runtime", "resources", "descriptors", "surface", "diagnostics", "capabilities", "host_memory"]
 

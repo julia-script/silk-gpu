@@ -11,7 +11,7 @@ import silk.num.u32
 import geometry { Point, Affine, Rect }
 import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
 import path { Path, MOVE, LINE, QUAD, CUBIC, CLOSE, ARC }
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub const TOLERANCE: f64 = 0.25
 

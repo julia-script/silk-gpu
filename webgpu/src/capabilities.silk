@@ -15,7 +15,7 @@ import runtime { Adapter, Device, Instance, GpuError }
 import descriptors { Limits }
 import silk.core.ownership { Copy, Drop }
 import silk.mem.pointer { Pointer }
-import silk.option { Option }
+import silk.core.option { Option }
 
 const EMPTY_FEATURES: [u32; 0] = []
 

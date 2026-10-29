@@ -1,7 +1,7 @@
 //! Points, rectangles and 2D affine transforms in user space (f64).
 import silk.core.ownership { Copy }
 import silk.num.f64
-import silk.option { Option }
+import silk.core.option { Option }
 
 pub struct Point {
   pub x: f64,
