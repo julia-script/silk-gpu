@@ -115,10 +115,23 @@ fn polygon(target: &mut Pixmap) {
     target.fill_path(&path, &solid(20, 40, 160, 255), FillRule::EvenOdd, Transform::identity(), None);
 }
 
+fn icons(target: &mut Pixmap) {
+    let mut random = Random(7);
+    for i in 0..4000 {
+        let (cx, cy, size) = (random.next() * 512.0, random.next() * 512.0, 2.0 + random.next() * 10.0);
+        let (r, g, b) = (random.byte(), random.byte(), random.byte());
+        let mut pb = PathBuilder::new();
+        if i % 2 == 0 { circle(&mut pb, cx, cy, size) } else { star(&mut pb, cx, cy, size, size * 0.4) }
+        let path = pb.finish().unwrap();
+        target.fill_path(&path, &solid(r, g, b, 255), FillRule::Winding, Transform::identity(), None);
+    }
+}
+
 fn main() {
     let frames: usize = std::env::args().nth(1).and_then(|v| v.parse().ok()).unwrap_or(20);
     let mut target = Pixmap::new(512, 512).unwrap();
-    let scenes: [(&str, fn(&mut Pixmap)); 4] = [("fills", fills), ("strokes", strokes), ("gradients", gradients), ("polygon", polygon)];
+    let scenes: [(&str, fn(&mut Pixmap)); 5] =
+        [("fills", fills), ("strokes", strokes), ("gradients", gradients), ("polygon", polygon), ("icons", icons)];
     for (name, draw) in scenes {
         let mut times = Vec::new();
         for _ in 0..frames {
