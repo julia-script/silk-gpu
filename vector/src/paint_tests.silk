@@ -28,6 +28,7 @@ import paint { Shader }
 import pixmap { pack }
 import silk.num.usize
 import geometry_error { GeometryError }
+import projective { Homography }
 
 fn close(a: u8, b: u8, tolerance: i32) -> bool {
   let d = u8.toI32(a) - u8.toI32(b)
@@ -444,4 +445,37 @@ test effect fn explicitSrgbRampMatchesBothLegacyAlphaModes() -> ()
     }
     mode = mode + 1
   }
+}
+
+// Reusing a paint across SVG instances must not retain the preceding inverse or
+// require rebuilding its color ramp after a singular instance.
+test effect fn gradientTransformUpdatesRetainColorsAndRecoverFromSingularMaps() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut gradient = Gradient.linear(0.0, 0.0, 4.0, 0.0, SPREAD_PAD, &Affine.identity())
+  run blackToWhite(&mut gradient) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(Shader.shade(&gradient, 0, 0).r == 32, "initial paint-space sample")
+  let mut affine = Affine.identity()
+  affine.e = 2.0
+  gradient.setTransform(&affine)
+  run Testing.expect(
+    Shader.shade(&gradient, 0, 0).r == 0,
+    "updated affine inverse translates the ramp",
+  )
+  let mut projective = Homography.fromAffine(&Affine.identity())
+  projective.wx = 0.25
+  run gradient.setProjective(&projective)
+  run Testing.expect(
+    Shader.shade(&gradient, 0, 0).r == 36,
+    "updated projective inverse divides by w",
+  )
+  projective.xx = 0.0
+  run gradient.setProjective(&projective)
+  run Testing.expect(Shader.shade(&gradient, 0, 0).a == 0, "singular instance paints transparently")
+  gradient.setTransform(&Affine.identity())
+  run Testing.expect(
+    !gradient.isProjective() && Shader.shade(&gradient, 0, 0).r == 32
+      && Shader.shade(&gradient, 0, 0).a == 255,
+    "affine instance recovers validity and uses the existing ramp",
+  )
 }

@@ -145,6 +145,9 @@ without Dawn.
      back to sRGB and premultiplies. No intermediate linear RGBA8 quantization loses dark
      channels. Both interpolation choices default to false; disabling linearRGB retains the
      existing sRGB ramp bytes. The ramp stays the same sRGB RGBA8 payload on CPU and GPU.
+     `setTransform` and `setProjective` update only the inverse mapping, retaining the ramp
+     without allocation. A singular instance paints transparently; a later invertible mapping
+     restores painting. A failed projective numeric check leaves that paint invalid.
    - Image patterns: nearest or bilinear sampling of a premultiplied pixmap, clamped (for
      `image`, clipped by its rectangle) or repeated (pattern tiles). Affine CPU sampling is f32
      with separately rounded operations on the inverse rounded to f32, four pixels per step.

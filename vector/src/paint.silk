@@ -386,7 +386,22 @@ impl Gradient {
     return move g
   }
 
-  effect fn setProjective(self: &mut Self, transform: &Homography) -> ()
+  /// Changes the paint-to-device map without allocating or rebuilding the ramp.
+  /// A singular map paints transparently; a later invertible map restores painting.
+  pub fn setTransform(self: &mut Self, transform: &Affine) -> () {
+    self.projective = false
+    self.valid = false
+    self.inverse = Affine.identity()
+    if let Option<Affine>.Some { value: inverse } = transform.invert() {
+      self.inverse = inverse
+      self.valid = true
+    }
+    self.homography = Homography.fromAffine(&self.inverse)
+  }
+
+  /// Projective counterpart of `setTransform`. A failed numeric check leaves the
+  /// paint invalid; the ramp is retained and either setter can restore validity.
+  pub effect fn setProjective(self: &mut Self, transform: &Homography) -> ()
     ! GeometryError {
     self.projective = true
     self.valid = false
