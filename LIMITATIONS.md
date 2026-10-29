@@ -41,19 +41,18 @@ All reproductions below use the published **0.1.0-dev.27+323ceb59e7ee** compiler
 - Measured: local LLD-linked ABI probe passes all 92 record layouts and 202 linked symbols; the native Metal ownership/mapping/validation/cancellation test passes in 2.05 seconds. Hosted results are recorded separately in CI; no instruction-count overhead claim.
 - Site: `scripts/_build.py:darwin_linker`.
 
-## LIMITATION-6 — Float-to-integer conversions run a software trunc
+## LIMITATION-6 — Float-to-integer conversions run a software trunc (fixed in dev.29)
 
-- Report: [silk-lang/silk#2561](https://github.com/silk-lang/silk/issues/2561).
-- Observed: on baseline x86-64 (SSE2), every stdlib `f32`/`f64` to integer conversion and `floor`/`ceil` runs a software trunc before its range check, about 25 extra instructions per call.
-- Workaround: `vector.pixmap.truncateToU8`, `truncateF64ToU8`, `truncateToI64` and `floorF64` call `Intrinsic.f*To*` with a range check on the raw value; the rasterizer truncates non-negative values directly where the floor is needed.
-- Sites: `vector/src/pixmap.silk`, `vector/src/strips.silk`, `vector/src/filter.silk`, `vector/src/paint.silk`.
+- Report: [silk-lang/silk#2561](https://github.com/silk-lang/silk/issues/2561), fixed by silk#2562 in dev.29.
+- Observed on dev.27: on baseline x86-64 (SSE2), every stdlib `f32`/`f64` to integer conversion and `floor`/`ceil` ran a software trunc before its range check, about 25 extra instructions per call.
+- Status: the local `truncateToU8`, `truncateF64ToU8`, `truncateToI64`, `floorF64` and `floorF32` helpers are gone; the stdlib conversions measure the same (filter bench 11.71 G Ir either way, vector bench +0.1%). The rasterizer still truncates non-negative values to `u32` directly where it needs a floor.
 
 ## LIMITATION-7 — `f32.min`/`f32.max` compile to branch chains
 
 - Report: [silk-lang/silk#2566](https://github.com/silk-lang/silk/issues/2566).
-- Observed: the stdlib's NaN- and signed-zero-ordering `min`/`max` cost 16 Ir per clamp against 3 for plain selects (`minss`/`maxss`).
-- Workaround: `vector/src/strips.silk` uses select-based `minF32`/`maxF32`; its lines are always finite, so the values are the same. Measured with the faster float-to-u32 conversions in the same change: on the icons benchmark `Rasterizer.fill` went from 1.42 G to 1.25 G Ir and `pushClipped` from 131 M to 68 M, with byte-identical output.
-- Site: `vector/src/strips.silk`.
+- Observed: the stdlib's NaN- and signed-zero-ordering `min`/`max` cost 16 Ir per clamp against 3 for plain selects (`minss`/`maxss`). silk#2567 (dev.29) brings that to 7.9 Ir; swapping the helpers for `f32.min`/`f32.max` still adds 0.5% Ir to the vector bench, so they stay.
+- Workaround: `vector/src/strips.silk` and `vector/src/paint.silk` use select-based `minF32`/`maxF32`; its lines are always finite, so the values are the same. Measured with the faster float-to-u32 conversions in the same change: on the icons benchmark `Rasterizer.fill` went from 1.42 G to 1.25 G Ir and `pushClipped` from 131 M to 68 M, with byte-identical output.
+- Sites: `vector/src/strips.silk`, `vector/src/paint.silk`.
 
 ## LIMITATION-8 — Portable inverse tangent missing
 
