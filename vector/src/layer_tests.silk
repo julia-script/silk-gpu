@@ -6,6 +6,7 @@ import silk.num.i32
 import geometry { Affine, Rect }
 import path { Path }
 import strips { Rasterizer, Coverage, NONZERO }
+import geometry_error { GeometryError }
 import pixmap { Pixmap, Rgba8 }
 import paint { Solid }
 import layer {
@@ -94,7 +95,8 @@ test effect fn masksFromContent() -> () ! AssertionError<'static> | OutOfMemoryE
   run Testing.expect(same(target.pixel(1, 0), 128, 128, 128, 128), "masked group")
 }
 
-test effect fn clipsIntersectAndLimitFills() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn clipsIntersectAndLimitFills() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut raster = Rasterizer.make()
   let mut left = Path.make()

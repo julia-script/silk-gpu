@@ -14,6 +14,7 @@ import silk.core.ownership { Copy }
 import silk.collections.list { List }
 import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
+import geometry_error { GeometryError }
 import silk.num.f32
 import silk.num.f64
 import silk.num.u8
@@ -24,7 +25,7 @@ import silk.simd.f32x4
 import silk.simd.i32x4
 import silk.simd.u8x16
 import silk.simd.u32x4
-import geometry { Affine }
+import geometry { Affine, Rect }
 import path { Path }
 import flatten { Line, TOLERANCE }
 import flatten as flattening
@@ -148,18 +149,26 @@ impl Rasterizer {
   }
 
   /// Replaces `out` with the coverage of `path` under `transform` with fill rule `rule`.
-  pub effect fn fill(self: &mut Self, path: &Path, transform: &Affine, rule: u8, out: &mut Coverage) -> ()
-    ! OutOfMemoryError ? &mut Allocator {
+  pub effect fn fill(
+    self: &mut Self,
+    path: &Path,
+    transform: &Affine,
+    rule: u8,
+    out: &mut Coverage,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
     out.clear()
     self.lines.clear()
-    run flattening.fill(path, transform, TOLERANCE, &mut self.lines)
+    let clip = Rect.make(0.0, 0.0, u32.toF64(out.canvasWidth), u32.toF64(out.canvasHeight))
+    run flattening.fillClipped(path, transform, &clip, TOLERANCE, &mut self.lines)
     run self.fillLines(rule, &mut out)
   }
 
   /// Replaces `out` with aliased coverage of `path`: a pixel is fully covered when its center is
   /// inside the path under `rule`, and empty otherwise (SVG `shape-rendering: crispEdges`).
   pub effect fn fillAliased(self: &mut Self, path: &Path, transform: &Affine, rule: u8, out: &mut Coverage) -> ()
-    ! OutOfMemoryError ? &mut Allocator {
+    ! OutOfMemoryError | GeometryError ? &mut Allocator {
     out.clear()
     self.lines.clear()
     run flattening.fill(path, transform, TOLERANCE, &mut self.lines)

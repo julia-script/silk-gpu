@@ -1,0 +1,11 @@
+//! Explicit failures for bounded geometric approximation. Never return an
+//! under-resolved outline when the requested tolerance cannot be represented.
+pub const INVALID_INPUT: u8 = 0
+
+pub const NUMERIC_LIMIT: u8 = 1
+
+pub const ACCURACY_LIMIT: u8 = 2
+
+pub struct GeometryError {
+  pub code: u8,
+}

@@ -22,6 +22,8 @@ import vector.geometry { Affine, Rect }
 import vector.path { Path }
 import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import vector.stroke { Stroke, Stroker, JOIN_ROUND, CAP_BUTT }
+import vector.geometry_error { GeometryError }
+import vector.flatten { TOLERANCE }
 import vector.pixmap { Pixmap, Rgba8 }
 import vector.paint { Gradient, Stop, Solid, ImagePattern, SPREAD_PAD, SAMPLE_BILINEAR, EXTEND_REPEAT }
 import vector.paint as painting
@@ -64,7 +66,9 @@ effect fn star(path: &mut Path, cx: f64, cy: f64, outer: f64, inner: f64) -> () 
   run path.close()
 }
 
-effect fn fills(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn fills(r: &mut Renderer, target: &mut Pixmap) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut random = Random.make()
   let id = Affine.identity()
   let mut i: u32 = 0
@@ -81,7 +85,9 @@ effect fn fills(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError 
   }
 }
 
-effect fn strokes(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn strokes(r: &mut Renderer, target: &mut Pixmap) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut random = Random.make()
   let id = Affine.identity()
   let mut i: u32 = 0
@@ -96,14 +102,16 @@ effect fn strokes(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryErro
     r.path.clear()
     run star(&mut r.path, cx, cy, outer, outer * 0.4)
     r.outline.clear()
-    run r.stroker.stroke(&r.path, &style, &id, &mut r.outline)
+    run r.stroker.stroke(&r.path, &style, &id, TOLERANCE, &mut r.outline)
     run r.raster.fill(&r.outline, &id, NONZERO, &mut r.coverage)
     painting.fill(&mut target, &r.coverage, &Solid.make(color), 255)
     i = i + 1
   }
 }
 
-effect fn gradients(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn gradients(r: &mut Renderer, target: &mut Pixmap) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut random = Random.make()
   let id = Affine.identity()
   let mut i: u32 = 0
@@ -131,7 +139,9 @@ effect fn gradients(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryEr
   }
 }
 
-effect fn polygon(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn polygon(r: &mut Renderer, target: &mut Pixmap) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut random = Random.make()
   r.path.clear()
   let mut i: u32 = 0
@@ -148,7 +158,9 @@ effect fn polygon(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryErro
   painting.fill(&mut target, &r.coverage, &Solid.make(Rgba8.make(20, 40, 160, 255)), 255)
 }
 
-effect fn icons(r: &mut Renderer, target: &mut Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn icons(r: &mut Renderer, target: &mut Pixmap) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut random = Random.make()
   let id = Affine.identity()
   let mut i: u32 = 0
@@ -186,7 +198,9 @@ effect fn tile() -> Pixmap ! OutOfMemoryError ? &mut Allocator {
   return move image
 }
 
-effect fn images(r: &mut Renderer, target: &mut Pixmap, image: &Pixmap) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn images(r: &mut Renderer, target: &mut Pixmap, image: &Pixmap) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut random = Random.make()
   let id = Affine.identity()
   let mut i: u32 = 0
@@ -212,7 +226,9 @@ fn nanos(start: &Instant, end: &Instant) -> i64 {
   return (SystemClock.seconds(end) - SystemClock.seconds(start)) * 1000000000 + SystemClock.nanoseconds(end) - SystemClock.nanoseconds(start)
 }
 
-effect fn scene(r: &mut Renderer, target: &mut Pixmap, image: &Pixmap, index: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn scene(r: &mut Renderer, target: &mut Pixmap, image: &Pixmap, index: u32) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   target.clear(Rgba8.make(255, 255, 255, 255))
   if index == 0 { run fills(&mut r, &mut target) }
   else if index == 1 { run strokes(&mut r, &mut target) }
@@ -254,7 +270,9 @@ effect fn save(fileName: string, bytes: &[u8]) -> () ! FileError | HostInputErro
   run FileSystem.writeFile(&path, bytes) |> Effect.provideMut<FileSystem>(&mut system)
 }
 
-effect fn program() -> i32 ! OutOfMemoryError | FileError | HostInputError ? &mut Allocator | &mut MonotonicClock {
+effect fn program() -> i32
+  ! OutOfMemoryError | GeometryError | FileError | HostInputError
+  ? &mut Allocator | &mut MonotonicClock {
   let frames: u32 = 20
   let mut r = Renderer { raster: Rasterizer.make(), stroker: Stroker.make(), coverage: Coverage.make(SIZE, SIZE), path: Path.make(), outline: Path.make() }
   let mut target = run Pixmap.make(SIZE, SIZE)

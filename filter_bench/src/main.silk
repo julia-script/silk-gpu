@@ -22,6 +22,7 @@ import vector.geometry { Affine, Rect }
 import vector.path { Path }
 import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import vector.pixmap { Pixmap, Rgba8 }
+import vector.geometry_error { GeometryError }
 import vector.filter as filtering
 import vector.filter {
   Region, BlurPlan, ComponentTransfer, Convolution, Turbulence, TurbulenceSettings, Light, Lighting, transferGamma, colorMatrixOf,
@@ -65,7 +66,7 @@ effect fn save(fileName: string, bytes: &[u8]) -> () ! FileError | HostInputErro
 
 
 /// The source graphic: the vector bench's 300 random circles on a transparent canvas.
-effect fn source() -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+effect fn source() -> Pixmap ! OutOfMemoryError | GeometryError ? &mut Allocator {
   let mut target = run Pixmap.make(SIZE, SIZE)
   target.clear(Rgba8.make(0, 0, 0, 0))
   let mut raster = Rasterizer.make()
@@ -161,7 +162,7 @@ effect fn workload(index: u32, s: &Setup, input: &Pixmap, out: &mut Pixmap) -> (
   }
 }
 
-effect fn program() -> i32 ! OutOfMemoryError | FileError | HostInputError ? &mut Allocator | &mut MonotonicClock {
+effect fn program() -> i32 ! OutOfMemoryError | GeometryError | FileError | HostInputError ? &mut Allocator | &mut MonotonicClock {
   let frames: u32 = 15
   let input = run source()
   run save("vector-source.rgba", input.data())

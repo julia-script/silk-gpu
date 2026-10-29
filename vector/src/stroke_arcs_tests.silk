@@ -1,0 +1,309 @@
+//! Behavioral geometry oracles for https://svgwg.org/svg2-draft/painting.html#LineJoinShape
+//! and §§13.5.8–13.5.9. These tests deliberately inspect the outline, not pixels.
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.f64
+import geometry { Point }
+import geometry_error { GeometryError, INVALID_INPUT, ACCURACY_LIMIT }
+import path { Path }
+import stroke_arcs
+
+fn near(a: f64, b: f64) -> bool {
+  return f64.abs(a - b) < 1.0e-9
+}
+
+fn distance2(a: Point, b: Point) -> f64 {
+  let x = a.x - b.x
+  let y = a.y - b.y
+  return x * x + y * y
+}
+
+fn contains(p: &Path, x: f64, y: f64) -> bool {
+  let points = p.pointList()
+  let mut i: usize = 0
+  while i < points.length {
+    if near(points[i].x, x) && near(points[i].y, y) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+effect fn corner(kin: f64, kout: f64, limit: f64, tolerance: f64) -> Path
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let mut p = Path.make()
+  run p.moveTo(0.0, 1.0)
+  run stroke_arcs.append(
+    &mut p,
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(0.0, -1.0),
+    kin,
+    kout,
+    1.0,
+    limit,
+    tolerance,
+  )
+  return move p
+}
+
+// §13.5.8: signed source radii -2 and -4 produce offset radii 3 and 5.
+// Their nearest intersection is NOT the tangent-line miter (1,1).
+test effect fn asymmetricArcsUseSourceOsculatingCircles() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(-0.5, -0.25, 10.0, 0.0001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let root = f64.sqrt(1.76)
+  run Testing.expect(contains(&p, root - 0.4, 2.0 * root - 1.8), "nearest circle intersection")
+  run Testing.expect(!contains(&p, 1.0, 1.0), "curved arcs must not alias miter-clip")
+  let points = p.pointList()
+  let mut i: usize = 0
+  while i < points.length {
+    let a = distance2(points[i], Point.make(0.0, -2.0))
+    let b = distance2(points[i], Point.make(-4.0, 0.0))
+    run Testing.expect(near(a, 9.0) || near(b, 25.0), "each vertex lies on its osculating circle")
+    i = i + 1
+  }
+  run Testing.expect(contains(&p, 1.0, 0.0), "final offset endpoint")
+}
+
+// §13.5.8: exactly one zero curvature is a line/circle intersection.
+test effect fn mixedStraightAndCurvedJoinKeepsTheLine() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(0.0, -0.25, 10.0, 0.0001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let points = p.pointList()
+  run Testing.expect(
+    near(points[1].x, f64.sqrt(24.0) - 4.0) && near(points[1].y, 1.0),
+    "exact line/circle intersection",
+  )
+  run Testing.expect(points.length > 3, "curved outgoing edge is not a straight miter")
+}
+
+// §13.5.9 disjoint case: increase both offset radii by the SAME amount.
+// Initial radii 1/4 become 1+sqrt(2), with tangency at (1+sqrt(1/2), same).
+test effect fn disjointCirclesGrowToExternalTangency() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(0.8, 0.8, 10.0, 0.0001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let q = 1.0 + f64.sqrt(0.5)
+  run Testing.expect(contains(&p, q, q), "equal radius adjustment reaches external tangency")
+  let radius = 1.0 + f64.sqrt(2.0)
+  let points = p.pointList()
+  let mut i: usize = 0
+  while i < points.length {
+    let a = distance2(points[i], Point.make(0.0, 1.0 + radius))
+    let b = distance2(points[i], Point.make(1.0 + radius, 0.0))
+    run Testing.expect(
+      near(a, radius * radius) || near(b, radius * radius),
+      "adjusted tangent circles",
+    )
+    i = i + 1
+  }
+}
+
+// §13.5.9 enclosed case: shrink the large circle and grow the small one.
+test effect fn enclosedCirclesAdjustInOppositeDirections() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(0.8, -0.25, 10.0, 0.0001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let delta = (13.5 - f64.sqrt(142.25)) / 4.0
+  let large = 5.0 - delta
+  let small = 0.25 + delta
+  let centerX = -4.0 + delta
+  let centerY = 1.25 + delta
+  let d = large - small
+  let x = centerX - centerX * large / d
+  let y = centerY * large / d
+  run Testing.expect(
+    contains(&p, x, y),
+    "internal tangency follows equal magnitude radius adjustment",
+  )
+}
+
+// §13.5.9 line/circle case: only the circle radius changes. A radius 1/4
+// circle centered at (1.25,0) cannot meet y=1; radius 1 touches at (2,1).
+test effect fn mixedNonintersectingCircleAdjustsRadius() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(0.0, 0.8, 10.0, 0.0001) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    contains(&p, 2.0, 1.0),
+    "circle grows while its center slides along the endpoint normal",
+  )
+}
+
+// §13.5.5: the clip plane is perpendicular to a CIRCULAR bisector at
+// arclength half-width * miterLimit, not perpendicular to a straight bisector.
+test effect fn clippingUsesCircularBisectorArclength() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(0.25, 0.125, 1.2, 0.00001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let qx = 2.0 - 2.0 / f64.sqrt(5.0)
+  let qy = 3.0 - 4.0 / f64.sqrt(5.0)
+  let b = f64.sqrt(0.5)
+  let curvature = 2.0 * b * (qy - qx) / (qx * qx + qy * qy)
+  let angle = 1.2 * curvature
+  let s = f64.sin(angle)
+  let c = f64.cos(angle)
+  let px = b * (s - (1.0 - c)) / curvature
+  let py = b * (s + (1.0 - c)) / curvature
+  let nx = b * (c - s)
+  let ny = b * (c + s)
+  let points = p.pointList()
+  let mut onPlane: usize = 0
+  let mut i: usize = 0
+  while i < points.length {
+    let side = nx * (points[i].x - px) + ny * (points[i].y - py)
+    run Testing.expect(side < 1.0e-9, "no outline survives past the arclength clip plane")
+    if f64.abs(side) < 1.0e-9 {
+      onPlane = onPlane + 1
+    }
+    i = i + 1
+  }
+  run Testing.expect(onPlane == 2, "two analytic intersections joined by the clipping edge")
+  run Testing.expect(!contains(&p, qx, qy), "over-limit circle intersection is removed")
+  run Testing.expect(f64.abs(nx - ny) > 0.01, "asymmetric join rotates its clip plane")
+}
+
+// §13.5.7 step 10 permits miter-clip only when BOTH curvatures vanish.
+test effect fn straightDegenerationAndRoundFallback() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run corner(0.0, 0.0, 10.0, 0.001) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    p.pointList().length == 3 && contains(&p, 1.0, 1.0),
+    "both straight: exact miter",
+  )
+  let clipped = run corner(0.0, 0.0, 1.0, 0.001) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(contains(&clipped, f64.sqrt(2.0) - 1.0, 1.0), "both straight: miter-clip")
+  let round = run corner(2.0, -0.25, 10.0, 0.0001) |> Effect.provideMut<Allocator>(&mut allocator)
+  let points = round.pointList()
+  let mut i: usize = 0
+  while i < points.length {
+    run Testing.expect(
+      near(distance2(points[i], Point.make(0.0, 0.0)), 1.0),
+      "overlarge inward curvature falls back to round",
+    )
+    i = i + 1
+  }
+}
+
+// §13.5.9 parallel disjoint tangents use a rectangle of length half*limit.
+test effect fn parallelDisjointCirclesUseSpecifiedRectangle() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run stroke_arcs.append(
+    &mut p,
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(-1.0, 0.0),
+    0.8,
+    0.8,
+    1.0,
+    3.0,
+    0.001,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(p.pointList().length == 4, "rectangle has three remaining corners")
+  run Testing.expect(
+    contains(&p, 3.0, 1.0) && contains(&p, 3.0, -1.0) && contains(&p, 0.0, -1.0),
+    "specified rectangle dimensions",
+  )
+}
+
+// Sagitta is checked against the true circle at each chord midpoint.
+test effect fn circularPolygonRespectsRequestedTolerance() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let tolerance = 0.00001
+  let p = run corner(2.0, 0.0, 4.0, tolerance) |> Effect.provideMut<Allocator>(&mut allocator)
+  let points = p.pointList()
+  let mut i: usize = 1
+  while i < points.length {
+    let x = 0.5 * (points[i - 1].x + points[i].x)
+    let y = 0.5 * (points[i - 1].y + points[i].y)
+    run Testing.expect(
+      1.0 - f64.sqrt(x * x + y * y) <= tolerance,
+      "every circular chord meets the geometric error bound",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn invalidToleranceAndUnachievableAccuracyAreErrors() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let invalid = run Effect.result(corner(-0.5, -0.25, 4.0, 0.0))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut invalidCode: u8 = 255
+  match &invalid {
+    Result<Path, OutOfMemoryError | GeometryError>.Failure { error } => {
+      match &error {
+        GeometryError e => {
+          invalidCode = e.code
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  run Testing.expect(invalidCode == INVALID_INPUT, "nonpositive tolerance is invalid")
+  let tiny = run Effect.result(corner(2.0, 0.0, 4.0, 1.0e-30))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut accuracyCode: u8 = 255
+  match &tiny {
+    Result<Path, OutOfMemoryError | GeometryError>.Failure { error } => {
+      match &error {
+        GeometryError e => {
+          accuracyCode = e.code
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  run Testing.expect(
+    accuracyCode == ACCURACY_LIMIT,
+    "unattainable tolerance never silently caps tessellation",
+  )
+}
+
+// A valid tiny sweep must not turn into a zero/NaN subdivision angle through
+// acos(1-tolerance/radius), or lose the sweep when cos(angle) rounds to one.
+test effect fn tinyCircularSweepsRetainTheirExactEndpoint() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let angle = 1.0e-8
+  let outgoing = Point.make(f64.cos(angle), 0.0 - f64.sin(angle))
+  let mut p = Path.make()
+  run p.moveTo(0.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run stroke_arcs.append(
+    &mut p,
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    outgoing,
+    2.0,
+    0.0,
+    1.0,
+    4.0,
+    1.0e-12,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let points = p.pointList()
+  run Testing.expect(points.length == 2, "tiny sweep needs one chord, not an accuracy failure")
+  run Testing.expect(
+    points[1].x == f64.sin(angle) && points[1].y == f64.cos(angle),
+    "final offset endpoint survives cancellation",
+  )
+  run Testing.expect(
+    angle * angle / 8.0 < 1.0e-12,
+    "analytic chord sagitta bound meets the actual passed tolerance",
+  )
+}

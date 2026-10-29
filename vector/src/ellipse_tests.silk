@@ -1,0 +1,123 @@
+//! Exact center-parametric arcs preserve ellipse geometry through affine maps.
+import path { Path }
+import geometry { Point, Affine }
+import geometry_error { GeometryError, INVALID_INPUT, ACCURACY_LIMIT }
+import flatten { Line }
+import flatten
+import silk.collections.list { List }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.testing.testing { Testing, AssertionError }
+
+fn area(lines: &[Line]) -> f64 {
+  let mut result = 0.0
+  let mut i: usize = 0
+  while i < lines.length {
+    let line = lines[i]
+    result = result
+      + (f32.toF64(line.x0) + f32.toF64(line.x1)) * (f32.toF64(line.y1) - f32.toF64(line.y0)) * 0.5
+    i = i + 1
+  }
+  return result
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/implnote.html#ArcParameterizationAlternatives
+// An affine ellipse's area is pi times the determinant of its two basis axes.
+test effect fn affineEllipseRetainsGeometryAndWinding() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut path = Path.make()
+  run path.moveTo(14.0, 22.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run path.ellipseArc(
+    Point.make(10.0, 20.0),
+    Point.make(4.0, 2.0),
+    Point.make(1.0, 3.0),
+    0.0,
+    -6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run path.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run flatten.fill(&path, &Affine.scale(2.0, 3.0), 0.0001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let expected = -3.141592653589793 * 10.0 * 6.0
+  run Testing.expect(
+    f64.abs(area(lines.asSlice()) - expected) < 0.01,
+    "true affine ellipse area and negative-sweep winding, not cubic circle approximation",
+  )
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/implnote.html#ArcParameterizationAlternatives
+// Midpoints of every inscribed chord must be within the requested radial error.
+test effect fn arcFlatteningBoundsTargetError() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut path = Path.make()
+  run path.moveTo(100.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run path.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(100.0, 0.0),
+    Point.make(0.0, 100.0),
+    0.0,
+    6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut lines = List<Line>.make()
+  run flatten.fill(&path, &Affine.identity(), 0.001, &mut lines)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: usize = 0
+  while i < lines.length() {
+    let line = lines.asSlice()[i]
+    let x = (f32.toF64(line.x0) + f32.toF64(line.x1)) * 0.5
+    let y = (f32.toF64(line.y0) + f32.toF64(line.y1)) * 0.5
+    run Testing.expect(
+      f64.abs(f64.sqrt(x * x + y * y) - 100.0) <= 0.001,
+      "arc chord plus f32 storage error respects caller tolerance",
+    )
+    i = i + 1
+  }
+}
+
+effect fn rejects(path: &Path, tolerance: f64, expected: u8) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut lines = List<Line>.make()
+  let result = run Effect.result(flatten.fill(path, &Affine.identity(), tolerance, &mut lines))
+  return match &result {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError value => value.code == expected
+      OutOfMemoryError value => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => false
+  }
+}
+
+// https://www.w3.org/TR/2018/CR-SVG2-20181004/types.html#RealNumberPrecision
+// A precision ceiling is observable, not an incorrectly coarse successful path.
+test effect fn unattainableArcAccuracyIsExplicit() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut path = Path.make()
+  run path.moveTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run path.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(0.0, 1.0),
+    0.0,
+    1.5707963267948966,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    run rejects(&path, 0.0, INVALID_INPUT) |> Effect.provideMut<Allocator>(&mut allocator),
+    "zero tolerance rejected",
+  )
+  run Testing.expect(
+    run rejects(&path, 1.0e-100, ACCURACY_LIMIT) |> Effect.provideMut<Allocator>(&mut allocator),
+    "subdivision ceiling fails rather than silently saturating",
+  )
+}

@@ -1,0 +1,82 @@
+import silk.testing.testing { AssertionError, Testing }
+import silk.num.f64
+import geometry { Point }
+import stroke_curve { Curve }
+
+// SVG 2 §13.5.7–8: caps use the source tangent, and arcs joins use source curvature.
+// https://svgwg.org/svg2-draft/painting.html#ComputingCircles
+test effect fn cubicEndpointUsesDerivativeNotChord() -> ()
+  ! AssertionError<'static> {
+  let c = Curve.cubic(
+    Point.make(0.0, 0.0),
+    Point.make(0.0, 10.0),
+    Point.make(20.0, 10.0),
+    Point.make(20.0, 0.0),
+  )
+  let a = c.tangent(0.0)
+  let b = c.tangent(1.0)
+  run Testing.expect(
+    a.x == 0.0 && a.y == 1.0 && b.x == 0.0 && b.y == -1.0,
+    "source endpoint derivatives",
+  )
+  run Testing.expect(
+    c.curvature(0.0) < 0.0 && c.curvature(1.0) < 0.0,
+    "signed source endpoint curvature",
+  )
+}
+
+// A collinear Bézier with a stationary endpoint still has a defined limiting tangent.
+test effect fn repeatedControlsPreserveLimitingDirection() -> ()
+  ! AssertionError<'static> {
+  let c = Curve.cubic(
+    Point.make(1.0, 2.0),
+    Point.make(1.0, 2.0),
+    Point.make(4.0, 2.0),
+    Point.make(7.0, 2.0),
+  )
+  let t = c.tangent(0.0)
+  run Testing.expect(
+    t.x == 1.0 && t.y == 0.0,
+    "first nonzero derivative supplies limiting direction",
+  )
+}
+
+// SVG 2 §13.5.8 elliptical curvature is analytic; cubic approximations are not equivalent.
+test effect fn ellipseRetainsCurvatureAndExactAnchors() -> ()
+  ! AssertionError<'static> {
+  let c = Curve.ellipse(
+    Point.make(0.0, 0.0),
+    Point.make(4.0, 0.0),
+    Point.make(0.0, 2.0),
+    0.0,
+    1.5707963267948966,
+    Point.make(4.0, 0.0),
+    Point.make(0.0, 2.0),
+  )
+  let a = c.tangent(0.0)
+  let end = c.point(1.0)
+  run Testing.expect(a.x == 0.0 && a.y == 1.0, "ellipse tangent uses its analytic derivative")
+  run Testing.expect(
+    f64.abs(c.curvature(0.0) - 1.0) < 1.0e-14,
+    "ellipse curvature a/b squared at axis endpoint",
+  )
+  run Testing.expect(
+    f64.abs(c.curvature(1.0) - 0.125) < 1.0e-14,
+    "ellipse curvature b/a squared at opposite axis",
+  )
+  run Testing.expect(
+    end.x == 0.0 && end.y == 2.0,
+    "exact endpoint anchor does not gain an artificial connector",
+  )
+}
+
+test effect fn widthEntersCertifiedOffsetError() -> ()
+  ! AssertionError<'static> {
+  let c = Curve.quad(Point.make(0.0, 0.0), Point.make(5.0, 0.1), Point.make(10.0, 0.0))
+  let centerline = c.offsetError(0.0, 1.0, 0.0)
+  let wide = c.offsetError(0.0, 1.0, 10000.0)
+  run Testing.expect(
+    wide > centerline * 100.0,
+    "wide offsets cannot reuse centerline-only tolerance",
+  )
+}
