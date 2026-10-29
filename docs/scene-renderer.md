@@ -158,6 +158,39 @@ without Dawn.
    not successful-return clamps. `stroke_space_tests.silk` derives expected offsets,
    caps, joins, host dash endpoints and projective limits independently of these APIs.
 
+   `stroke.measureLength(path: &Path, tolerance: f64) -> f64 ! GeometryError`
+   measures the total analytic centerline in source coordinates.
+   `stroke.measureLengthInSpace(path: &Path, sourceToStroke: &Homography,
+   tolerance: f64) -> f64 ! GeometryError` measures it in an independent host.
+   These stateless module functions require no allocator, `Stroker`, style, device
+   transform or clip. They sum every contour and closing segment; moves and
+   geometrically constant segments contribute zero. Calling them between reusable
+   stroker operations cannot inherit host state. Ellipse arcs retain their analytic
+   axes and signed sweep, rather than being replaced with cubic approximations.
+
+   Tolerance is a **positive finite absolute error for the entire sum**, in the
+   selected coordinate system. Adaptive analytic interval certificates bound chord
+   deficits using the existing curve `lengthError` machinery; no pixel-flattened
+   geometry substitutes for length. A per-verb budget, conservative endpoint/anchor
+   arithmetic bounds and accumulated summation bounds account for the total error.
+   The implementation uses only bounded recursion, with 40 subdivision levels and
+   1,048,576 interval visits across the whole path. Very small tolerances, large
+   coordinate cancellation or near-eye projective precision can exhaust those
+   certificates even when the mathematical length is finite.
+
+   Host measurement includes only positive-w geometry. Entirely nonpositive
+   intervals contribute zero, including certified eye-plane touches from behind.
+   A detected connected positive/nonpositive crossing fails `NUMERIC_LIMIT`;
+   unresolved eye-plane tangencies or removable projective singularities may fail
+   `ACCURACY_LIMIT`. It never returns a clipped, epsilon-w-truncated or partial
+   finite length for an unbounded path. Nonfinite points/maps and invalid tolerance
+   fail `INVALID_INPUT`; nonfinite arithmetic fails `NUMERIC_LIMIT`; exhausted
+   precision, subdivision or total error budgets fail `ACCURACY_LIMIT`.
+   `path_metric_tests.silk` covers analytic lines/polygons/circles, independent
+   polynomial and mapped-curve integrals, visibility boundaries, errors and
+   interleaving with reusable host stroking. This is generic geometry only:
+   path-length calibration, dash policy and text layout belong to callers.
+
 4. **Coverage** (`vector.strips`): exact signed area per pixel cell, accumulated and prefix-summed
    along each row (the font-rs method). Nonzero coverage is `min(|a|, 1)`; even-odd is
    `|a - 2 round(a / 2)|`. Lines are split at x = 0 and x = width and then clamped, so geometry

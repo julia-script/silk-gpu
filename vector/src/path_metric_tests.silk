@@ -1,0 +1,235 @@
+//! Independent analytic/integral references for the allocation-free centerline metric.
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.num.f64
+import geometry { Point, Rect, Affine }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import path { Path }
+import projective { Homography }
+import stroke { Stroker, Stroke, measureLength, measureLengthInSpace }
+
+fn identity() -> Homography {
+  return Homography.fromAffine(&Affine.identity())
+}
+
+effect fn near(actual: f64, expected: f64, tolerance: f64) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(
+    f64.isFinite(actual) && f64.abs(actual - expected) <= tolerance,
+    "total length respects absolute error",
+  )
+}
+
+effect fn failure(result: &Result<f64, GeometryError>, code: u8) -> ()
+  ! AssertionError<'static> {
+  match &result.* {
+    Result<f64, GeometryError>.Failure { error } => {
+      run Testing.expect(error.code == code, "exact geometry error contract")
+    }
+    _ => {
+      run Testing.expect(false, "uncertifiable length must fail")
+    }
+  }
+}
+
+test effect fn lengthAllContoursClosingSegmentsAndImplicitOrigin() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+
+  // Implicit origin; a 3-4-5 line, then a closed 3-by-4 rectangle.
+  run p.lineTo(3.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.rect(Rect.make(10.0, 20.0, 3.0, 4.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.moveTo(100.0, 100.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-8), 19.0, 1.0e-8)
+}
+
+test effect fn lengthEmptyAndDegenerateGeometryIsZero() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run near(run measureLength(&p, 1.0e-30), 0.0, 0.0)
+  run p.moveTo(3.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(3.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(3.0, 4.0, 3.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.cubicTo(3.0, 4.0, 3.0, 4.0, 3.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(Point.make(3.0, 4.0), Point.make(0.0, 0.0), Point.make(0.0, 0.0), 0.0, 6.0)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-30), 0.0, 0.0)
+  let mut eye = identity()
+  eye.wx = 1.0
+  eye.ww = -3.0
+  run near(run measureLengthInSpace(&p, &eye, 1.0e-30), 0.0, 0.0)
+}
+
+test effect fn lengthExactCircleAndNonuniformMappedEllipse() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(0.0, 1.0),
+    0.0,
+    6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-4), 6.283185307179586, 1.0e-4)
+  let h = Homography.fromAffine(&Affine.scale(3.0, 2.0))
+
+  // Integral sqrt(9 sin(t)^2 + 4 cos(t)^2), 0..2pi; independent composite Simpson reference.
+  run near(run measureLengthInSpace(&p, &h, 1.0e-4), 15.865439589290588, 1.0e-4)
+  p.clear()
+  run p.moveTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArc(
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(0.0, 1.0),
+    0.0,
+    -6.283185307179586,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-4), 6.283185307179586, 1.0e-4)
+}
+
+test effect fn lengthPolynomialCurvesAgainstIndependentIntegrals() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+
+  // (t,t^2): sqrt(5)/2 + asinh(2)/4.
+  run p.quadTo(0.5, 0.0, 1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-5), 1.4789428575445973, 1.0e-5)
+
+  // (t,t^3): integral sqrt(1+9t^4); independent 65536-panel composite Simpson reference.
+  p.clear()
+  run p.cubicTo(0.3333333333333333, 0.0, 0.6666666666666666, 0.0, 1.0, 1.0)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-5), 1.5478656546836098, 1.0e-5)
+  let h = Homography.fromAffine(&Affine.scale(2.0, 3.0))
+  run near(run measureLengthInSpace(&p, &h, 1.0e-5), 3.9436780176349453, 1.0e-5)
+
+  // A stationary point is not an empty curve: the quadratic goes out and back.
+  p.clear()
+  run p.quadTo(2.0, 0.0, 0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-4), 2.0, 1.0e-4)
+}
+
+test effect fn lengthFiniteProjectiveCurvesAndPositiveEyeBoundary() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.quadTo(0.5, 0.0, 1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut h = identity()
+  h.wx = 0.5
+
+  // Integral sqrt(1+(2t+t^2/2)^2)/(1+t/2)^2, independent Simpson reference.
+  run near(run measureLengthInSpace(&p, &h, 1.0e-4), 1.001757174595654, 1.0e-4)
+  p.clear()
+  run p.moveTo(0.125, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  h.wx = 1.0
+  h.ww = 0.0
+  run near(run measureLengthInSpace(&p, &h, 1.0e-5), 7.0, 1.0e-5)
+}
+
+test effect fn lengthHiddenGeometryAndUnboundedCrossings() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  let mut h = identity()
+  h.wx = 1.0
+  h.ww = 0.0
+  run p.moveTo(0.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(-1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLengthInSpace(&p, &h, 1.0e-5), 0.0, 0.0)
+
+  // A separate visible contour still counts, without connecting across the move.
+  run p.moveTo(1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(2.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLengthInSpace(&p, &h, 1.0e-5), 0.5, 1.0e-5)
+  p.clear()
+  run p.moveTo(-1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run failure(&(run Effect.result(measureLengthInSpace(&p, &h, 1.0e-5))), NUMERIC_LIMIT)
+  p.clear()
+  run p.moveTo(0.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run failure(&(run Effect.result(measureLengthInSpace(&p, &h, 1.0e-5))), NUMERIC_LIMIT)
+
+  // Equal positive endpoint signs do not prove that the interior stays visible.
+  p.clear()
+  run p.moveTo(1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(-3.0, 1.0, 1.0, 1.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run failure(&(run Effect.result(measureLengthInSpace(&p, &h, 1.0e-5))), NUMERIC_LIMIT)
+}
+
+test effect fn lengthInvalidInputsAndUnattainableAccuracy() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run failure(&(run Effect.result(measureLength(&p, 0.0))), INVALID_INPUT)
+  run failure(&(run Effect.result(measureLength(&p, -1.0))), INVALID_INPUT)
+  run failure(&(run Effect.result(measureLength(&p, 1.0 / 0.0))), INVALID_INPUT)
+  run failure(&(run Effect.result(measureLength(&p, 0.0 / 0.0))), INVALID_INPUT)
+  run failure(&(run Effect.result(measureLengthInSpace(&p, &identity(), 0.0))), INVALID_INPUT)
+  let mut invalid = identity()
+  invalid.wx = 1.0 / 0.0
+  run failure(&(run Effect.result(measureLengthInSpace(&p, &invalid, 0.01))), INVALID_INPUT)
+  run p.lineTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run failure(&(run Effect.result(measureLength(&p, 1.0e-30))), ACCURACY_LIMIT)
+
+  // Rounded transformed controls must not masquerade as an exactly empty line.
+  let cancellation = Homography.fromAffine(&Affine.translate(1.0e16, 0.0))
+  run failure(&(run Effect.result(measureLengthInSpace(&p, &cancellation, 0.01))), ACCURACY_LIMIT)
+  p.clear()
+  run p.lineTo(1.0 / 0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run failure(&(run Effect.result(measureLength(&p, 0.01))), INVALID_INPUT)
+  p.clear()
+  run p.moveTo(-1.0e308, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(1.0e308, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run failure(&(run Effect.result(measureLength(&p, 1.0))), NUMERIC_LIMIT)
+}
+
+test effect fn lengthIndependentOfReusableStrokerHostStateAndWidth() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.lineTo(3.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  let h = Homography.fromAffine(&Affine.scale(2.0, 3.0))
+  let mut style = Stroke.make(9.0)
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect.make(-100.0, -100.0, 200.0, 200.0),
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLengthInSpace(&p, &h, 1.0e-8), 13.416407864998739, 1.0e-8)
+  run near(run measureLength(&p, 1.0e-8), 5.0, 1.0e-8)
+  style.width = 0.0
+  out.clear()
+  run stroker.strokeInSpace(
+    &p,
+    &style,
+    &h,
+    &identity(),
+    Rect.make(-100.0, -100.0, 200.0, 200.0),
+    0.01,
+    &mut out,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-8), 5.0, 1.0e-8)
+  run near(run measureLengthInSpace(&p, &identity(), 1.0e-8), 5.0, 1.0e-8)
+}

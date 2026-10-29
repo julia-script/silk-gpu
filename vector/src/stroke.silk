@@ -188,6 +188,264 @@ fn maxScale(m: &Affine) -> f64 {
   return s * ((norm(a + d, b - c) + norm(a - d, b + c)) * 0.5)
 }
 
+/// Total analytic centerline length in source coordinates, including every contour
+/// and closing segment. tolerance is a positive finite absolute error budget for
+/// the entire path. No stroke style, device transform, allocation or mutable state
+/// is involved. Uncertifiable finite precision fails with ACCURACY_LIMIT.
+pub effect fn measureLength(path: &Path, tolerance: f64) -> f64
+  ! GeometryError {
+  return run measureCenterline(path, &Homography.fromAffine(&Affine.identity()), tolerance, false)
+}
+
+/// Total positive-w centerline length in an independent stroke host. Entirely
+/// hidden segments contribute zero. No clipping or epsilon-w cutoff is used;
+/// connected eye-plane crossings fail rather than returning a partial length.
+/// INVALID_INPUT rejects nonfinite inputs or nonpositive/nonfinite tolerance;
+/// NUMERIC_LIMIT rejects nonfinite arithmetic or a detected eye-plane crossing;
+/// ACCURACY_LIMIT rejects unresolved visibility or unattainable error budgets.
+pub effect fn measureLengthInSpace(path: &Path, sourceToStroke: &Homography, tolerance: f64) -> f64
+  ! GeometryError {
+  return run measureCenterline(path, sourceToStroke, tolerance, true)
+}
+
+struct LengthEstimate {
+  value: f64,
+  error: f64,
+}
+
+impl Copy for LengthEstimate {}
+
+effect fn addLengths(a: LengthEstimate, b: LengthEstimate) -> LengthEstimate
+  ! GeometryError {
+  let value = a.value + b.value
+  let error = (a.error + b.error + value * 8.881784197001252e-16) * 1.000000000000001
+  if !f64.isFinite(value) || !f64.isFinite(error) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  return LengthEstimate { value: value, error: error }
+}
+
+// Bound endpoint evaluation separately from geometric chord deficit. Source
+// arithmetic must still be charged when a homography cancels large coordinates.
+fn lengthPointError(source: &Curve) -> f64 {
+  let magnitude = norm(source.p0.x, source.p0.y) + norm(source.p1.x, source.p1.y)
+    + norm(source.p2.x, source.p2.y)
+    + norm(source.p3.x, source.p3.y)
+  let phase = if source.kind == ARC {
+    (norm(source.p1.x, source.p1.y) + norm(source.p2.x, source.p2.y)) * f64.abs(source.sweep)
+  } else {
+    0.0
+  }
+  return (magnitude + phase) * 2.8421709430404007e-14
+}
+
+effect fn lengthInterval(
+  curve: &StrokeCurve,
+  source: &StrokeCurve,
+  mapping: &Homography,
+  sourceError: f64,
+  mapped: bool,
+  a: f64,
+  b: f64,
+  budget: f64,
+  depth: u32,
+  visits: &mut usize,
+) -> LengthEstimate
+  ! GeometryError {
+  if visits.* >= MAX_POINTS {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  visits.* = visits.* + 1
+  let weights = curve.weightRange(a, b)
+  if !weights.isFinite() {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if weights.y <= 0.0 {
+    return LengthEstimate { value: 0.0, error: 0.0 }
+  }
+  if weights.x > 0.0 {
+    let start = curve.point(a)
+    let end = curve.point(b)
+    let chord = distance(start, end)
+    if !start.isFinite() || !end.isFinite() || !f64.isFinite(chord) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    let mut pointError = sourceError
+    if mapped {
+      let w = source.functional(a, b, mapping.wx, mapping.wy, mapping.ww)
+      if w.x > 0.0 {
+        let x = source.functional(a, b, mapping.xx, mapping.xy, mapping.xw)
+        let y = source.functional(a, b, mapping.yx, mapping.yy, mapping.yw)
+        let numerator = norm(
+          f64.max(f64.abs(x.x), f64.abs(x.y)),
+          f64.max(f64.abs(y.x), f64.abs(y.y)),
+        )
+        let matrix = norm(norm(mapping.xx, mapping.xy), norm(mapping.yx, mapping.yy))
+        pointError = sourceError
+          * (matrix / w.x + numerator / w.x * norm(mapping.wx, mapping.wy) / w.x)
+      } else {
+        pointError = 1.0 / 0.0
+      }
+    }
+    let rounding = 2.0 * (pointError + curve.anchorError() + curve.precisionError(a, b))
+      + chord * 8.881784197001252e-16
+    let error = (curve.lengthError(a, b) + rounding) * 1.000000000001
+    if error <= budget * 0.5 {
+      return LengthEstimate { value: chord, error: error }
+    }
+
+    // A smaller interval cannot repair source-space coordinate precision.
+    if !mapped && rounding > budget {
+      fail GeometryError { code: ACCURACY_LIMIT }
+    }
+  } else {
+    let startWeight = curve.weightAt(a)
+    let endWeight = curve.weightAt(b)
+    if (startWeight > 0.0 && endWeight <= 0.0) || (endWeight > 0.0 && startWeight <= 0.0) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+  }
+  let middle = (a + b) * 0.5
+  if depth >= MAX_DEPTH || middle == a || middle == b || !(budget * 0.5 > 0.0) {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let left = run lengthInterval(
+    curve,
+    source,
+    mapping,
+    sourceError,
+    mapped,
+    a,
+    middle,
+    budget * 0.5,
+    depth + 1,
+    &mut visits,
+  )
+  let right = run lengthInterval(
+    curve,
+    source,
+    mapping,
+    sourceError,
+    mapped,
+    middle,
+    b,
+    budget * 0.5,
+    depth + 1,
+    &mut visits,
+  )
+  let result = run addLengths(left, right)
+  if result.error > budget {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  return result
+}
+
+effect fn measureCenterline(path: &Path, mapping: &Homography, tolerance: f64, mapped: bool) -> f64
+  ! GeometryError {
+  if !(tolerance > 0.0) || !f64.isFinite(tolerance) || !mapping.isFinite() {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let points = path.pointList()
+  let verbs = path.verbList()
+  let mut p: usize = 0
+  while p < points.length {
+    if !points[p].isFinite() {
+      fail GeometryError { code: INVALID_INPUT }
+    }
+    p = p + 1
+  }
+  if verbs.length == 0 {
+    return 0.0
+  }
+
+  // At most one analytic segment per verb, including CLOSE. Half the total
+  // budget is reserved for combining independently certified segment estimates.
+  let budget = tolerance / usize.toF64(verbs.length) * 0.5
+  let mut total = LengthEstimate { value: 0.0, error: 0.0 }
+  let mut current = Point.make(0.0, 0.0)
+  let mut start = current
+  let mut open = false
+  let mut visits: usize = 0
+  p = 0
+  let mut i: usize = 0
+  while i < verbs.length {
+    let verb = verbs[i]
+    if verb == MOVE {
+      current = points[p]
+      start = current
+      open = true
+      p = p + 1
+    } else {
+      let mut curve = Curve.line(current, current)
+      if verb == CLOSE {
+        if open {
+          curve = Curve.line(current, start)
+          current = start
+          open = false
+        }
+      } else {
+        if !open {
+          start = current
+          open = true
+        }
+        if verb == LINE {
+          curve = Curve.line(current, points[p])
+          current = points[p]
+          p = p + 1
+        } else if verb == QUAD {
+          curve = Curve.quad(current, points[p], points[p + 1])
+          current = points[p + 1]
+          p = p + 2
+        } else if verb == CUBIC {
+          curve = Curve.cubic(current, points[p], points[p + 1], points[p + 2])
+          current = points[p + 2]
+          p = p + 3
+        } else if verb == ARC {
+          curve = Curve.ellipse(
+            points[p],
+            points[p + 1],
+            points[p + 2],
+            points[p + 3].x,
+            points[p + 3].y,
+            current,
+            points[p + 4],
+          )
+          current = points[p + 4]
+          p = p + 5
+        }
+      }
+      let source = StrokeCurve.plain(curve)
+
+      // Source-degenerate segments remain empty even on the eye plane.
+      if !(curve.anchorError() == 0.0 && (source.collapsed() || curve.firstBound() == 0.0)) {
+        let measured = if mapped {
+          StrokeCurve.mapped(curve, mapping)
+        } else {
+          source
+        }
+        let length = run lengthInterval(
+          &measured,
+          &source,
+          mapping,
+          lengthPointError(&curve),
+          mapped,
+          0.0,
+          1.0,
+          budget,
+          0,
+          &mut visits,
+        )
+        total = run addLengths(total, length)
+        if total.error > tolerance {
+          fail GeometryError { code: ACCURACY_LIMIT }
+        }
+      }
+    }
+    i = i + 1
+  }
+  return total.value
+}
+
 /// Reusable storage; neither bounds nor repeated strokes need a second stroker allocation.
 pub struct Stroker {
   vertices: List<Vertex>,
