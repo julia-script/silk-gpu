@@ -1,0 +1,117 @@
+import silk.testing.testing { AssertionError, Testing }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.u8
+import silk.num.i32
+import geometry { Affine, Rect }
+import path { Path }
+import strips { Rasterizer, Coverage, NONZERO }
+import pixmap { Pixmap, Rgba8 }
+import paint { Solid }
+import layer {
+  Mask, composite, compositeMasked, fillClipped, BLEND_NORMAL, BLEND_MULTIPLY, BLEND_SCREEN, BLEND_DIFFERENCE,
+  BLEND_OVERLAY, BLEND_HARD_LIGHT, BLEND_COLOR_DODGE, BLEND_COLOR_BURN, BLEND_COLOR, BLEND_LUMINOSITY, BLEND_HUE,
+}
+
+fn close(a: u8, b: u8) -> bool {
+  let d = u8.toI32(a) - u8.toI32(b)
+  return d <= 1 && 0 - d <= 1
+}
+
+fn same(c: Rgba8, r: u8, g: u8, b: u8, a: u8) -> bool { return close(c.r, r) && close(c.g, g) && close(c.b, b) && close(c.a, a) }
+
+/// Blends one opaque `source` pixel onto one opaque `backdrop` pixel.
+effect fn blendOne(backdrop: Rgba8, source: Rgba8, mode: u8) -> Rgba8 ! OutOfMemoryError ? &mut Allocator {
+  let mut target = run Pixmap.make(1, 1)
+  target.clear(backdrop)
+  let mut layer = run Pixmap.make(1, 1)
+  layer.clear(source)
+  composite(&mut target, &layer, mode, 255)
+  return target.pixel(0, 0)
+}
+
+test effect fn separableModesFollowTheFormulas() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let b = Rgba8.make(255, 128, 0, 255)
+  let s = Rgba8.make(128, 128, 128, 255)
+  let multiply = run blendOne(b, s, BLEND_MULTIPLY) |> Effect.provideMut<Allocator>(&mut allocator)
+  let screen = run blendOne(b, s, BLEND_SCREEN) |> Effect.provideMut<Allocator>(&mut allocator)
+  let difference = run blendOne(b, s, BLEND_DIFFERENCE) |> Effect.provideMut<Allocator>(&mut allocator)
+  let overlay = run blendOne(b, s, BLEND_OVERLAY) |> Effect.provideMut<Allocator>(&mut allocator)
+  let hard = run blendOne(s, b, BLEND_HARD_LIGHT) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(same(multiply, 128, 64, 0, 255), "multiply")
+  run Testing.expect(same(screen, 255, 192, 128, 255), "screen")
+  run Testing.expect(same(difference, 127, 0, 128, 255), "difference")
+  run Testing.expect(same(overlay, hard.r, hard.g, hard.b, 255), "overlay(b, s) is hard-light(s, b)")
+  let dodge = run blendOne(Rgba8.make(0, 128, 255, 255), Rgba8.make(255, 128, 0, 255), BLEND_COLOR_DODGE) |> Effect.provideMut<Allocator>(&mut allocator)
+  let burn = run blendOne(Rgba8.make(255, 128, 0, 255), Rgba8.make(0, 128, 255, 255), BLEND_COLOR_BURN) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(same(dodge, 0, 255, 255, 255), "color-dodge: black stays, 0.5 / 0.5 clamps to 1, white stays")
+  run Testing.expect(same(burn, 255, 1, 0, 255), "color-burn: white stays, 1 - 0.498 / 0.502, black stays")
+}
+
+test effect fn nonSeparableModesUseLuminance() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let red = Rgba8.make(255, 0, 0, 255)
+  let gray = Rgba8.make(128, 128, 128, 255)
+  let luminosity = run blendOne(red, gray, BLEND_LUMINOSITY) |> Effect.provideMut<Allocator>(&mut allocator)
+  let color = run blendOne(red, gray, BLEND_COLOR) |> Effect.provideMut<Allocator>(&mut allocator)
+  let hue = run blendOne(red, gray, BLEND_HUE) |> Effect.provideMut<Allocator>(&mut allocator)
+  // SetLum(red, 0.502) overflows red and ClipColor pulls it back: (1, 0.2885, 0.2885).
+  run Testing.expect(same(luminosity, 255, 74, 74, 255), "luminosity")
+  run Testing.expect(same(color, 77, 77, 77, 255), "color: gray at red's luminance 0.3")
+  run Testing.expect(same(hue, 77, 77, 77, 255), "hue of a gray source is gray")
+}
+
+test effect fn groupOpacityAndTransparentBackdrops() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut target = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  target.clear(Rgba8.make(0, 0, 0, 255))
+  let mut layer = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  layer.clear(Rgba8.make(255, 255, 255, 255))
+  composite(&mut target, &layer, BLEND_NORMAL, 128)
+  run Testing.expect(same(target.pixel(0, 0), 128, 128, 128, 255), "half-opaque white over black")
+  let mut empty = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut red = run Pixmap.make(1, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  red.clear(Rgba8.make(255, 0, 0, 255))
+  composite(&mut empty, &red, BLEND_MULTIPLY, 255)
+  run Testing.expect(same(empty.pixel(0, 0), 255, 0, 0, 255), "blending onto nothing leaves the source")
+}
+
+test effect fn masksFromContent() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut content = run Pixmap.make(2, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  content.clear(Rgba8.make(255, 0, 0, 255))
+  let luminance = run Mask.fromLuminance(&content) |> Effect.provideMut<Allocator>(&mut allocator)
+  let alpha = run Mask.fromAlpha(&content) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(luminance.at(0, 0) == 54 && alpha.at(1, 0) == 255, "red: luminance 0.2125, alpha 1")
+  content.clear(Rgba8.make(255, 255, 255, 128))
+  let half = run Mask.fromLuminance(&content) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(half.at(0, 0) == 128, "luminance includes alpha")
+  let mut target = run Pixmap.make(2, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut layer = run Pixmap.make(2, 1) |> Effect.provideMut<Allocator>(&mut allocator)
+  layer.clear(Rgba8.make(255, 255, 255, 255))
+  compositeMasked(&mut target, &layer, BLEND_NORMAL, 255, &half)
+  run Testing.expect(same(target.pixel(1, 0), 128, 128, 128, 128), "masked group")
+}
+
+test effect fn clipsIntersectAndLimitFills() -> () ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut raster = Rasterizer.make()
+  let mut left = Path.make()
+  run left.rect(Rect.make(0.0, 0.0, 6.0, 8.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut right = Path.make()
+  run right.rect(Rect.make(2.5, 0.0, 6.0, 8.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut coverage = Coverage.make(8, 8)
+  run raster.fill(&left, &Affine.identity(), NONZERO, &mut coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut clip = run Mask.fromCoverage(&coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  run raster.fill(&right, &Affine.identity(), NONZERO, &mut coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  let other = run Mask.fromCoverage(&coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  clip.intersect(&other)
+  run Testing.expect(clip.at(1, 3) == 0 && clip.at(2, 3) == 128 && clip.at(4, 3) == 255 && clip.at(6, 3) == 0, "intersection")
+  let mut everything = Path.make()
+  run everything.rect(Rect.make(0.0, 0.0, 8.0, 8.0)) |> Effect.provideMut<Allocator>(&mut allocator)
+  run raster.fill(&everything, &Affine.identity(), NONZERO, &mut coverage) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut target = run Pixmap.make(8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
+  fillClipped(&mut target, &coverage, &Solid.make(Rgba8.make(0, 0, 255, 255)), 255, &clip)
+  run Testing.expect(target.pixel(1, 1).a == 0 && target.pixel(2, 1).b == 128 && target.pixel(5, 7).b == 255, "fill limited by clip")
+}

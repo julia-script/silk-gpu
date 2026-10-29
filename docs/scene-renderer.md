@@ -67,6 +67,15 @@ without Dawn.
    `div255(x) = (x + 128 + ((x + 128) >> 8)) >> 8`, which equals `round(x / 255)` for all
    products of two bytes, so CPU and GPU can agree byte for byte.
 
+7. **Layers** (`vector.layer`): a group that needs isolation (opacity below 1, a mask, a clip,
+   a filter or a non-normal blend mode) is drawn into its own transparent pixmap and composited
+   onto its parent with `composite` or `compositeMasked`, using the 16 blend modes of
+   Compositing and Blending Level 1 (`normal` is exact integer source-over; the others compute
+   `cs (1 - ab) + cb (1 - as) + as ab B(Cb, Cs)` in f32). A `Mask` is one byte per pixel: clip
+   paths become masks from coverage and intersect by multiplication; `mask` content becomes a
+   mask from its alpha or its luminance (CSS Masking coefficients 0.2125, 0.7154, 0.0721 on
+   premultiplied values). `fillClipped` draws a path through a clip without a layer.
+
 ## Planned work
 
 | PR | Content | Exit test |
