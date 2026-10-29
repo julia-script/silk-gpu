@@ -85,7 +85,9 @@ without Dawn.
    premultiplied paint with the same integer `div255` as the CPU, and the blend unit's
    `One, OneMinusSrcAlpha` computes `s + d (1 - as)`, which for unorm8 equals the CPU's
    `s + div255(d (255 - as))`, so solid fills match the CPU pixmap byte for byte. Gradients use
-   the same formulas in f32. Image paints come next; buffers are recreated per frame for now.
+   the same formulas in f32. Image paints (`Scene.fillImage`) append the image's texels to the
+   ramp buffer and sample them like `ImagePattern` (nearest or bilinear, clamp or repeat). Buffers
+   are recreated per frame for now.
 
 9. **GPU layers** (`gpu_scene`): `Scene.pushLayer` starts a group, `popLayer(mode, opacity,
    mask)` composites it onto its parent, and `popMask(kind, clip)` turns the group into a mask
@@ -94,8 +96,8 @@ without Dawn.
    mask, and one for a copy of the parent. Popping a group copies its parent and draws a
    full-target pass of `shaders/compose.wgsl` that computes `vector.layer`'s compositing on the
    bytes (integer source-over for `normal`, the same f32 formulas for the other modes), and the
-   root is copied to the target at the end. The scene test renders all 16 blend modes and a
-   luminance mask through a clip and matches the CPU byte for byte on lavapipe. Textures are
+   root is copied to the target at the end. The scene test renders all 16 blend modes, a
+   luminance mask through a clip, and image patterns, and matches the CPU byte for byte on lavapipe. Textures are
    allocated per render; pooling them is future work.
 
 ## Planned work

@@ -25,7 +25,7 @@ import vector.path { Path }
 import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import vector.stroke { Stroke, Stroker, JOIN_ROUND, JOIN_MITER_CLIP, CAP_ROUND, CAP_SQUARE }
 import vector.pixmap { Pixmap, Rgba8 }
-import vector.paint { Gradient, Stop, Solid, SPREAD_PAD, SPREAD_REFLECT, SPREAD_REPEAT }
+import vector.paint { Gradient, Stop, Solid, ImagePattern, SPREAD_PAD, SPREAD_REFLECT, SPREAD_REPEAT, SAMPLE_NEAREST, SAMPLE_BILINEAR, EXTEND_CLAMP, EXTEND_REPEAT }
 import vector.paint as painting
 import vector.layer { Mask, BLEND_NORMAL }
 import vector.layer as layering
@@ -211,6 +211,46 @@ effect fn layers() -> Canvas ! OutOfMemoryError ? &mut Allocator {
   return move c
 }
 
+/// A small premultiplied test image: a color ramp with a few translucent texels.
+effect fn sampleImage() -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+  let mut image = run Pixmap.make(7, 5)
+  let d = image.dataMut()
+  let mut i: u32 = 0
+  while i < 35 {
+    let x = i % 7
+    let y = i / 7
+    let color = Rgba8.make(u32.toU8(x * 36), u32.toU8(y * 60), u32.toU8(255 - x * 30), if (x + y) % 3 == 0 { 120 } else { 255 }).premultiply()
+    let at = u32.toUsize(i) * 4
+    d[at] = color.r
+    d[at + 1] = color.g
+    d[at + 2] = color.b
+    d[at + 3] = color.a
+    i = i + 1
+  }
+  return move image
+}
+
+/// Image patterns: nearest and clamped, bilinear and repeated, under scale and rotation.
+effect fn images() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+  let mut c = run Canvas.make()
+  let id = Affine.identity()
+  let image = run sampleImage()
+  let mut left = Path.make()
+  run left.rect(Rect.make(4.0, 4.0, 58.0, 88.0))
+  let nearest = ImagePattern.make(&image, &Affine.translate(9.3, 11.7).then(&Affine.scale(6.1, 7.3)), SAMPLE_NEAREST, EXTEND_CLAMP)
+  run c.raster.fill(&left, &id, NONZERO, &mut c.coverage)
+  painting.fill(&mut c.cpu, &c.coverage, &nearest, 255)
+  run c.scene.fillImage(&c.coverage, &nearest, 255)
+  let mut disk = Path.make()
+  run disk.circle(96.0, 48.0, 30.0)
+  let placed = Affine.translate(96.0, 48.0).then(&Affine.rotate(0.35)).then(&Affine.scale(5.3, 4.1))
+  let bilinear = ImagePattern.make(&image, &placed, SAMPLE_BILINEAR, EXTEND_REPEAT)
+  run c.raster.fill(&disk, &id, NONZERO, &mut c.coverage)
+  painting.fill(&mut c.cpu, &c.coverage, &bilinear, 230)
+  run c.scene.fillImage(&c.coverage, &bilinear, 230)
+  return move c
+}
+
 fn extent(width: u32, height: u32) -> Extent3D {
   let mut size = Extent3D.default()
   size.setWidth(width)
@@ -298,8 +338,12 @@ effect fn program() -> i32 ! GpuError | OutOfMemoryError {
   let layeredGpu = run renderOnGpu(&device, &queue, &renderer, &layered.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   // Non-separable and other non-normal modes run in f32 on both sides; allow one level.
   let layersOk = compare("layers", layered.cpu.data(), layeredGpu.asSlice(), 1)
+  let imaged = run images() |> Effect.provideMut<Allocator>(&mut allocator)
+  let imagedGpu = run renderOnGpu(&device, &queue, &renderer, &imaged.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  let imagesOk = compare("images", imaged.cpu.data(), imagedGpu.asSlice(), 0)
   let drawn = painted("solids", solid.cpu.data(), 4000) && painted("gradients", gradient.cpu.data(), 8000) && painted("layers", layered.cpu.data(), 9000)
-  return if solidOk && gradientOk && layersOk && drawn { 0 } else { 1 }
+    && painted("images", imaged.cpu.data(), 6000)
+  return if solidOk && gradientOk && layersOk && imagesOk && drawn { 0 } else { 1 }
 }
 
 effect fn failed<E>(error: E) -> i32 {

@@ -342,6 +342,14 @@ impl<'a> ImagePattern<'a> {
     if let Option<Affine>.Some { value: found } = transform.invert() { inverse = found } else { valid = false }
     return ImagePattern { image: image, inverse: inverse, valid: valid, sampling: sampling, extend: extend }
   }
+  /// The premultiplied image being placed.
+  pub fn pixmap(self: &Self) -> &'a Pixmap { return self.image }
+  /// The device-to-image-pixel transform.
+  pub fn inverseTransform(self: &Self) -> Affine { return self.inverse }
+  pub fn samplingMode(self: &Self) -> u8 { return self.sampling }
+  pub fn extendMode(self: &Self) -> u8 { return self.extend }
+  /// False for an empty image or a non-invertible transform: the pattern paints nothing.
+  pub fn isPaintable(self: &Self) -> bool { return self.valid }
   fn texel(self: &Self, x: i64, y: i64) -> Rgba8 {
     let w = u32.toI64(self.image.width())
     let h = u32.toI64(self.image.height())

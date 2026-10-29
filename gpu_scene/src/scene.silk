@@ -9,7 +9,7 @@ import silk.num.u32
 import silk.num.usize
 import vector.strips { Coverage, BAND }
 import vector.pixmap { Rgba8 }
-import vector.paint { Gradient }
+import vector.paint { Gradient, ImagePattern }
 
 /// Bytes per run record: x, y, width, alpha word index (or SOLID_RUN), paint word index, opacity.
 pub const RUN_BYTES: usize = 24
@@ -76,6 +76,7 @@ impl Scene {
   pub fn runs(self: &Self) -> &[u8] { return self.runBytes.asSlice() }
   pub fn alphas(self: &Self) -> &[u8] { return self.alphaBytes.asSlice() }
   pub fn paints(self: &Self) -> &[u8] { return self.paintBytes.asSlice() }
+  /// Gradient ramps and image texels, one premultiplied RGBA8 word each.
   pub fn ramps(self: &Self) -> &[u8] { return self.rampBytes.asSlice() }
   /// Command records ([`COMMAND_BYTES`] each). Empty when the scene has no layers or masks: then
   /// every run draws straight onto the target.
@@ -173,6 +174,35 @@ impl Scene {
     let mut i: usize = 0
     while i < 6 {
       run pushF32(&mut self.paintBytes, g[i])
+      i = i + 1
+    }
+    run self.addRuns(coverage, paint, opacity)
+  }
+
+  /// Draws `coverage` with the image `pattern`, like `paint.fill`. An unpaintable pattern draws
+  /// nothing. The image's texels are appended to [`ramps`].
+  pub effect fn fillImage(self: &mut Self, coverage: &Coverage, pattern: &ImagePattern, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+    if !pattern.isPaintable() { return }
+    let paint = usize.toU32(self.paintBytes.length() / 4)
+    let image = pattern.pixmap()
+    let start = usize.toU32(self.rampBytes.length() / 4)
+    run self.rampBytes.appendSlice(image.data())
+    run pushU32(&mut self.paintBytes, 3)
+    run pushU32(&mut self.paintBytes, start)
+    run pushU32(&mut self.paintBytes, image.width())
+    run pushU32(&mut self.paintBytes, image.height())
+    let m = pattern.inverseTransform()
+    run pushF32(&mut self.paintBytes, m.a)
+    run pushF32(&mut self.paintBytes, m.b)
+    run pushF32(&mut self.paintBytes, m.c)
+    run pushF32(&mut self.paintBytes, m.d)
+    run pushF32(&mut self.paintBytes, m.e)
+    run pushF32(&mut self.paintBytes, m.f)
+    run pushU32(&mut self.paintBytes, u8.toU32(pattern.samplingMode()))
+    run pushU32(&mut self.paintBytes, u8.toU32(pattern.extendMode()))
+    let mut i: u32 = 12
+    while i < PAINT_WORDS {
+      run pushU32(&mut self.paintBytes, 0)
       i = i + 1
     }
     run self.addRuns(coverage, paint, opacity)
