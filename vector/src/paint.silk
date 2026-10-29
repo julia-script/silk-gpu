@@ -125,8 +125,9 @@ pub struct Gradient {
   projective: bool,
   homography: Homography,
   valid: bool,
-  /// True when the paint is the last stop color everywhere (a degenerate vector or radius).
+  /// True for one stop or a degenerate linear vector, never merely a zero radial radius.
   single: bool,
+  tangent: bool,
   premultipliedInterpolation: bool,
   linearRgbInterpolation: bool,
   ramp: List<u8>,
@@ -322,6 +323,8 @@ impl Gradient {
       valid: valid,
       single: false,
       premultipliedInterpolation: false,
+      tangent: kind == RADIAL && r0 != r1
+        && (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0) == (r1 - r0) * (r1 - r0),
       linearRgbInterpolation: false,
       ramp: List<u8>.make(),
     }
@@ -348,9 +351,7 @@ impl Gradient {
     spread: u8,
     transform: &Affine,
   ) -> Gradient {
-    let mut g = Gradient.make(RADIAL, fx, fy, fr, cx, cy, r, spread, transform)
-    g.single = !(r > 0.0)
-    return move g
+    return Gradient.make(RADIAL, fx, fy, fr, cx, cy, r, spread, transform)
   }
 
   /// A linear gradient with true inverse homogeneous pixel-center mapping.
@@ -441,6 +442,11 @@ impl Gradient {
     return self.single
   }
 
+  /// Whether the ramp appends an exact tangent-cone limiting color at `RAMP_SIZE`.
+  pub fn hasTangentLimit(self: &Self) -> bool {
+    return self.tangent && !self.single
+  }
+
   pub fn spreadMode(self: &Self) -> u8 {
     return self.spread
   }
@@ -456,7 +462,7 @@ impl Gradient {
     return [self.x0, self.y0, self.r0, self.x1, self.y1, self.r1]
   }
 
-  /// The premultiplied RGBA8 ramp, [`RAMP_SIZE`] entries (empty before [`setStops`]).
+  /// The premultiplied RGBA8 ramp: `RAMP_SIZE` entries, plus one if `hasTangentLimit`.
   pub fn rampBytes(self: &Self) -> &[u8] {
     return self.ramp.asSlice()
   }
@@ -473,10 +479,20 @@ impl Gradient {
     ! OutOfMemoryError
     ? &mut Allocator {
     self.ramp.clear()
-    if stops.length == 0 {
+    self.single = stops.length == 1
+      || (self.kind == LINEAR && self.x0 == self.x1 && self.y0 == self.y1)
+    if stops.length == 0
+      || (!self.single && self.kind == RADIAL && self.x0 == self.x1 && self.y0 == self.y1
+        && self.r0 == self.r1) {
       return
     }
-    run self.ramp.appendRepeated(0, RAMP_SIZE * 4)
+    let tangent = self.hasTangentLimit()
+    let entries = if tangent {
+      RAMP_SIZE + 1
+    } else {
+      RAMP_SIZE
+    }
+    run self.ramp.appendRepeated(0, entries * 4)
     let ramp = self.ramp.asMutSlice()
     let first = pack(stops[0].color.premultiply())
     let last = pack(stops[stops.length - 1].color.premultiply())
@@ -537,6 +553,22 @@ impl Gradient {
         }
       }
     }
+    if tangent {
+      // CR2018 #RadialGradientNotes: the internally tangent exterior has the
+      // limiting terminal color (pad), or the offset-weighted period average.
+      // Reflect has the same mean as repeat. Integrate stops before tabulation
+      // so thin segments and alpha are not lost to ramp quantization.
+      let limit = if self.spread == SPREAD_PAD {
+        if self.r1 > self.r0 {
+          last
+        } else {
+          first
+        }
+      } else {
+        pack(averageStops(stops, self.premultipliedInterpolation, self.linearRgbInterpolation))
+      }
+      storePacked(&mut ramp, RAMP_SIZE * 4, limit)
+    }
   }
 
   /// The gradient parameter at gradient-space point `p`, or [`NOTHING`] where nothing is painted.
@@ -557,16 +589,11 @@ impl Gradient {
     let a = cdx * cdx + cdy * cdy - dr * dr
     let b = pdx * cdx + pdy * cdy + self.r0 * dr
     let c = pdx * pdx + pdy * pdy - self.r0 * self.r0
-    if f64.abs(a) < 1.0e-12 {
-      if b == 0.0 {
-        return NOTHING
+    if self.tangent {
+      if b == 0.0 || (b < 0.0) == (dr > 0.0) {
+        return LIMIT_COLOR
       }
-      let t = c / (2.0 * b)
-      return if self.r0 + t * dr >= 0.0 {
-        t
-      } else {
-        NOTHING
-      }
+      return c / (2.0 * b)
     }
     let disc = b * b - a * c
     if disc < 0.0 {
@@ -587,6 +614,78 @@ impl Gradient {
 
 /// Encodes "nothing painted here" apart from every real parameter.
 const NOTHING: f64 = -1.0e300
+
+const LIMIT_COLOR: f64 = -2.0e300
+
+fn averageStop(color: Rgba8, premultiplied: bool, linearRgb: bool) -> [f64; 4] {
+  if linearRgb {
+    return linearStop(color, premultiplied)
+  }
+  let alpha = u8.toF64(color.a) / 255.0
+  let factor = if premultiplied {
+    alpha / 255.0
+  } else {
+    1.0 / 255.0
+  }
+  return [u8.toF64(color.r) * factor, u8.toF64(color.g) * factor, u8.toF64(color.b) * factor, alpha]
+}
+
+fn integrateStops(
+  sum: &mut [f64; 4],
+  a: &[f64; 4],
+  b: &[f64; 4],
+  width: f64,
+  premultiplied: bool,
+) -> () {
+  let mut channel: usize = 0
+  while channel < 3 {
+    let mean = if premultiplied {
+      (a[channel] + b[channel]) * 0.5
+    } else {
+      // Integral of two linear functions' product: color(t) * alpha(t).
+      (2.0 * a[channel] * a[3] + a[channel] * b[3] + b[channel] * a[3] + 2.0 * b[channel] * b[3])
+        / 6.0
+    }
+    sum[channel] = sum[channel] + width * mean
+    channel = channel + 1
+  }
+  sum[3] = sum[3] + width * (a[3] + b[3]) * 0.5
+}
+
+fn averageStops(stops: &[Stop], premultiplied: bool, linearRgb: bool) -> Rgba8 {
+  let mut sum = [0.0; 4]
+  let mut previous = clamp01(stops[0].offset)
+  let mut left = averageStop(stops[0].color, premultiplied, linearRgb)
+  integrateStops(&mut sum, &left, &left, previous, premultiplied)
+  let mut i: usize = 1
+  while i < stops.length {
+    let offset = f64.max(previous, clamp01(stops[i].offset))
+    let right = averageStop(stops[i].color, premultiplied, linearRgb)
+    integrateStops(&mut sum, &left, &right, offset - previous, premultiplied)
+    previous = offset
+    left = right
+    i = i + 1
+  }
+  integrateStops(&mut sum, &left, &left, 1.0 - previous, premultiplied)
+  return Rgba8 {
+    r: if linearRgb {
+      colorSpace.encode(sum[0], sum[3])
+    } else {
+      colorSpace.byte(sum[0])
+    },
+    g: if linearRgb {
+      colorSpace.encode(sum[1], sum[3])
+    } else {
+      colorSpace.byte(sum[1])
+    },
+    b: if linearRgb {
+      colorSpace.encode(sum[2], sum[3])
+    } else {
+      colorSpace.byte(sum[2])
+    },
+    a: colorSpace.byte(sum[3]),
+  }
+}
 
 /// Interpolates stop colors `a` and `b` with weight `wb / 65536` on `b`, straight (then
 /// premultiplied) or premultiplied.
@@ -660,6 +759,9 @@ impl Shader for Gradient {
     }
     if !self.single {
       let t = self.parameter(p)
+      if t == LIMIT_COLOR {
+        return unpack(rampWord(ramp, RAMP_SIZE))
+      }
       if t == NOTHING || !f64.isFinite(t) {
         return Rgba8.make(0, 0, 0, 0)
       }
@@ -736,6 +838,11 @@ impl Shader for Gradient {
     while i < count {
       let k = usize.toF64(i)
       let t = self.parameter(Point.make(start.x + k * self.inverse.a, start.y + k * self.inverse.b))
+      if t == LIMIT_COLOR {
+        out[i] = rampWord(ramp, RAMP_SIZE)
+        i = i + 1
+        continue
+      }
       if t == NOTHING || !f64.isFinite(t) {
         out[i] = 0
       } else {
