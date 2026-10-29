@@ -479,3 +479,133 @@ test effect fn gradientTransformUpdatesRetainColorsAndRecoverFromSingularMaps() 
     "affine instance recovers validity and uses the existing ramp",
   )
 }
+
+// SVG2 CR2018 pservers.html#StopNotes and #RadialGradientNotes:
+// zero/one stops resolve before the two-circle distribution. Identical circles
+// with multiple stops are transparent, including two zero-radius circles.
+test effect fn radialDegeneracyAndStopCountPrecedence() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut radius = 0.0
+  while radius <= 2.0 {
+    let mut g = Gradient.radial(4.5, 4.5, radius, 4.5, 4.5, radius, SPREAD_PAD, &Affine.identity())
+    run blackToWhite(&mut g) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      !g.isPaintable() && g.shade(4, 4).a == 0,
+      "identical circles have no gradient distribution",
+    )
+    run g.setStops(&[Stop { offset: 0.7, color: Rgba8.make(255, 0, 0, 128) }])
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(
+      g.isSingle() && g.shade(20, 20).r == 128 && g.shade(20, 20).a == 128,
+      "one stop is solid before circle degeneracy",
+    )
+    run blackToWhite(&mut g) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(!g.isPaintable(), "resetting stops restores identical-circle transparency")
+    run g.setStops(&[]) |> Effect.provideMut<Allocator>(&mut allocator)
+    run Testing.expect(!g.isPaintable(), "zero stops remain none")
+    radius = radius + 2.0
+  }
+}
+
+test effect fn shrinkingRadialCircleCanEndAtZeroRadius() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut g = Gradient.radial(6.5, 6.5, 0.0, 6.5, 6.5, 4.0, SPREAD_PAD, &Affine.identity())
+  run blackToWhite(&mut g) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !g.isSingle() && g.shade(6, 6).r == 255 && g.shade(12, 6).r == 0,
+    "zero end radius is not a solid last stop",
+  )
+  run Testing.expect(close(g.shade(8, 6).r, 128, 1), "shrinking circle midpoint has radius two")
+
+  // Changing the gradient-space scale must not turn a quadratic into a tangent.
+  let mut tiny = Gradient.radial(
+    0.00000045,
+    0.00000045,
+    0.0000002,
+    0.00000045,
+    0.00000045,
+    0.0000001,
+    SPREAD_PAD,
+    &Affine.scale(10000000.0, 10000000.0),
+  )
+  run blackToWhite(&mut tiny) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(tiny.shade(6, 4).r == 255, "small nonzero quadratic coefficient is not zero")
+}
+
+// CR2018 #RadialGradientNotes' tangent illustration and the linked
+// https://www.w3.org/2011/07/29-svg-minutes.html#item05 require offset weighting.
+// Reflect has the same mean as repeat: its period is one ramp and its reverse.
+test effect fn tangentRadialLimitUsesWeightedPeriodMean() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let stops = [
+    Stop { offset: -1.0, color: Rgba8.make(255, 0, 0, 255) },
+    Stop { offset: 0.25, color: Rgba8.make(255, 0, 0, 255) },
+    Stop { offset: 0.2, color: Rgba8.make(0, 0, 255, 255) },
+    Stop { offset: 2.0, color: Rgba8.make(0, 0, 255, 255) },
+  ]
+  let modes = [SPREAD_PAD, SPREAD_REPEAT, SPREAD_REFLECT]
+  let mut i: usize = 0
+  while i < modes.length {
+    let mut g = Gradient.radial(4.5, 4.5, 4.0, 8.5, 4.5, 0.0, modes[i], &Affine.identity())
+    run g.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+    let expected = if i == 0 {
+      Rgba8.make(0, 0, 255, 255)
+    } else {
+      Rgba8.make(64, 0, 191, 255)
+    }
+    run Testing.expect(
+      pack(g.shade(10, 3)) == pack(expected),
+      "exterior tangent half-plane has a limiting color, not transparency",
+    )
+    let mut span: [u32; 3] = [0; 3]
+    g.shadeSpan(9, 4, 3, &mut span)
+    run Testing.expect(
+      span[0] == pack(expected) && span[2] == pack(expected),
+      "span and scalar limit agree",
+    )
+    run g.setProjective(&Homography.fromAffine(&Affine.identity()))
+    run Testing.expect(
+      pack(g.shade(10, 3)) == pack(expected),
+      "projective path retains the same tangent limit",
+    )
+    i = i + 1
+  }
+  let mut shrinking = Gradient.radial(8.5, 4.5, 0.0, 4.5, 4.5, 4.0, SPREAD_PAD, &Affine.identity())
+  run shrinking.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    shrinking.shade(10, 3).r == 255,
+    "shrinking tangent pad extends the first stop",
+  )
+}
+
+test effect fn tangentPeriodMeanIntegratesAlphaAndInterpolationSpace() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let stops = [
+    Stop { offset: 0.0, color: Rgba8.make(255, 0, 0, 255) },
+    Stop { offset: 1.0, color: Rgba8.make(0, 0, 255, 0) },
+  ]
+  let mut g = Gradient.radial(4.5, 4.5, 4.0, 8.5, 4.5, 0.0, SPREAD_REPEAT, &Affine.identity())
+  run g.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+
+  // Integral of ((1-t)^2, 0, t(1-t), 1-t), not an average of rounded ramp entries.
+  run Testing.expect(
+    pack(g.shade(10, 3)) == pack(Rgba8.make(85, 0, 43, 128)),
+    "straight alpha integrates the product of color and opacity",
+  )
+  g.setPremultipliedInterpolation(true)
+  run g.setStops(&stops) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    pack(g.shade(10, 3)) == pack(Rgba8.make(128, 0, 0, 128)),
+    "premultiplied interpolation integrates linearly",
+  )
+  g.setLinearRgbInterpolation(true)
+  run blackToWhite(&mut g) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    g.shade(10, 3).r == 188 && g.shade(10, 3).a == 255,
+    "linearRGB mean is encoded after integration",
+  )
+}

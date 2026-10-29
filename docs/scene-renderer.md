@@ -180,8 +180,24 @@ without Dawn.
    - Gradients: linear, and radial in the SVG 2 two-point conical form (focal circle `fx fy fr`
      to end circle `cx cy r`, taking the largest `t` with a non-negative radius; points outside
      a cone stay transparent). Spread pad, reflect and repeat. Stop offsets are clamped and made
-     non-decreasing; equal offsets give hard edges; a zero-length vector or zero radius paints
-     the last stop. Colors are tabulated into a 1024-entry premultiplied ramp; interpolation is in
+     non-decreasing; equal offsets give hard edges. Per SVG2 CR2018
+     [StopNotes](https://www.w3.org/TR/2018/CR-SVG2-20181004/pservers.html#StopNotes),
+     zero stops paint nothing and one stop is solid before radial geometry is considered.
+     With multiple stops, a zero-length linear vector paints the last stop, while identical
+     radial circles (including two zero radii) paint nothing. A zero end radius with a positive
+     focal radius is a shrinking gradient, not a solid color. SVG callers must reject
+     zero-dimension object-bounding-box paint before this stop-count rule.
+     At internal tangency, the exterior half-plane uses the appropriate terminal color for
+     pad and the offset-weighted period average for repeat/reflect, following CR2018
+     [RadialGradientNotes](https://www.w3.org/TR/2018/CR-SVG2-20181004/pservers.html#RadialGradientNotes)
+     and its [2011 resolution](https://www.w3.org/2011/07/29-svg-minutes.html#item05).
+     Reflect's forward/reverse period has the same average as repeat. The average integrates
+     color times alpha in the selected interpolation space before quantization; it is not
+     an unweighted stop mean or an average of rounded ramp entries.
+     Colors are tabulated into a 1024-entry premultiplied ramp; tangent gradients append their
+     exact limiting color at entry 1024 (`hasTangentLimit`). CPU and GPU use that same entry,
+     with bit 1 of the existing paint flags word selecting the tangent equation. Non-tangent
+     ramps and the 16/19-word paint record sizes are unchanged. Interpolation is in
      straight alpha by default (resvg and Skia's SVG behaviour) or premultiplied (CSS Images 3).
      `Gradient.setLinearRgbInterpolation(true)` before `setStops` decodes straight sRGB stop
      channels to linear light in f64, interpolates in the selected alpha mode, then encodes
