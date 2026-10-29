@@ -8,24 +8,26 @@ import geometry { Point, Rect, Affine }
 import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
 import path { Path }
 import projective { Homography }
-import stroke { Stroker, Stroke, measureLength, measureLengthInSpace }
+import stroke { Stroker, Stroke, LengthEstimate, measureLength, measureLengthInSpace }
 
 fn identity() -> Homography {
   return Homography.fromAffine(&Affine.identity())
 }
 
-effect fn near(actual: f64, expected: f64, tolerance: f64) -> ()
+effect fn near(actual: LengthEstimate, expected: f64, tolerance: f64) -> ()
   ! AssertionError<'static> {
   run Testing.expect(
-    f64.isFinite(actual) && f64.abs(actual - expected) <= tolerance,
-    "total length respects absolute error",
+    f64.isFinite(actual.value) && f64.isFinite(actual.error) && actual.error >= 0.0
+      && actual.error <= tolerance
+      && f64.abs(actual.value - expected) <= actual.error,
+    "reported length interval contains the independent reference within the requested budget",
   )
 }
 
-effect fn failure(result: &Result<f64, GeometryError>, code: u8) -> ()
+effect fn failure(result: &Result<LengthEstimate, GeometryError>, code: u8) -> ()
   ! AssertionError<'static> {
   match &result.* {
-    Result<f64, GeometryError>.Failure { error } => {
+    Result<LengthEstimate, GeometryError>.Failure { error } => {
       run Testing.expect(error.code == code, "exact geometry error contract")
     }
     _ => {
@@ -64,6 +66,16 @@ test effect fn lengthEmptyAndDegenerateGeometryIsZero() -> ()
   eye.wx = 1.0
   eye.ww = -3.0
   run near(run measureLengthInSpace(&p, &eye, 1.0e-30), 0.0, 0.0)
+}
+
+test effect fn lengthTinyReturningCurvePreservesUncertainty() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+
+  // x(t) = 2e-8*t*(1-t): out to 5e-9 and back, despite equal endpoints.
+  run p.quadTo(1.0e-8, 0.0, 0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run near(run measureLength(&p, 1.0e-4), 1.0e-8, 1.0e-4)
 }
 
 test effect fn lengthExactCircleAndNonuniformMappedEllipse() -> ()
