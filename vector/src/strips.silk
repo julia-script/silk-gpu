@@ -18,6 +18,10 @@ import silk.num.f32
 import silk.num.f64
 import silk.num.u32
 import silk.num.usize
+import silk.simd.f32x4
+import silk.simd.i32x4
+import silk.simd.u8x16
+import silk.simd.u32x4
 import geometry { Affine }
 import path { Path }
 import flatten { Line, TOLERANCE }
@@ -220,10 +224,12 @@ impl Rasterizer {
     let flags = stride * u32.toUsize(bandCount)
     let haveFlags = self.touched.length()
     if haveFlags < flags { run self.touched.appendRepeated(0, flags - haveFlags) }
-    self.bandAlphas.clear()
-    run self.bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND))
-    self.columnKinds.clear()
-    run self.columnKinds.appendRepeated(0, u32.toUsize(localWidth))
+    // `resolve` writes every column's kind and every partial column's alphas before
+    // `emitBand` reads them, so these only need to be long enough.
+    let haveAlphas = self.bandAlphas.length()
+    if haveAlphas < u32.toUsize(localWidth * BAND) { run self.bandAlphas.appendRepeated(0, u32.toUsize(localWidth * BAND) - haveAlphas) }
+    let haveKinds = self.columnKinds.length()
+    if haveKinds < u32.toUsize(localWidth) { run self.columnKinds.appendRepeated(0, u32.toUsize(localWidth) - haveKinds) }
     let originX = u32.toF32(bx0)
     let lines = self.clipped.asSlice()
     let mut k: usize = 0
@@ -244,8 +250,10 @@ impl Rasterizer {
   }
 }
 
-/// Adds the signed area of `line` to the cells of rows `top .. bottom`. Cell `c` of row `r` lives
-/// at `area[(r - top) * stride + c]`, in coordinates relative to `originX`; `touched` flags each
+/// Adds the signed area of `line` to the cells of rows `top .. bottom`. Each band of `BAND` rows
+/// takes `stride * BAND` cells, column-major: cell `c` of row `r` lives at
+/// `area[band * stride * BAND + c * BAND + (r - top) % BAND]` with `band = (r - top) / BAND`, in
+/// coordinates relative to `originX`, so a column's rows load as one vector. `touched` flags each
 /// column of each band that received area.
 fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, originX: f32, localWidth: f32, top: u32, bottom: u32) -> () {
   let mut dir: f32 = 1.0
@@ -277,8 +285,9 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
     let xa = clampX(ax + (rowTop - ay) * dxdy, 0.0, localWidth)
     let xb = clampX(ax + (rowBottom - ay) * dxdy, 0.0, localWidth)
     let d = dy * dir
-    let line0 = u32.toUsize(y - top) * stride
-    let flags = Slice.viewMut(&mut touched, u32.toUsize((y - top) / BAND) * stride, stride)
+    let band = u32.toUsize((y - top) / BAND)
+    let line0 = band * stride * 4 + u32.toUsize((y - top) % BAND)
+    let flags = Slice.viewMut(&mut touched, band * stride, stride)
     let x0 = minF32(xa, xb)
     let x1 = maxF32(xa, xb)
     // x0 and x1 are in 0 ..= localWidth, so truncating is the floor, and converting back is
@@ -295,8 +304,8 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
       flags[x0i] = 1
       flags[x0i + 1] = 1
       let xmf = 0.5 * (xa + xb) - x0floor
-      area[line0 + x0i] = area[line0 + x0i] + (d - d * xmf)
-      area[line0 + x0i + 1] = area[line0 + x0i + 1] + d * xmf
+      area[line0 + x0i * 4] = area[line0 + x0i * 4] + (d - d * xmf)
+      area[line0 + (x0i + 1) * 4] = area[line0 + (x0i + 1) * 4] + d * xmf
     } else {
       let mut ti = x0i
       while ti <= x1i {
@@ -308,21 +317,21 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
       let a0 = 0.5 * s * (1.0 - x0f) * (1.0 - x0f)
       let x1f = x1 - x1ceil + 1.0
       let am = 0.5 * s * x1f * x1f
-      area[line0 + x0i] = area[line0 + x0i] + d * a0
+      area[line0 + x0i * 4] = area[line0 + x0i * 4] + d * a0
       if x1i == x0i + 2 {
-        area[line0 + x0i + 1] = area[line0 + x0i + 1] + d * (1.0 - a0 - am)
+        area[line0 + (x0i + 1) * 4] = area[line0 + (x0i + 1) * 4] + d * (1.0 - a0 - am)
       } else {
         let a1 = s * (1.5 - x0f)
-        area[line0 + x0i + 1] = area[line0 + x0i + 1] + d * (a1 - a0)
+        area[line0 + (x0i + 1) * 4] = area[line0 + (x0i + 1) * 4] + d * (a1 - a0)
         let mut xi = x0i + 2
         while xi < x1i - 1 {
-          area[line0 + xi] = area[line0 + xi] + d * s
+          area[line0 + xi * 4] = area[line0 + xi * 4] + d * s
           xi = xi + 1
         }
         let a2 = a1 + u32.toF32(x1u - x0u - 3) * s
-        area[line0 + x1i - 1] = area[line0 + x1i - 1] + d * (1.0 - a2 - am)
+        area[line0 + (x1i - 1) * 4] = area[line0 + (x1i - 1) * 4] + d * (1.0 - a2 - am)
       }
-      area[line0 + x1i] = area[line0 + x1i] + d * am
+      area[line0 + x1i * 4] = area[line0 + x1i * 4] + d * am
     }
     y = y + 1
   }
@@ -330,31 +339,24 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
 
 /// Prefix-sums each row's cells into column-major alphas and classifies each column, zeroing the
 /// cells and `touched` flags it reads. Rows past `rows` have no area (lines were clipped to the
-/// canvas), so they resolve to zero. A column no line touched repeats the column before it.
+/// canvas), so they resolve to zero. A column no line touched repeats the column before it. The
+/// four rows of a column are one vector (see [`accumulate`]).
 fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32, rows: u32, rule: u8, alphas: &mut [u8], kinds: &mut [u8]) -> () {
   let width = u32.toUsize(localWidth)
   // The packed column word of a fully covered column: 255 in each row inside the canvas.
   let all: u32 = 0xffffffff
   let full = if rows >= BAND { all } else { u32.shiftLeft(1, rows * 8) - 1 }
-  let mut a0: f32 = 0.0
-  let mut a1: f32 = 0.0
-  let mut a2: f32 = 0.0
-  let mut a3: f32 = 0.0
+  let zero = f32x4.splat(0.0)
+  let mut sum = zero
   let mut word: u32 = 0
   let mut kind = EMPTY
   let mut c: usize = 0
   while c < width {
     if touched[c] != 0 {
       touched[c] = 0
-      a0 = a0 + area[c]
-      a1 = a1 + area[stride + c]
-      a2 = a2 + area[2 * stride + c]
-      a3 = a3 + area[3 * stride + c]
-      area[c] = 0.0
-      area[stride + c] = 0.0
-      area[2 * stride + c] = 0.0
-      area[3 * stride + c] = 0.0
-      word = alphaOf(a0, rule) | u32.shiftLeft(alphaOf(a1, rule), 8) | u32.shiftLeft(alphaOf(a2, rule), 16) | u32.shiftLeft(alphaOf(a3, rule), 24)
+      sum = sum + f32x4.load(&area, c * 4)
+      f32x4.store(&mut area, c * 4, zero)
+      word = alphaWord(sum, rule)
       kind = if word == 0 { EMPTY } else if word == full { SOLID } else { PARTIAL }
     }
     kinds[c] = kind
@@ -369,20 +371,34 @@ fn resolve(area: &mut [f32], touched: &mut [u8], stride: usize, localWidth: u32,
   // Cells right of the canvas collect area that no column reads.
   while c < stride {
     touched[c] = 0
-    area[c] = 0.0
-    area[stride + c] = 0.0
-    area[2 * stride + c] = 0.0
-    area[3 * stride + c] = 0.0
+    f32x4.store(&mut area, c * 4, zero)
     c = c + 1
   }
 }
 
-/// The 0..=255 coverage of an accumulated winding area.
-fn alphaOf(acc: f32, rule: u8) -> u32 {
-  let mut coverage = f32.abs(acc)
-  if rule == EVENODD { coverage = f32.abs(acc - 2.0 * f32.round(acc * 0.5)) }
-  // In range by construction (0 <= coverage * 255 + 0.5 < 256).
-  return Intrinsic.f32ToU32(minF32(coverage, 1.0) * 255.0 + 0.5)
+/// The 0..=255 coverages of four accumulated winding areas, packed one byte per lane (lane 0 in
+/// the low byte). The same values as the scalar `round(min(|coverage|, 1) * 255)` with the
+/// nonzero or even-odd fold.
+fn alphaWord(sum: simd<f32, 4>, rule: u8) -> u32
+with Intrinsic.inlineAlways() {
+  let zero = f32x4.splat(0.0)
+  let one = f32x4.splat(1.0)
+  let mut coverage = f32x4.select(f32x4.lanesLess(sum, zero), zero - sum, sum)
+  if rule == EVENODD {
+    // Distance to the nearest even integer. Adding and removing 1.5 * 2^23 rounds half to even
+    // where the scalar rounds half away from zero; the two differ only at odd integers, where
+    // either gives 1.
+    let magic = f32x4.splat(12582912.0)
+    let half = sum * f32x4.splat(0.5)
+    let nearest = (half + magic) - magic
+    let folded = sum - nearest * f32x4.splat(2.0)
+    coverage = f32x4.select(f32x4.lanesLess(folded, zero), zero - folded, folded)
+  }
+  let clamped = f32x4.select(f32x4.lanesLess(coverage, one), coverage, one)
+  // In range by construction (0 <= clamped * 255 + 0.5 < 256).
+  let bytes = i32x4.bitcastToU8x16(f32x4.toI32x4(clamped * f32x4.splat(255.0) + f32x4.splat(0.5)))
+  let packed = u8x16.shuffle(bytes, bytes, [0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12, 0, 4, 8, 12])
+  return u32x4.extract(u8x16.bitcastToU32x4(packed), 0)
 }
 
 const EMPTY: u8 = 0
