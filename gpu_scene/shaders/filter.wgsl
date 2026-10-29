@@ -36,6 +36,8 @@ const OP_TRANSFER: u32 = 10u;
 const OP_TILE: u32 = 11u;
 const OP_CONVOLVE: u32 = 12u;
 const OP_DISPLACE: u32 = 13u;
+const OP_TURBULENCE: u32 = 14u;
+const OP_LIGHTING: u32 = 15u;
 
 const EDGE_DUPLICATE: u32 = 0u;
 const EDGE_NONE: u32 = 2u;
@@ -286,6 +288,178 @@ fn displace(pixel: vec2u) -> vec4u {
   return bytes(first, vec2u(source));
 }
 
+// feTurbulence, the spec's reference noise in f32. data holds the 514-entry lattice, then the
+// gradients as f32 bits at 514 + (channel * 514 + index) * 2 + component. p0 is the octave
+// count, p1 bit 0 fractal noise and bit 1 stitching, k.xy the (stitch-adjusted) base
+// frequencies, color the stitch width, height, wrapX and wrapY, and m[0], m[1].xy the
+// device-to-user transform a..f.
+fn lattice(i: i32) -> i32 { return i32(data[i]); }
+fn gradient(channel: u32, index: i32) -> vec2f {
+  let at = 514u + (channel * 514u + u32(index)) * 2u;
+  return vec2f(bitcast<f32>(data[at]), bitcast<f32>(data[at + 1u]));
+}
+
+fn noise2(channel: u32, v: vec2f, stitching: bool, stitch: vec4i) -> f32 {
+  // floor(v) + 4096 equals the reference's (int)(v + 4096) without losing f32 bits to the sum.
+  let cell = floor(v);
+  var bx0 = i32(cell.x) + 4096;
+  var by0 = i32(cell.y) + 4096;
+  var bx1 = bx0 + 1;
+  var by1 = by0 + 1;
+  let rx0 = v.x - cell.x;
+  let ry0 = v.y - cell.y;
+  let rx1 = rx0 - 1.0;
+  let ry1 = ry0 - 1.0;
+  if stitching {
+    if bx0 >= stitch.z { bx0 -= stitch.x; }
+    if bx1 >= stitch.z { bx1 -= stitch.x; }
+    if by0 >= stitch.w { by0 -= stitch.y; }
+    if by1 >= stitch.w { by1 -= stitch.y; }
+  }
+  bx0 &= 255;
+  bx1 &= 255;
+  by0 &= 255;
+  by1 &= 255;
+  let i = lattice(bx0);
+  let j = lattice(bx1);
+  let b00 = lattice(i + by0);
+  let b10 = lattice(j + by0);
+  let b01 = lattice(i + by1);
+  let b11 = lattice(j + by1);
+  let sx = rx0 * rx0 * (3.0 - 2.0 * rx0);
+  let sy = ry0 * ry0 * (3.0 - 2.0 * ry0);
+  var q = gradient(channel, b00);
+  let u0 = rx0 * q.x + ry0 * q.y;
+  q = gradient(channel, b10);
+  let v0 = rx1 * q.x + ry0 * q.y;
+  let a = u0 + sx * (v0 - u0);
+  q = gradient(channel, b01);
+  let u1 = rx0 * q.x + ry1 * q.y;
+  q = gradient(channel, b11);
+  let v1 = rx1 * q.x + ry1 * q.y;
+  let b = u1 + sx * (v1 - u1);
+  return a + sy * (b - a);
+}
+
+fn turbulence(pixel: vec2u) -> vec4u {
+  let m = params.m;
+  let p = vec2f(pixel);
+  let user = vec2f(m[0].x * p.x + m[0].z * p.y + m[1].x, m[0].y * p.x + m[0].w * p.y + m[1].y);
+  let fractal = (params.p1 & 1u) != 0u;
+  let stitching = (params.p1 & 2u) != 0u;
+  var c = vec4f(0.0);
+  for (var channel = 0u; channel < 4u; channel++) {
+    var v = user * params.k.xy;
+    var stitch = vec4i(params.color);
+    var sum = 0.0;
+    var ratio = 1.0;
+    for (var octave = 0u; octave < params.p0; octave++) {
+      let n = noise2(channel, v, stitching, stitch);
+      if fractal { sum += n / ratio; } else { sum += abs(n) / ratio; }
+      v *= 2.0;
+      ratio *= 2.0;
+      stitch = vec4i(stitch.x * 2, stitch.y * 2, 2 * stitch.z - 4096, 2 * stitch.w - 4096);
+    }
+    if fractal { sum = (sum + 1.0) / 2.0; }
+    c[channel] = sum;
+  }
+  let a = byte(clamp01(c.w));
+  return vec4u(div255(byte(clamp01(c.x)) * a), div255(byte(clamp01(c.y)) * a), div255(byte(clamp01(c.z)) * a), a);
+}
+
+// feDiffuseLighting and feSpecularLighting: p0 bit 0 specular, bits 8.. the light kind; k the
+// surface scale, constant, exponent and cone cosine; color the lighting color; m[0] the distant
+// direction and spot exponent, m[1] the position, m[2] the spot direction.
+fn alphaAt(x: u32, y: u32) -> f32 { return f32(bytes(first, vec2u(x, y)).w) / 255.0; }
+
+fn surfaceNormal(x: u32, y: u32, surfaceScale: f32) -> vec2f {
+  let r = params.region;
+  var left = x;
+  if x > r.x { left = x - 1u; }
+  var right = x;
+  if x + 1u < r.z { right = x + 1u; }
+  var top = y;
+  if y > r.y { top = y - 1u; }
+  var bottom = y;
+  if y + 1u < r.w { bottom = y + 1u; }
+  var nx = 0.0;
+  if right > left {
+    var weight = 2.0;
+    var sum = 2.0 * (alphaAt(right, y) - alphaAt(left, y));
+    if top < y {
+      sum = sum + (alphaAt(right, top) - alphaAt(left, top));
+      weight = weight + 1.0;
+    }
+    if bottom > y {
+      sum = sum + (alphaAt(right, bottom) - alphaAt(left, bottom));
+      weight = weight + 1.0;
+    }
+    nx = 0.0 - surfaceScale * 2.0 / (f32(right - left) * weight) * sum;
+  }
+  var ny = 0.0;
+  if bottom > top {
+    var weight = 2.0;
+    var sum = 2.0 * (alphaAt(x, bottom) - alphaAt(x, top));
+    if left < x {
+      sum = sum + (alphaAt(left, bottom) - alphaAt(left, top));
+      weight = weight + 1.0;
+    }
+    if right > x {
+      sum = sum + (alphaAt(right, bottom) - alphaAt(right, top));
+      weight = weight + 1.0;
+    }
+    ny = 0.0 - surfaceScale * 2.0 / (f32(bottom - top) * weight) * sum;
+  }
+  return vec2f(nx, ny);
+}
+
+fn powUnit(base: f32, power: f32) -> f32 {
+  if power == 0.0 { return 1.0; }
+  if base <= 0.0 { return 0.0; }
+  return pow(base, power);
+}
+
+fn lighting(pixel: vec2u) -> vec4u {
+  let specular = (params.p0 & 1u) != 0u;
+  let kind = params.p0 >> 8u;
+  let surfaceScale = params.k.x;
+  let n = surfaceNormal(pixel.x, pixel.y, surfaceScale);
+  let z = surfaceScale * alphaAt(pixel.x, pixel.y);
+  let m = params.m;
+  let nLength = sqrt(n.x * n.x + n.y * n.y + 1.0);
+  var l = m[0].xyz;
+  if kind != 0u {
+    l = m[1].xyz - vec3f(f32(pixel.x), f32(pixel.y), z);
+    let length = sqrt(l.x * l.x + l.y * l.y + l.z * l.z);
+    if length > 0.0 { l = l / length; }
+  }
+  var scale = 1.0;
+  if kind == 2u {
+    let minusLDotS = 0.0 - (l.x * m[2].x + l.y * m[2].y + l.z * m[2].z);
+    if minusLDotS <= 0.0 || minusLDotS < params.k.w { scale = 0.0; } else { scale = powUnit(minusLDotS, m[0].w); }
+  }
+  var factor = 0.0;
+  if specular {
+    let h = vec3f(l.x, l.y, l.z + 1.0);
+    let hLength = sqrt(h.x * h.x + h.y * h.y + h.z * h.z);
+    if hLength > 0.0 {
+      let nDotH = (n.x * h.x + n.y * h.y + h.z) / (nLength * hLength);
+      factor = params.k.y * powUnit(min(max(nDotH, 0.0), 1.0), params.k.z);
+    }
+  } else {
+    let nDotL = (n.x * l.x + n.y * l.y + l.z) / nLength;
+    factor = params.k.y * max(nDotL, 0.0);
+  }
+  let k = factor * scale;
+  let color = params.color;
+  let r = clamp01(k * f32(color.x) / 255.0);
+  let g = clamp01(k * f32(color.y) / 255.0);
+  let b = clamp01(k * f32(color.z) / 255.0);
+  if !specular { return vec4u(byte(r), byte(g), byte(b), 255u); }
+  let a = byte(max(r, max(g, b)));
+  return vec4u(div255(byte(r) * a), div255(byte(g) * a), div255(byte(b) * a), a);
+}
+
 @fragment fn fs(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let pixel = vec2u(position.xy);
   if params.op == OP_CONVERT {
@@ -321,6 +495,8 @@ fn displace(pixel: vec2u) -> vec4u {
     case OP_TILE: { return emit(tile(pixel)); }
     case OP_CONVOLVE: { return emit(convolve(pixel)); }
     case OP_DISPLACE: { return emit(displace(pixel)); }
+    case OP_TURBULENCE: { return emit(turbulence(pixel)); }
+    case OP_LIGHTING: { return emit(lighting(pixel)); }
     default: { return vec4f(0.0); }
   }
 }

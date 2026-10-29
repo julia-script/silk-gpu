@@ -22,6 +22,7 @@ import silk.num.usize
 import strips { minU32 }
 import pixmap { Pixmap, Rgba8, div255 }
 import layer as layering
+import geometry { Affine, Point }
 
 /// A pixel rectangle `x0 .. x1` by `y0 .. y1`, the primitive subregion in device pixels.
 pub struct Region {
@@ -937,4 +938,402 @@ pub fn displacementMap(out: &mut Pixmap, input: &Pixmap, map: &Pixmap, table: &[
     }
     y = y + 1
   }
+}
+
+/// `feTurbulence` attributes. Frequencies and the tile (the primitive subregion, for
+/// `stitchTiles`) are in user space.
+pub struct TurbulenceSettings {
+  pub baseFrequencyX: f64,
+  pub baseFrequencyY: f64,
+  pub octaves: u32,
+  pub fractalNoise: bool,
+  pub stitchTiles: bool,
+  pub tileX: f64,
+  pub tileY: f64,
+  pub tileWidth: f64,
+  pub tileHeight: f64,
+}
+impl Copy for TurbulenceSettings {}
+
+/// Base frequencies adjusted for stitching and the stitch lattice extents of the first octave
+/// (the spec's `StitchInfo`); `enabled` is false without `stitchTiles`.
+pub struct Stitch {
+  pub frequencyX: f64,
+  pub frequencyY: f64,
+  pub enabled: bool,
+  pub width: i64,
+  pub height: i64,
+  pub wrapX: i64,
+  pub wrapY: i64,
+}
+impl Copy for Stitch {}
+
+const PERLIN_N: i64 = 4096
+const LATTICE: usize = 514
+
+fn stitchFrequency(frequency: f64, size: f64) -> f64 {
+  if frequency == 0.0 { return frequency }
+  let lo = f64.floor(size * frequency) / size
+  let hi = f64.ceil(size * frequency) / size
+  return if frequency / lo < hi / frequency { lo } else { hi }
+}
+
+pub fn stitchOf(settings: &TurbulenceSettings) -> Stitch {
+  if !settings.stitchTiles {
+    return Stitch { frequencyX: settings.baseFrequencyX, frequencyY: settings.baseFrequencyY, enabled: false, width: 0, height: 0, wrapX: 0, wrapY: 0 }
+  }
+  let fx = stitchFrequency(settings.baseFrequencyX, settings.tileWidth)
+  let fy = stitchFrequency(settings.baseFrequencyY, settings.tileHeight)
+  let width = f64.toI64(f64.trunc(settings.tileWidth * fx + 0.5))
+  let height = f64.toI64(f64.trunc(settings.tileHeight * fy + 0.5))
+  return Stitch {
+    frequencyX: fx, frequencyY: fy, enabled: true, width: width, height: height,
+    wrapX: f64.toI64(f64.trunc(settings.tileX * fx + i64.toF64(PERLIN_N + width))),
+    wrapY: f64.toI64(f64.trunc(settings.tileY * fy + i64.toF64(PERLIN_N + height))),
+  }
+}
+
+/// The lattice and gradients of the spec's reference noise for one `seed`.
+pub struct Turbulence {
+  latticeList: List<u32>,
+  /// `(channel * 514 + index) * 2 + component`.
+  gradientList: List<f64>,
+}
+
+fn nextRandom(seed: i64) -> i64 {
+  let result = 16807 * (seed % 127773) - 2836 * (seed / 127773)
+  return if result <= 0 { result + 2147483647 } else { result }
+}
+
+impl Turbulence {
+  /// `seed` is the attribute value, rounded like the spec's `setup_seed` input.
+  pub effect fn make(seed: f64) -> Turbulence ! OutOfMemoryError ? &mut Allocator {
+    let mut s = f64.toI64(f64.round(seed))
+    if s <= 0 { s = 0 - (s % (2147483647 - 1)) + 1 }
+    if s > 2147483647 - 1 { s = 2147483647 - 1 }
+    let mut lattice = List<u32>.make()
+    run lattice.appendRepeated(0, LATTICE)
+    let mut gradients = List<f64>.make()
+    run gradients.appendRepeated(0.0, 4 * LATTICE * 2)
+    let l = lattice.asMutSlice()
+    let g = gradients.asMutSlice()
+    let mut k: usize = 0
+    while k < 4 {
+      let mut i: usize = 0
+      while i < 256 {
+        l[i] = usize.toU32(i)
+        s = nextRandom(s)
+        let gx = i64.toF64((s % 512) - 256) / 256.0
+        s = nextRandom(s)
+        let gy = i64.toF64((s % 512) - 256) / 256.0
+        let length = f64.sqrt(gx * gx + gy * gy)
+        g[(k * LATTICE + i) * 2] = gx / length
+        g[(k * LATTICE + i) * 2 + 1] = gy / length
+        i = i + 1
+      }
+      k = k + 1
+    }
+    let mut i: usize = 255
+    while i > 0 {
+      let t = l[i]
+      s = nextRandom(s)
+      let j = i64.toUsize(s % 256)
+      l[i] = l[j]
+      l[j] = t
+      i = i - 1
+    }
+    i = 0
+    while i < 258 {
+      l[256 + i] = l[i]
+      k = 0
+      while k < 4 {
+        g[(k * LATTICE + 256 + i) * 2] = g[(k * LATTICE + i) * 2]
+        g[(k * LATTICE + 256 + i) * 2 + 1] = g[(k * LATTICE + i) * 2 + 1]
+        k = k + 1
+      }
+      i = i + 1
+    }
+    return Turbulence { latticeList: move lattice, gradientList: move gradients }
+  }
+  /// The permutation, 514 entries.
+  pub fn lattice(self: &Self) -> &[u32] { return self.latticeList.asSlice() }
+  /// Unit gradients, `(channel * 514 + index) * 2 + component`.
+  pub fn gradients(self: &Self) -> &[f64] { return self.gradientList.asSlice() }
+
+  fn noise2(self: &Self, channel: usize, vx: f64, vy: f64, stitch: &Stitch, width: i64, height: i64, wrapX: i64, wrapY: i64) -> f64 {
+    let tx = vx + i64.toF64(PERLIN_N)
+    let mut bx0 = f64.toI64(f64.trunc(tx))
+    let rx0 = tx - f64.trunc(tx)
+    let rx1 = rx0 - 1.0
+    let ty = vy + i64.toF64(PERLIN_N)
+    let mut by0 = f64.toI64(f64.trunc(ty))
+    let ry0 = ty - f64.trunc(ty)
+    let ry1 = ry0 - 1.0
+    // Compared before masking (resvg and browsers do; SVG 1.1's listing masks first, which
+    // turns stitching off).
+    let mut bx1 = bx0 + 1
+    let mut by1 = by0 + 1
+    if stitch.enabled {
+      if bx0 >= wrapX { bx0 = bx0 - width }
+      if bx1 >= wrapX { bx1 = bx1 - width }
+      if by0 >= wrapY { by0 = by0 - height }
+      if by1 >= wrapY { by1 = by1 - height }
+    }
+    bx0 = bx0 & 255
+    bx1 = bx1 & 255
+    by0 = by0 & 255
+    by1 = by1 & 255
+    let l = self.latticeList.asSlice()
+    let i = u32.toI64(l[i64.toUsize(bx0)])
+    let j = u32.toI64(l[i64.toUsize(bx1)])
+    let b00 = u32.toUsize(l[i64.toUsize(i + by0)])
+    let b10 = u32.toUsize(l[i64.toUsize(j + by0)])
+    let b01 = u32.toUsize(l[i64.toUsize(i + by1)])
+    let b11 = u32.toUsize(l[i64.toUsize(j + by1)])
+    let sx = rx0 * rx0 * (3.0 - 2.0 * rx0)
+    let sy = ry0 * ry0 * (3.0 - 2.0 * ry0)
+    let g = self.gradientList.asSlice()
+    let base = channel * LATTICE
+    let u0 = rx0 * g[(base + b00) * 2] + ry0 * g[(base + b00) * 2 + 1]
+    let v0 = rx1 * g[(base + b10) * 2] + ry0 * g[(base + b10) * 2 + 1]
+    let a = u0 + sx * (v0 - u0)
+    let u1 = rx0 * g[(base + b01) * 2] + ry1 * g[(base + b01) * 2 + 1]
+    let v1 = rx1 * g[(base + b11) * 2] + ry1 * g[(base + b11) * 2 + 1]
+    let b = u1 + sx * (v1 - u1)
+    return a + sy * (b - a)
+  }
+
+  /// The spec's `turbulence(channel, point)` at a user-space point.
+  pub fn sample(self: &Self, channel: usize, x: f64, y: f64, settings: &TurbulenceSettings, stitch: &Stitch) -> f64 {
+    let mut vx = x * stitch.frequencyX
+    let mut vy = y * stitch.frequencyY
+    let mut sum = 0.0
+    let mut ratio = 1.0
+    let mut width = stitch.width
+    let mut height = stitch.height
+    let mut wrapX = stitch.wrapX
+    let mut wrapY = stitch.wrapY
+    let mut octave: u32 = 0
+    while octave < settings.octaves {
+      let n = self.noise2(channel, vx, vy, stitch, width, height, wrapX, wrapY)
+      sum = sum + (if settings.fractalNoise { n } else { f64.abs(n) }) / ratio
+      vx = vx * 2.0
+      vy = vy * 2.0
+      ratio = ratio * 2.0
+      width = width * 2
+      wrapX = 2 * wrapX - PERLIN_N
+      height = height * 2
+      wrapY = 2 * wrapY - PERLIN_N
+      octave = octave + 1
+    }
+    return sum
+  }
+}
+
+/// `feTurbulence` over the region; `toUser` maps device pixels to user space, where the
+/// noise is defined (each pixel samples at its top-left corner).
+pub fn turbulence(out: &mut Pixmap, noise: &Turbulence, settings: &TurbulenceSettings, toUser: &Affine, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let stitch = stitchOf(settings)
+  let stride = u32.toUsize(out.width()) * 4
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let p = toUser.apply(Point.make(u32.toF64(x), u32.toF64(y)))
+      let mut c: [u8; 4] = [0; 4]
+      let mut channel: usize = 0
+      while channel < 4 {
+        let mut v = noise.sample(channel, p.x, p.y, settings, &stitch)
+        if settings.fractalNoise { v = (v + 1.0) / 2.0 }
+        c[channel] = transferByte(v)
+        channel = channel + 1
+      }
+      store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, Rgba8.make(c[0], c[1], c[2], c[3]).premultiply())
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+pub const LIGHT_DISTANT: u8 = 0
+pub const LIGHT_POINT: u8 = 1
+pub const LIGHT_SPOT: u8 = 2
+
+/// A light source in device space: `feDistantLight` (degrees), `fePointLight` or `feSpotLight`
+/// (positions in device pixels, z scaled like x). `limitingConeAngle` is in degrees; a negative
+/// value means no cone.
+pub struct Light {
+  pub kind: u8,
+  pub azimuth: f64,
+  pub elevation: f64,
+  pub x: f64,
+  pub y: f64,
+  pub z: f64,
+  pub pointsAtX: f64,
+  pub pointsAtY: f64,
+  pub pointsAtZ: f64,
+  pub specularExponent: f64,
+  pub limitingConeAngle: f64,
+}
+impl Copy for Light {}
+
+/// `feDiffuseLighting` (`specular` false: `constant` is kd) or `feSpecularLighting` (`constant`
+/// is ks, with `exponent`). `color` is the straight `lighting-color`.
+pub struct Lighting {
+  pub specular: bool,
+  pub surfaceScale: f32,
+  pub constant: f32,
+  pub exponent: f32,
+  pub color: Rgba8,
+  pub light: Light,
+}
+impl Copy for Lighting {}
+
+/// The f32 light parameters both renderers use: the unit vector of a distant light, the
+/// position, the unit spot direction, the cone cosine (or -2 without a cone) and the spot
+/// exponent.
+pub struct LightSetup {
+  pub kind: u8,
+  pub direction: [f32; 3],
+  pub position: [f32; 3],
+  pub spot: [f32; 3],
+  pub coneCosine: f32,
+  pub spotExponent: f32,
+}
+impl Copy for LightSetup {}
+
+pub fn lightSetupOf(light: &Light) -> LightSetup {
+  let radians = 3.141592653589793 / 180.0
+  let az = light.azimuth * radians
+  let el = light.elevation * radians
+  let direction: [f32; 3] = [f64.toF32(f64.cos(az) * f64.cos(el)), f64.toF32(f64.sin(az) * f64.cos(el)), f64.toF32(f64.sin(el))]
+  let sx = light.pointsAtX - light.x
+  let sy = light.pointsAtY - light.y
+  let sz = light.pointsAtZ - light.z
+  let length = f64.sqrt(sx * sx + sy * sy + sz * sz)
+  let spot: [f32; 3] = if length > 0.0 { [f64.toF32(sx / length), f64.toF32(sy / length), f64.toF32(sz / length)] } else { [0.0, 0.0, 0.0] }
+  let cone: f64 = if light.limitingConeAngle >= 0.0 { f64.cos(light.limitingConeAngle * radians) } else { -2.0 }
+  return LightSetup {
+    kind: light.kind, direction: direction, position: [f64.toF32(light.x), f64.toF32(light.y), f64.toF32(light.z)], spot: spot,
+    coneCosine: f64.toF32(cone), spotExponent: f64.toF32(light.specularExponent),
+  }
+}
+
+/// `base ^ power` in f32 for `base` in `0 ..= 1` (both renderers round the same f64 result
+/// differently only past the last bit).
+pub fn powUnit(base: f32, power: f32) -> f32 {
+  if power == 0.0 { return 1.0 }
+  if base <= 0.0 { return 0.0 }
+  return f64.toF32(pow(f32.toF64(base), f32.toF64(power)))
+}
+
+fn alphaAt(s: &[u8], stride: usize, x: u32, y: u32) -> f32 { return u8.toF32(s[u32.toUsize(y) * stride + u32.toUsize(x) * 4 + 3]) / 255.0 }
+
+/// The surface normal's x and y (before normalizing with z = 1) at `(x, y)` of the region `r`,
+/// with the spec's Sobel kernels: one-sided differences and their factors at the edges.
+pub fn surfaceNormal(s: &[u8], stride: usize, r: Region, x: u32, y: u32, surfaceScale: f32) -> [f32; 2] {
+  let left = if x > r.x0 { x - 1 } else { x }
+  let right = if x + 1 < r.x1 { x + 1 } else { x }
+  let top = if y > r.y0 { y - 1 } else { y }
+  let bottom = if y + 1 < r.y1 { y + 1 } else { y }
+  let mut nx: f32 = 0.0
+  if right > left {
+    // Rows y - 1, y, y + 1 weighted 1, 2, 1 where they exist.
+    let mut weight: f32 = 2.0
+    let mut sum = 2.0 * (alphaAt(s, stride, right, y) - alphaAt(s, stride, left, y))
+    if top < y {
+      sum = sum + (alphaAt(s, stride, right, top) - alphaAt(s, stride, left, top))
+      weight = weight + 1.0
+    }
+    if bottom > y {
+      sum = sum + (alphaAt(s, stride, right, bottom) - alphaAt(s, stride, left, bottom))
+      weight = weight + 1.0
+    }
+    nx = 0.0 - surfaceScale * 2.0 / (u32.toF32(right - left) * weight) * sum
+  }
+  let mut ny: f32 = 0.0
+  if bottom > top {
+    let mut weight: f32 = 2.0
+    let mut sum = 2.0 * (alphaAt(s, stride, x, bottom) - alphaAt(s, stride, x, top))
+    if left < x {
+      sum = sum + (alphaAt(s, stride, left, bottom) - alphaAt(s, stride, left, top))
+      weight = weight + 1.0
+    }
+    if right > x {
+      sum = sum + (alphaAt(s, stride, right, bottom) - alphaAt(s, stride, right, top))
+      weight = weight + 1.0
+    }
+    ny = 0.0 - surfaceScale * 2.0 / (u32.toF32(bottom - top) * weight) * sum
+  }
+  return [nx, ny]
+}
+
+/// `feDiffuseLighting` or `feSpecularLighting` over the region, with the input's alpha as the
+/// bump map. Computes in f32.
+pub fn lighting(out: &mut Pixmap, input: &Pixmap, lighting: &Lighting, region: Region) -> () {
+  clear(&mut out)
+  let r = region.clampTo(out.width(), out.height())
+  let setup = lightSetupOf(&lighting.light)
+  let stride = u32.toUsize(out.width()) * 4
+  let s = input.data()
+  let d = out.dataMut()
+  let mut y = r.y0
+  while y < r.y1 {
+    let mut x = r.x0
+    while x < r.x1 {
+      let n = surfaceNormal(s, stride, r, x, y, lighting.surfaceScale)
+      let z = lighting.surfaceScale * alphaAt(s, stride, x, y)
+      store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, lightPixel(n[0], n[1], u32.toF32(x), u32.toF32(y), z, lighting, &setup))
+      x = x + 1
+    }
+    y = y + 1
+  }
+}
+
+pub fn lightPixel(nx: f32, ny: f32, x: f32, y: f32, z: f32, lighting: &Lighting, setup: &LightSetup) -> Rgba8 {
+  let nLength = f32.sqrt(nx * nx + ny * ny + 1.0)
+  let mut lx = setup.direction[0]
+  let mut ly = setup.direction[1]
+  let mut lz = setup.direction[2]
+  if setup.kind != LIGHT_DISTANT {
+    lx = setup.position[0] - x
+    ly = setup.position[1] - y
+    lz = setup.position[2] - z
+    let length = f32.sqrt(lx * lx + ly * ly + lz * lz)
+    if length > 0.0 {
+      lx = lx / length
+      ly = ly / length
+      lz = lz / length
+    }
+  }
+  // The light color, attenuated by a spot light's direction and cone.
+  let mut scale: f32 = 1.0
+  if setup.kind == LIGHT_SPOT {
+    let minusLDotS = 0.0 - (lx * setup.spot[0] + ly * setup.spot[1] + lz * setup.spot[2])
+    if minusLDotS <= 0.0 || minusLDotS < setup.coneCosine { scale = 0.0 } else { scale = powUnit(minusLDotS, setup.spotExponent) }
+  }
+  let mut factor: f32 = 0.0
+  if lighting.specular {
+    let hx = lx
+    let hy = ly
+    let hz = lz + 1.0
+    let hLength = f32.sqrt(hx * hx + hy * hy + hz * hz)
+    if hLength > 0.0 {
+      let nDotH = (nx * hx + ny * hy + hz) / (nLength * hLength)
+      factor = lighting.constant * powUnit(f32.min(f32.max(nDotH, 0.0), 1.0), lighting.exponent)
+    }
+  } else {
+    let nDotL = (nx * lx + ny * ly + lz) / nLength
+    factor = lighting.constant * f32.max(nDotL, 0.0)
+  }
+  let k = factor * scale
+  let r = clamp01(k * u8.toF32(lighting.color.r) / 255.0)
+  let g = clamp01(k * u8.toF32(lighting.color.g) / 255.0)
+  let b = clamp01(k * u8.toF32(lighting.color.b) / 255.0)
+  if !lighting.specular { return Rgba8.make(byte(r), byte(g), byte(b), 255) }
+  let a = f32.max(r, f32.max(g, b))
+  return Rgba8.make(byte(r), byte(g), byte(b), byte(a)).premultiply()
 }

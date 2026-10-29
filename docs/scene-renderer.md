@@ -108,7 +108,13 @@ without Dawn.
    `div255`, arithmetic in f32), `feMerge`, `feBlend`, `feMorphology` (separable min/max), `feComponentTransfer` (per-channel
    256-byte tables built in f64, applied to integer-unpremultiplied bytes), `feTile`,
    `feConvolveMatrix` (f32, all edge modes and `preserveAlpha`), `feDisplacementMap` (a per-byte
-   whole-pixel displacement table, nearest neighbor) and the linearRGB conversions. Conversions
+   whole-pixel displacement table, nearest neighbor), `feTurbulence` (the spec's reference noise; stitch
+   lattice points are compared before masking, as resvg and browsers do, because the SVG 1.1
+   listing masks first and never stitches), `feDiffuseLighting` and `feSpecularLighting`
+   (distant, point and spot lights in device space; Sobel normals with the spec's one-sided
+   edge kernels) and the linearRGB conversions. `feDropShadow` is a composition of these
+   (blur, offset, flood, composite, merge), and `feImage` renders through the scene, so the SVG
+   renderer builds both. Conversions
    go through a 256 x 256 table of `(alpha, channel)` so the GPU applies exactly the CPU's
    result. On the GPU each primitive is a full-target pass of `shaders/filter.wgsl` (blur takes
    one pass per box or kernel and ping-pongs through a scratch image); `blend.wgsl` holds the
