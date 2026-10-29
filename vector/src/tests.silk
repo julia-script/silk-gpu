@@ -2,6 +2,7 @@ import ellipse_tests
 import projective_tests
 import stroke_projective_tests
 import stroke_space_tests
+import path_metric_tests
 import projective_paint_tests
 import silk.testing.testing { AssertionError, Testing }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
@@ -321,15 +322,21 @@ test effect fn binaryCoverageThresholdPreservesSharedPayload() -> ()
   )
 }
 
-test effect fn aliasedFillSamplesPixelCenters() -> () ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+test effect fn aliasedFillSamplesPixelCenters() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.3, 1.6, 5.4, 2.8) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut raster = Rasterizer.make()
   let mut c = Coverage.make(8, 8)
-  run raster.fillAliased(&p, &Affine.identity(), NONZERO, &mut c) |> Effect.provideMut<Allocator>(&mut allocator)
+  run raster.fillAliased(&p, &Affine.identity(), NONZERO, &mut c)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+
   // Centers 0.5 ..= 5.5 lie in [0.3, 5.7) and 2.5, 3.5 in [1.6, 4.4).
   run Testing.expect(c.alphaAt(0, 2) == 255 && c.alphaAt(5, 3) == 255, "corner pixels covered")
-  run Testing.expect(c.alphaAt(6, 2) == 0 && c.alphaAt(0, 1) == 0 && c.alphaAt(0, 4) == 0, "neighbors empty")
+  run Testing.expect(
+    c.alphaAt(6, 2) == 0 && c.alphaAt(0, 1) == 0 && c.alphaAt(0, 4) == 0,
+    "neighbors empty",
+  )
   run Testing.expect(totalArea(&c) == 12.0, "twelve whole pixels")
 }
 
@@ -343,15 +350,24 @@ fn windingAt(xs: &[f64], ys: &[f64], px: f64, py: f64) -> i32 {
     let down = ys[j] <= py && py < ys[i]
     if up || down {
       let x = xs[i] + (py - ys[i]) * (xs[j] - xs[i]) / (ys[j] - ys[i])
-      if x < px { winding = winding + (if up { 1 } else { -1 }) }
+      if x < px {
+        winding = winding
+          + (if up {
+            1
+          } else {
+            -1
+          })
+      }
     }
     i = i + 1
   }
   return winding
 }
 
-test effect fn aliasedFillMatchesCenterWinding() -> () ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+test effect fn aliasedFillMatchesCenterWinding() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
+
   // A self-intersecting pentagram: winding 2 in the middle, 1 in the points.
   let xs: [f64; 5] = [16.3, 25.1, 2.2, 30.4, 7.6]
   let ys: [f64; 5] = [1.7, 29.2, 11.9, 12.3, 29.8]
@@ -367,15 +383,26 @@ test effect fn aliasedFillMatchesCenterWinding() -> () ! AssertionError<'static>
   let mut rule: u8 = NONZERO
   while rule <= EVENODD {
     let mut c = Coverage.make(33, 31)
-    run raster.fillAliased(&p, &Affine.identity(), rule, &mut c) |> Effect.provideMut<Allocator>(&mut allocator)
+    run raster.fillAliased(&p, &Affine.identity(), rule, &mut c)
+      |> Effect.provideMut<Allocator>(&mut allocator)
     let mut y: u32 = 0
     while y < 31 {
       let mut x: u32 = 0
       while x < 33 {
         let w = windingAt(&xs, &ys, u32.toF64(x) + 0.5, u32.toF64(y) + 0.5)
-        let inside = if rule == EVENODD { w % 2 != 0 } else { w != 0 }
-        let expected: u8 = if inside { 255 } else { 0 }
-        if c.alphaAt(x, y) != expected { ok = false }
+        let inside = if rule == EVENODD {
+          w % 2 != 0
+        } else {
+          w != 0
+        }
+        let expected: u8 = if inside {
+          255
+        } else {
+          0
+        }
+        if c.alphaAt(x, y) != expected {
+          ok = false
+        }
         x = x + 1
       }
       y = y + 1
@@ -384,6 +411,7 @@ test effect fn aliasedFillMatchesCenterWinding() -> () ! AssertionError<'static>
   }
   run Testing.expect(ok, "every pixel matches the winding at its center under both rules")
   let mut c = Coverage.make(33, 31)
-  run raster.fillAliased(&p, &Affine.identity(), EVENODD, &mut c) |> Effect.provideMut<Allocator>(&mut allocator)
+  run raster.fillAliased(&p, &Affine.identity(), EVENODD, &mut c)
+    |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(c.alphaAt(16, 16) == 0, "even-odd leaves the middle empty")
 }
