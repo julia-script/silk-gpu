@@ -1,0 +1,181 @@
+//! Host-owned presentation targets. No windows or event loop are created here.
+//! A native target's unsafe constructor ties the host object's lifetime to the
+//! surface; the caller guarantees native pointer provenance and thread affinity.
+import webgpu_sys.generated_webgpu as sys
+import webgpu_sys.generated_webgpu {
+  WGPUChainedStruct, WGPUSurfaceDescriptor, WGPUSurfaceSourceMetalLayer,
+  WGPUSurfaceSourceWaylandSurface, WGPUSurfaceSourceXlibWindow,
+  WGPUSurfaceSourceWindowsHWND, WGPUSurfaceCapabilities,
+  WGPUSurfaceConfiguration, WGPUSurfaceTexture,
+}
+import runtime { Instance, Adapter, Device, GpuError }
+import resources { Texture }
+import descriptors { stringView }
+import surface_canvas { CanvasSource }
+import diagnostics { Diagnostics, HandleLease }
+import silk.core.ownership { Drop, Copy }
+import silk.mem.pointer { Pointer }
+
+pub struct SurfaceTarget<'host> {
+  kind: u32,
+  first: ?*mut u8,
+  second: ?*mut u8,
+  window: u64,
+  canvas: &'host [u8],
+}
+impl<'host> SurfaceTarget<'host> {
+  // `owner` must own the native objects, which remain valid on this thread until
+  // every surface borrowing this target is dropped. The pointers are not retained.
+  pub unsafe fn metalLayer<T>(owner: &'host T, layer: ?*mut u8) -> Self {
+    return Self { kind: 1, first: layer, second: Pointer.null<u8>(), window: 0, canvas: &[] }
+  }
+  pub unsafe fn wayland<T>(owner: &'host T, display: ?*mut u8, surface: ?*mut u8) -> Self {
+    return Self { kind: 2, first: display, second: surface, window: 0, canvas: &[] }
+  }
+  pub unsafe fn x11<T>(owner: &'host T, display: ?*mut u8, window: u64) -> Self {
+    return Self { kind: 3, first: display, second: Pointer.null<u8>(), window: window, canvas: &[] }
+  }
+  pub unsafe fn windows<T>(owner: &'host T, hwnd: ?*mut u8, hinstance: ?*mut u8) -> Self {
+    return Self { kind: 4, first: hwnd, second: hinstance, window: 0, canvas: &[] }
+  }
+  pub fn canvasSelector(selector: &'host [u8]) -> Self {
+    return Self { kind: 5, first: Pointer.null<u8>(), second: Pointer.null<u8>(), window: 0, canvas: selector }
+  }
+  pub fn canvasId(id: &'host [u8]) -> Self {
+    return Self { kind: 6, first: Pointer.null<u8>(), second: Pointer.null<u8>(), window: 0, canvas: id }
+  }
+}
+
+pub struct Surface<'target> {
+  handle: sys.WGPUSurface,
+  observer: Diagnostics,
+  lease: HandleLease,
+}
+impl<'target> Surface<'target> {
+  pub effect fn create(instance: &Instance, target: &SurfaceTarget<'target>, label: &[u8]) -> Self ! GpuError {
+    let mut descriptor = WGPUSurfaceDescriptor.default()
+    descriptor.label = stringView(label)
+    let mut metal = WGPUSurfaceSourceMetalLayer.default()
+    let mut wayland = WGPUSurfaceSourceWaylandSurface.default()
+    let mut x11 = WGPUSurfaceSourceXlibWindow.default()
+    let mut windows = WGPUSurfaceSourceWindowsHWND.default()
+    let mut canvas = CanvasSource.make(target.canvas, target.kind == 6)
+    if target.kind == 1 {
+      metal.layer = target.first
+      descriptor.nextInChain = Pointer.fromMutRef(&mut metal.chain)
+    } else if target.kind == 2 {
+      wayland.display = target.first
+      wayland.surface = target.second
+      descriptor.nextInChain = Pointer.fromMutRef(&mut wayland.chain)
+    } else if target.kind == 3 {
+      x11.display = target.first
+      x11.window = target.window
+      descriptor.nextInChain = Pointer.fromMutRef(&mut x11.chain)
+    } else if target.kind == 4 {
+      windows.hwnd = target.first
+      windows.hinstance = target.second
+      descriptor.nextInChain = Pointer.fromMutRef(&mut windows.chain)
+    } else {
+      static if Intrinsic.targetArchitecture() != "wasm32" {
+        fail GpuError.status(sys.WGPUStatus_Error)
+      }
+      descriptor.nextInChain = Pointer.fromMutRef(&mut canvas.chain)
+    }
+    let handle = unsafe sys.wgpuInstanceCreateSurface(unsafe instance.raw(), Pointer.fromRef(&descriptor))
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    let observer = instance.diagnostics()
+    let lease = HandleLease.track(&observer)
+    return Self { handle: handle, observer: move observer, lease: move lease }
+  }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuSurfaceAddRef(self.handle)
+    return Self { handle: self.handle, observer: self.observer.dup(), lease: self.lease.dup() }
+  }
+  pub unsafe fn raw(self: &Self) -> sys.WGPUSurface { return self.handle }
+  pub effect fn getCapabilities(self: &Self, adapter: &Adapter) -> SurfaceCapabilities ! GpuError {
+    let mut capabilities = SurfaceCapabilities { value: WGPUSurfaceCapabilities.default() }
+    let status = unsafe sys.wgpuSurfaceGetCapabilities(self.handle, unsafe adapter.raw(), Pointer.fromMutRef(&mut capabilities.value))
+    if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+    return move capabilities
+  }
+  pub fn configure(self: &Self, configuration: &SurfaceConfiguration) -> () {
+    unsafe sys.wgpuSurfaceConfigure(self.handle, Pointer.fromRef(&configuration.value))
+  }
+  // Reuses the caller's configuration, including view formats and presentation mode.
+  // A minimized (zero-sized) host must wait for a nonzero framebuffer before resizing.
+  pub fn resize(self: &Self, configuration: &mut SurfaceConfiguration, width: u32, height: u32) -> () {
+    configuration.setSize(width, height)
+    self.configure(&configuration.*)
+  }
+  pub fn unconfigure(self: &Self) -> () { unsafe sys.wgpuSurfaceUnconfigure(self.handle) }
+  pub effect fn getCurrentTexture(self: &Self) -> SurfaceTexture ! GpuError {
+    let mut result = WGPUSurfaceTexture.default()
+    unsafe sys.wgpuSurfaceGetCurrentTexture(self.handle, Pointer.fromMutRef(&mut result))
+    if result.status != sys.WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal && result.status != sys.WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal {
+      if !Pointer.isNull(result.texture) { unsafe sys.wgpuTextureRelease(result.texture) }
+      fail GpuError.status(result.status)
+    }
+    if Pointer.isNull(result.texture) { fail GpuError.status(sys.WGPUSurfaceGetCurrentTextureStatus_Error) }
+    return SurfaceTexture { texture: unsafe Texture.adoptTracked(result.texture, &self.observer), suboptimal: result.status == sys.WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal }
+  }
+  pub effect fn present(self: &Self) -> () ! GpuError {
+    let status = unsafe sys.wgpuSurfacePresent(self.handle)
+    if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () { unsafe sys.wgpuSurfaceSetLabel(self.handle, stringView(label)) }
+}
+impl<'target> Drop for Surface<'target> {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuSurfaceRelease(self.handle) }
+}
+pub struct SurfaceTexture { pub texture: Texture, pub suboptimal: bool }
+
+pub struct SurfaceCapabilities { value: sys.WGPUSurfaceCapabilities }
+impl SurfaceCapabilities {
+  pub fn usages(self: &Self) -> u64 { return self.value.usages }
+  pub fn formats(self: &Self) -> &[u32] {
+    if self.value.formatCount == 0 { return &[] }
+    let pointer = unsafe Intrinsic.pointerRequalify<?[*]const u32, [*]const u32>(self.value.formats)
+    return unsafe Intrinsic.pointerBorrowMany<Self, u32>(self, pointer, self.value.formatCount)
+  }
+  pub fn presentModes(self: &Self) -> &[u32] {
+    if self.value.presentModeCount == 0 { return &[] }
+    let pointer = unsafe Intrinsic.pointerRequalify<?[*]const u32, [*]const u32>(self.value.presentModes)
+    return unsafe Intrinsic.pointerBorrowMany<Self, u32>(self, pointer, self.value.presentModeCount)
+  }
+  pub fn alphaModes(self: &Self) -> &[u32] {
+    if self.value.alphaModeCount == 0 { return &[] }
+    let pointer = unsafe Intrinsic.pointerRequalify<?[*]const u32, [*]const u32>(self.value.alphaModes)
+    return unsafe Intrinsic.pointerBorrowMany<Self, u32>(self, pointer, self.value.alphaModeCount)
+  }
+}
+impl Drop for SurfaceCapabilities {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuSurfaceCapabilitiesFreeMembers(self.value) }
+}
+
+pub struct SurfaceConfiguration<'a> { value: sys.WGPUSurfaceConfiguration }
+impl<'a> Copy for SurfaceConfiguration<'a> {}
+impl<'a> SurfaceConfiguration<'a> {
+  pub fn make(device: &'a Device, format: u32, width: u32, height: u32) -> Self {
+    let mut value = WGPUSurfaceConfiguration.default()
+    value.device = unsafe device.raw()
+    value.format = format
+    value.width = width
+    value.height = height
+    value.presentMode = sys.WGPUPresentMode_Fifo
+    return Self { value: value }
+  }
+  pub fn setSize(self: &mut Self, width: u32, height: u32) -> () {
+    self.value.width = width
+    self.value.height = height
+  }
+  pub fn setUsage(self: &mut Self, usage: u64) -> () { self.value.usage = usage }
+  pub fn setFormat(self: &mut Self, format: u32) -> () { self.value.format = format }
+  pub fn setPresentMode(self: &mut Self, mode: u32) -> () { self.value.presentMode = mode }
+  pub fn setAlphaMode(self: &mut Self, mode: u32) -> () { self.value.alphaMode = mode }
+  pub fn withViewFormats(self: Self, formats: &'a [u32]) -> Self {
+    let mut value = self.value
+    value.viewFormatCount = formats.length
+    value.viewFormats = Pointer.fromSlice(formats)
+    return Self { value: value }
+  }
+}

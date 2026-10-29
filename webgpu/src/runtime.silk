@@ -1,0 +1,860 @@
+//! Owned instances/devices and same-thread asynchronous completion slots.
+//! Native waits never lend a Silk reference to the callback pump. Browser requests
+//! are polled; dropping one unregisters its callback before releasing its slot.
+import webgpu_sys.generated_webgpu as sys
+import webgpu_sys.generated_webgpu {
+  WGPUInstanceDescriptor, WGPURequestAdapterOptions, WGPURequestAdapterCallbackInfo,
+  WGPUDeviceLostCallbackInfo, WGPUUncapturedErrorCallbackInfo, WGPURequestDeviceCallbackInfo,
+  WGPUPopErrorScopeCallbackInfo, WGPUFuture, WGPUFutureWaitInfo, WGPUStringView,
+}
+import descriptors { DeviceDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, Limits }
+import resources { Buffer, Queue, ShaderModule, ComputePipeline, RenderPipeline }
+import webgpu_sys.generated_webgpu { WGPUBufferMapCallbackInfo, WGPUQueueWorkDoneCallbackInfo }
+import webgpu_sys.generated_webgpu {
+  WGPUCompilationInfoCallbackInfo, WGPUCreateComputePipelineAsyncCallbackInfo,
+  WGPUCreateRenderPipelineAsyncCallbackInfo,
+}
+import surface { Surface }
+import diagnostics { Diagnostics }
+import capabilities as caps
+import capabilities { AdapterInfo, SupportedFeatures, SupportedWGSLLanguageFeatures }
+import host_memory
+import silk.core.ownership { Drop }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.option { Option }
+import silk.mem.pointer { Pointer }
+import silk.mem.box { Box }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.collections.list { List }
+import silk.concurrency.sync { Arc, Mutex }
+import silk.num.usize
+
+static if Intrinsic.targetArchitecture() != "wasm32" {
+  // LIMITATION-4: one declaration cannot mix thread and deferred callback modes.
+  // The thread registration writes the descriptor first; requestDeviceNative
+  // then installs the deferred lost callback and submits the complete descriptor.
+  unsafe extern "C" fn registerErrorNative(
+    descriptor: *mut sys.WGPUDeviceDescriptor, callback: sys.WGPUUncapturedErrorCallback,
+  ) -> () as "silkWebgpuRegisterError" with Intrinsic.foreign(threadCallbacks: ("callback",))
+  unsafe extern "C" fn requestDeviceNative(
+    adapter: sys.WGPUAdapter, descriptor: *mut sys.WGPUDeviceDescriptor,
+    lostCallback: sys.WGPUDeviceLostCallback, callbackInfo: sys.WGPURequestDeviceCallbackInfo,
+  ) -> sys.WGPUFuture as "silkWebgpuRequestDevice" with Intrinsic.foreign(
+    deferredCallbacks: ("lostCallback", "callbackInfo.callback"),
+  )
+}
+
+pub struct GpuError {
+  pub code: u32,
+  pub message: List<u8>,
+}
+impl GpuError {
+  pub fn status(code: u32) -> GpuError {
+    return GpuError { code: code, message: List<u8>.make() }
+  }
+}
+
+pub struct RequestAdapterOptions<'a> {
+  pub powerPreference: u32,
+  pub forceFallbackAdapter: bool,
+  pub featureLevel: u32,
+  pub backendType: u32,
+  pub compatibleSurface: Option<&'a Surface<'a>>,
+}
+impl<'a> RequestAdapterOptions<'a> {
+  pub fn default() -> RequestAdapterOptions<'a> {
+    return RequestAdapterOptions<'a> {
+      powerPreference: sys.WGPUPowerPreference_Undefined,
+      forceFallbackAdapter: false,
+      featureLevel: sys.WGPUFeatureLevel_Core,
+      backendType: sys.WGPUBackendType_Undefined,
+      compatibleSurface: Option<&'a Surface<'a>>.none(),
+    }
+  }
+  pub fn forSurface<'b>(surface: &'b Surface<'b>) -> RequestAdapterOptions<'b> {
+    return RequestAdapterOptions<'b> {
+      powerPreference: sys.WGPUPowerPreference_Undefined, forceFallbackAdapter: false,
+      featureLevel: sys.WGPUFeatureLevel_Core, backendType: sys.WGPUBackendType_Undefined,
+      compatibleSurface: Option<&'b Surface<'b>>.some(surface),
+    }
+  }
+}
+
+pub struct Instance { handle: sys.WGPUInstance, observer: Diagnostics }
+impl Instance {
+  pub effect fn create() -> Instance ! GpuError | OutOfMemoryError {
+    let observer = run Diagnostics.make()
+    let mut descriptor = WGPUInstanceDescriptor.default()
+    let features = [sys.WGPUInstanceFeatureName_TimedWaitAny]
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      descriptor.requiredFeatureCount = 1
+      descriptor.requiredFeatures = Pointer.fromSlice<u32>(&features)
+    }
+    let raw = unsafe sys.wgpuCreateInstance(Pointer.fromRef(&descriptor))
+    if Pointer.isNull(raw) { fail GpuError.status(sys.WGPUStatus_Error) }
+    observer.retain()
+    return Instance { handle: raw, observer: move observer }
+  }
+  pub fn dup(self: &Self) -> Instance {
+    unsafe sys.wgpuInstanceAddRef(self.handle)
+    self.observer.retain()
+    return Instance { handle: self.handle, observer: self.observer.dup() }
+  }
+  pub fn diagnostics(self: &Self) -> Diagnostics { return self.observer.dup() }
+  pub unsafe fn raw(self: &Self) -> sys.WGPUInstance { return self.handle }
+  pub fn getWGSLLanguageFeatures(self: &Self) -> SupportedWGSLLanguageFeatures {
+    return caps.wgslLanguageFeatures(self)
+  }
+  pub fn hasWGSLLanguageFeature(self: &Self, feature: u32) -> bool {
+    return caps.hasWGSLLanguageFeature(self, feature)
+  }
+  pub fn processEvents(self: &Self) -> () {
+    let handle = self.handle
+    unsafe sys.wgpuInstanceProcessEvents(handle)
+  }
+  pub effect fn requestAdapterStart<'a>(self: &Self, options: &RequestAdapterOptions<'a>) -> AdapterRequest<'a>
+    ! OutOfMemoryError {
+    let mut pending = run makePending(self, 1)
+    let mut rawOptions = WGPURequestAdapterOptions.default()
+    rawOptions.powerPreference = options.powerPreference
+    rawOptions.forceFallbackAdapter = if options.forceFallbackAdapter { 1 } else { 0 }
+    rawOptions.featureLevel = options.featureLevel
+    rawOptions.backendType = options.backendType
+    match options.compatibleSurface {
+      Option<&Surface>.Some { value } => { rawOptions.compatibleSurface = unsafe value.raw() }
+      Option<&Surface>.None => ()
+    }
+    let mut info = WGPURequestAdapterCallbackInfo.default(adapterCallbackAddress())
+    info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+    info.userdata1 = pending.userdata
+    pending.future = unsafe sys.wgpuInstanceRequestAdapter(self.handle, Pointer.fromRef(&rawOptions), info)
+    return AdapterRequest<'a> { pending: move pending, surface: options.compatibleSurface }
+  }
+  pub effect fn requestAdapter(self: &Self, options: &RequestAdapterOptions) -> Adapter
+    ! GpuError | OutOfMemoryError {
+    let mut request = run self.requestAdapterStart(options)
+    run request.pending.wait()
+    return run request.finish()
+  }
+}
+impl Drop for Instance {
+  fn drop(self: &mut Self) -> () {
+    unsafe sys.wgpuInstanceRelease(self.handle)
+    self.observer.release()
+  }
+}
+
+pub struct Adapter { handle: sys.WGPUAdapter, instance: Instance }
+impl Adapter {
+  pub fn dup(self: &Self) -> Adapter {
+    unsafe sys.wgpuAdapterAddRef(self.handle)
+    self.instance.observer.retain()
+    return Adapter { handle: self.handle, instance: self.instance.dup() }
+  }
+  pub unsafe fn raw(self: &Self) -> sys.WGPUAdapter { return self.handle }
+  pub effect fn getInfo(self: &Self) -> AdapterInfo ! GpuError { return run caps.adapterInfo(self) }
+  pub fn getFeatures(self: &Self) -> SupportedFeatures { return caps.adapterFeatures(self) }
+  pub effect fn getLimits(self: &Self) -> Limits<'static> ! GpuError { return run caps.adapterLimits(self) }
+  pub fn hasFeature(self: &Self, feature: u32) -> bool {
+    return unsafe sys.wgpuAdapterHasFeature(self.handle, feature) != 0
+  }
+  pub effect fn requestDeviceStart(self: &Self, options: &DeviceDescriptor) -> DeviceRequest
+    ! OutOfMemoryError {
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mailbox = run Mutex<FailureState>.make(FailureState {
+      error: Option<GpuError>.none(), registered: false, lostDelivered: false,
+      lostFuture: WGPUFuture.default(),
+      observer: self.instance.diagnostics(),
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let shared = run Arc<DeviceMailbox>.make(DeviceMailbox {
+      state: move mailbox, instance: self.instance.dup(),
+    }) |> Effect.provideMut<Allocator>(&mut allocator)
+    let mailboxPointer = Pointer.fromRef(&shared.get().state)
+    let erased = unsafe Intrinsic.pointerReinterpret<*const Mutex<FailureState>, *const u8>(mailboxPointer)
+    let userdata = unsafe Intrinsic.pointerRequalify<*const u8, ?*mut u8>(erased)
+    let mut lost = WGPUDeviceLostCallbackInfo.default(lostCallbackAddress())
+    lost.mode = sys.WGPUCallbackMode_AllowProcessEvents
+    lost.userdata1 = userdata
+    let mut error = WGPUUncapturedErrorCallbackInfo.default(errorCallbackAddress())
+    error.userdata1 = userdata
+    let mut descriptor = unsafe options.raw(lost, error)
+    let mut pending = run makePending(&self.instance, 2)
+    let mut info = WGPURequestDeviceCallbackInfo.default(deviceCallbackAddress())
+    info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+    info.userdata1 = pending.userdata
+    info.userdata2 = userdata
+    let mut registration = shared.get().state.lock()
+    let registeredState = registration.getMut()
+    registeredState.registered = true
+    drop registration
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      pending.future = unsafe sys.wgpuAdapterRequestDevice(self.handle, Pointer.fromRef(&descriptor), info)
+    } else {
+      unsafe registerErrorNative(Pointer.fromMutRef(&mut descriptor), error.callback)
+      pending.future = unsafe requestDeviceNative(self.handle, Pointer.fromMutRef(&mut descriptor), lost.callback, info)
+    }
+    return DeviceRequest { pending: move pending, mailbox: move shared }
+  }
+  pub effect fn requestDevice(self: &Self, options: &DeviceDescriptor) -> Device
+    ! GpuError | OutOfMemoryError {
+    let mut request = run self.requestDeviceStart(options)
+    run request.pending.wait()
+    return run request.finish()
+  }
+}
+impl Drop for Adapter {
+  fn drop(self: &mut Self) -> () {
+    unsafe sys.wgpuAdapterRelease(self.handle)
+    self.instance.observer.release()
+  }
+}
+
+struct FailureState {
+  error: Option<GpuError>,
+  observer: Diagnostics,
+  registered: bool,
+  lostDelivered: bool,
+  lostFuture: sys.WGPUFuture,
+}
+struct DeviceMailbox { state: Mutex<FailureState>, instance: Instance }
+impl DeviceMailbox {
+  fn delivered(self: &Self) -> bool {
+    let guard = self.state.lock()
+    return guard.get().lostDelivered
+  }
+}
+impl Drop for DeviceMailbox {
+  fn drop(self: &mut Self) -> () {
+    let guard = self.state.lock()
+    let registered = guard.get().registered
+    let future = guard.get().lostFuture
+    drop guard
+    if !registered { return () }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      // The host removes listeners and cancels queued callbacks on final release.
+      // Promise settlement cannot synchronously be waited for on the web.
+      if future.id != 0 { unsafe cancelFuture(future.id) }
+    } else {
+      // Last external DeviceRelease readies loss; it does not deliver it.
+      // Device events: https://webgpu-native.github.io/webgpu-headers/Asynchronous-Operations.html
+      // Uncaptured errors cannot fire after loss, so observing loss is the barrier
+      // for both callback userdata lifetimes, including failed device creation.
+      while !self.delivered() {
+        let instance = unsafe self.instance.raw()
+        if future.id == 0 {
+          unsafe sys.wgpuInstanceProcessEvents(instance)
+        } else {
+          let mut waitInfo = WGPUFutureWaitInfo.default()
+          waitInfo.future = future
+          drop unsafe sys.wgpuInstanceWaitAny(instance, 1, Pointer.fromMutRef(&mut waitInfo), 1000000000)
+        }
+      }
+    }
+  }
+}
+pub struct Device {
+  handle: sys.WGPUDevice,
+  instance: Instance,
+  mailbox: Arc<DeviceMailbox>,
+}
+impl Device {
+  pub fn dup(self: &Self) -> Device {
+    unsafe sys.wgpuDeviceAddRef(self.handle)
+    self.instance.observer.retain()
+    return Device { handle: self.handle, instance: self.instance.dup(), mailbox: self.mailbox.clone() }
+  }
+  pub fn diagnostics(self: &Self) -> Diagnostics { return self.instance.diagnostics() }
+  pub unsafe fn raw(self: &Self) -> sys.WGPUDevice { return self.handle }
+  pub effect fn getAdapterInfo(self: &Self) -> AdapterInfo ! GpuError { return run caps.deviceAdapterInfo(self) }
+  pub fn getFeatures(self: &Self) -> SupportedFeatures { return caps.deviceFeatures(self) }
+  pub effect fn getLimits(self: &Self) -> Limits<'static> ! GpuError { return run caps.deviceLimits(self) }
+  pub unsafe fn instanceRaw(self: &Self) -> sys.WGPUInstance { return unsafe self.instance.raw() }
+  pub fn hasFeature(self: &Self, feature: u32) -> bool {
+    return unsafe sys.wgpuDeviceHasFeature(self.handle, feature) != 0
+  }
+  pub fn destroy(self: &Self) -> () { unsafe sys.wgpuDeviceDestroy(self.handle) }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuDeviceSetLabel(self.handle, stringView(label))
+  }
+  pub fn pushErrorScope(self: &Self, filter: u32) -> () {
+    unsafe sys.wgpuDevicePushErrorScope(self.handle, filter)
+  }
+  pub effect fn checkErrors(self: &Self) -> () ! GpuError {
+    self.instance.processEvents()
+    let mut guard = self.mailbox.get().state.lock()
+    let state = guard.getMut()
+    let error = Intrinsic.replace(state.error, Option<GpuError>.none())
+    match move error {
+      Option<GpuError>.Some { value } => { fail move value }
+      Option<GpuError>.None => ()
+    }
+  }
+  pub effect fn popErrorScopeStart(self: &Self) -> StatusRequest ! OutOfMemoryError {
+    let mut pending = run makePending(&self.instance, 4)
+    let mut info = WGPUPopErrorScopeCallbackInfo.default(scopeCallbackAddress())
+    info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+    info.userdata1 = pending.userdata
+    pending.future = unsafe sys.wgpuDevicePopErrorScope(self.handle, info)
+    return StatusRequest { pending: move pending }
+  }
+  pub effect fn popErrorScope(self: &Self) -> () ! GpuError | OutOfMemoryError {
+    let mut request = run self.popErrorScopeStart()
+    run request.pending.wait()
+    run request.finish()
+  }
+}
+impl Drop for Device {
+  fn drop(self: &mut Self) -> () {
+    // The final shared mailbox drains loss after every external device ref has
+    // been released, while retaining an instance on which to drive that callback.
+    unsafe sys.wgpuDeviceRelease(self.handle)
+    self.instance.observer.release()
+  }
+}
+
+struct Completion<T> {
+  ready: bool,
+  status: u32,
+  errorType: u32,
+  handle: ?*mut u8,
+  message: List<u8>,
+  extra: T,
+}
+struct Pending<T> {
+  instance: Instance,
+  future: sys.WGPUFuture,
+  slot: Box<Completion<T>>,
+  userdata: ?*mut u8,
+  kind: u32,
+}
+effect fn makePending(instance: &Instance, kind: u32) -> Pending<()> ! OutOfMemoryError {
+  return run makePendingWith(instance, kind, ())
+}
+effect fn makePendingWith<T>(instance: &Instance, kind: u32, extra: T) -> Pending<T> ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut slot = run Box<Completion<T>>.make(Completion<T> {
+    ready: false, status: 0, errorType: sys.WGPUErrorType_NoError,
+    handle: Pointer.null<u8>(), message: List<u8>.make(),
+    extra: move extra,
+  }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let pointer = Pointer.fromMutRef(&mut slot.getMut()[0])
+  let erased = unsafe Intrinsic.pointerReinterpret<*mut Completion<T>, *mut u8>(pointer)
+  let userdata = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(erased)
+  return Pending<T> { instance: instance.dup(), future: WGPUFuture.default(), slot: move slot, userdata: userdata, kind: kind }
+}
+impl<T> Pending<T> {
+  fn poll(self: &mut Self) -> bool {
+    let instance = unsafe self.instance.raw()
+    unsafe sys.wgpuInstanceProcessEvents(instance)
+    return self.slot.get()[0].ready
+  }
+  effect fn wait(self: &mut Self) -> () ! GpuError {
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      // Blocking cannot drive the browser event loop. Use start/poll/finish.
+      if !self.slot.get()[0].ready { fail GpuError.status(0xfffffffe) }
+    } else {
+      while !self.slot.get()[0].ready {
+        let mut waitInfo = WGPUFutureWaitInfo.default()
+        waitInfo.future = self.future
+        let instance = unsafe self.instance.raw()
+        let waitPointer = Pointer.fromMutRef(&mut waitInfo)
+        let status = unsafe sys.wgpuInstanceWaitAny(instance, 1, waitPointer, 1000000000)
+        if status != sys.WGPUWaitStatus_Success && status != sys.WGPUWaitStatus_TimedOut {
+          fail GpuError.status(status)
+        }
+      }
+    }
+  }
+  effect fn take(self: &mut Self) -> ?*mut u8 ! GpuError {
+    let slot = &mut self.slot.getMut()[0]
+    if !slot.ready { fail GpuError.status(0xfffffffe) }
+    if slot.status != 1 || slot.errorType != sys.WGPUErrorType_NoError {
+      let code = if slot.status != 1 { slot.status } else { slot.errorType }
+      let message = Intrinsic.replace(slot.message, List<u8>.make())
+      fail GpuError { code: code, message: move message }
+    }
+    return Intrinsic.replace(slot.handle, Pointer.null<u8>())
+  }
+  fn drain(self: &mut Self) -> () {
+    if self.future.id == 0 || self.slot.get()[0].ready { return () }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe cancelFuture(self.future.id)
+    } else {
+      while !self.slot.get()[0].ready {
+        let mut waitInfo = WGPUFutureWaitInfo.default()
+        waitInfo.future = self.future
+        let instance = unsafe self.instance.raw()
+        drop unsafe sys.wgpuInstanceWaitAny(instance, 1, Pointer.fromMutRef(&mut waitInfo), 1000000000)
+      }
+    }
+  }
+}
+impl<T> Drop for Pending<T> {
+  fn drop(self: &mut Self) -> () {
+    self.drain()
+    let handle = self.slot.get()[0].handle
+    if !Pointer.isNull(handle) {
+      if self.kind == 1 { unsafe sys.wgpuAdapterRelease(handle) }
+      if self.kind == 2 { unsafe sys.wgpuDeviceRelease(handle) }
+      if self.kind == 9 { unsafe sys.wgpuComputePipelineRelease(handle) }
+      if self.kind == 10 { unsafe sys.wgpuRenderPipelineRelease(handle) }
+    }
+  }
+}
+
+pub struct AdapterRequest<'a> { pending: Pending<()>, surface: Option<&'a Surface<'a>> }
+impl<'a> AdapterRequest<'a> {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> Adapter ! GpuError {
+    let mut owned = move self
+    let handle = run owned.pending.take()
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    owned.pending.instance.observer.retain()
+    return Adapter { handle: handle, instance: owned.pending.instance.dup() }
+  }
+}
+pub struct DeviceRequest { pending: Pending<()>, mailbox: Arc<DeviceMailbox> }
+impl DeviceRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> Device ! GpuError {
+    let mut owned = move self
+    let handle = run owned.pending.take()
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    owned.pending.instance.observer.retain()
+    return Device { handle: handle, instance: owned.pending.instance.dup(), mailbox: owned.mailbox.clone() }
+  }
+}
+impl Drop for DeviceRequest {
+  fn drop(self: &mut Self) -> () {
+    // Establish completion and release an unclaimed device before either field
+    // is dropped, independent of automatic field destruction order.
+    self.pending.drain()
+    let handle = Intrinsic.replace(self.pending.slot.getMut()[0].handle, Pointer.null<u8>())
+    if !Pointer.isNull(handle) { unsafe sys.wgpuDeviceRelease(handle) }
+  }
+}
+pub struct StatusRequest { pending: Pending<()> }
+impl StatusRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> () ! GpuError {
+    let mut owned = move self
+    let ignored = run owned.pending.take()
+  }
+}
+
+pub fn stringView(bytes: &[u8]) -> sys.WGPUStringView {
+  return WGPUStringView { data: Pointer.fromSlice(bytes), length: bytes.length }
+}
+
+unsafe fn copyMessage(message: sys.WGPUStringView) -> Result<List<u8>, OutOfMemoryError> {
+  let mut length = message.length
+  if Pointer.isNullMany(message.data) { return Result<List<u8>, OutOfMemoryError>.succeed(List<u8>.make()) }
+  let pointer = unsafe Intrinsic.pointerRequalify<?[*]const u8, [*]const u8>(message.data)
+  if length == usize.MAX {
+    length = 0
+    while unsafe Pointer.read(unsafe Pointer.at(pointer, length)) != 0 { length = length + 1 }
+  }
+  let anchor = ()
+  let bytes = unsafe Pointer.borrowMany(&anchor, pointer, length)
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.result(copyBytes(bytes) |> Effect.provideMut<Allocator>(&mut allocator))
+}
+effect fn copyBytes(bytes: &[u8]) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = run List<u8>.makeWithCapacity(bytes.length)
+  run result.appendBytes(bytes)
+  return move result
+}
+unsafe fn complete(userdata: ?*mut u8, status: u32, errorType: u32, handle: ?*mut u8, message: sys.WGPUStringView) -> () {
+  let mut anchor = ()
+  let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Completion<()>>(userdata)
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut Completion<()>, *mut Completion<()>>(typed)
+  let slot = unsafe Pointer.borrowMut(&mut anchor, pointer)
+  slot.status = status
+  slot.errorType = errorType
+  slot.handle = handle
+  match move unsafe copyMessage(message) {
+    Result<List<u8>, OutOfMemoryError>.Success { value } => { slot.message = move value }
+    Result<List<u8>, OutOfMemoryError>.Failure { error } => { slot.status = 0xfffffffd }
+  }
+  slot.ready = true
+}
+unsafe fn report(userdata: ?*mut u8, status: u32, message: sys.WGPUStringView) -> () {
+  let anchor = ()
+  let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Mutex<FailureState>>(userdata)
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut Mutex<FailureState>, *const Mutex<FailureState>>(typed)
+  let mailbox = unsafe Pointer.borrow(&anchor, pointer)
+  let mut guard = mailbox.lock()
+  let state = guard.getMut()
+  if state.error.isNone() {
+    state.observer.recordFailure()
+    state.error = Option<GpuError>.some(match move unsafe copyMessage(message) {
+      Result<List<u8>, OutOfMemoryError>.Success { value } => GpuError { code: status, message: move value }
+      Result<List<u8>, OutOfMemoryError>.Failure { error } => GpuError.status(0xfffffffd)
+    })
+  }
+}
+
+export "C" fn adapterCallback(status: u32, adapter: sys.WGPUAdapter, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, adapter, message)
+}
+export "C" fn deviceCallback(status: u32, device: sys.WGPUDevice, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe recordDeviceFuture(userdata2, device)
+  unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, device, message)
+}
+export "C" fn scopeCallback(status: u32, errorType: u32, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe complete(userdata1, status, errorType, Pointer.null<u8>(), message)
+}
+export "C" fn lostCallback(device: ?*const sys.WGPUDevice, reason: u32, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  if reason != sys.WGPUDeviceLostReason_CallbackCancelled && reason != sys.WGPUDeviceLostReason_Destroyed && reason != sys.WGPUDeviceLostReason_FailedCreation {
+    unsafe report(userdata1, reason, message)
+  }
+  unsafe markLossDelivered(userdata1)
+}
+export "C" fn errorCallback(device: ?*const sys.WGPUDevice, errorType: u32, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe report(userdata1, errorType, message)
+}
+fn adapterCallbackAddress() -> sys.WGPURequestAdapterCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 1 } else { return adapterCallback }
+}
+fn deviceCallbackAddress() -> sys.WGPURequestDeviceCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 2 } else { return deviceCallback }
+}
+fn scopeCallbackAddress() -> sys.WGPUPopErrorScopeCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 4 } else { return scopeCallback }
+}
+fn lostCallbackAddress() -> sys.WGPUDeviceLostCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 6 } else { return lostCallback }
+}
+fn errorCallbackAddress() -> sys.WGPUUncapturedErrorCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 7 } else { return errorCallback }
+}
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  unsafe extern "C" fn cancelFuture(id: u64) -> () as "webgpu_cancel_future"
+    with Intrinsic.foreign(module: "webgpu", name: "webgpu_cancel_future")
+}
+
+pub struct MapReadRequest {
+  pending: Pending<()>,
+  buffer: Buffer,
+  offset: usize,
+  size: usize,
+}
+impl MapReadRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> List<u8> ! GpuError | OutOfMemoryError {
+    let mut owned = move self
+    let ignored = run owned.pending.take()
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut bytes = run List<u8>.makeWithCapacity(owned.size)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run bytes.appendRepeated(0, owned.size) |> Effect.provideMut<Allocator>(&mut allocator)
+    run owned.buffer.readMapped(owned.offset, bytes.asMutSlice())
+    return move bytes
+  }
+}
+impl Drop for MapReadRequest {
+  fn drop(self: &mut Self) -> () {
+    // Unmap cancels a pending native map before Pending drains its callback.
+    self.buffer.unmap()
+  }
+}
+pub effect fn mapReadStart(device: &Device, buffer: &Buffer, offset: usize, size: usize) -> MapReadRequest
+  ! OutOfMemoryError {
+  let mut pending = run makePending(&device.instance, 3)
+  let mut info = WGPUBufferMapCallbackInfo.default(mapCallbackAddress())
+  info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+  info.userdata1 = pending.userdata
+  pending.future = unsafe sys.wgpuBufferMapAsync(unsafe buffer.raw(), sys.WGPUMapMode_Read, offset, size, info)
+  return MapReadRequest { pending: move pending, buffer: buffer.dup(), offset: offset, size: size }
+}
+pub effect fn mapRead(device: &Device, buffer: &Buffer, offset: usize, size: usize) -> List<u8>
+  ! GpuError | OutOfMemoryError {
+  let mut request = run mapReadStart(device, buffer, offset, size)
+  run request.pending.wait()
+  return run request.finish()
+}
+pub effect fn onSubmittedWorkDoneStart(device: &Device, queue: &Queue) -> StatusRequest
+  ! OutOfMemoryError {
+  let mut pending = run makePending(&device.instance, 5)
+  let mut info = WGPUQueueWorkDoneCallbackInfo.default(queueCallbackAddress())
+  info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+  info.userdata1 = pending.userdata
+  pending.future = unsafe sys.wgpuQueueOnSubmittedWorkDone(unsafe queue.raw(), info)
+  return StatusRequest { pending: move pending }
+}
+pub effect fn onSubmittedWorkDone(device: &Device, queue: &Queue) -> ()
+  ! GpuError | OutOfMemoryError {
+  let mut request = run onSubmittedWorkDoneStart(device, queue)
+  run request.pending.wait()
+  run request.finish()
+}
+export "C" fn mapCallback(status: u32, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, Pointer.null<u8>(), message)
+}
+export "C" fn queueCallback(status: u32, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, Pointer.null<u8>(), message)
+}
+fn mapCallbackAddress() -> sys.WGPUBufferMapCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 3 } else { return mapCallback }
+}
+fn queueCallbackAddress() -> sys.WGPUQueueWorkDoneCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 5 } else { return queueCallback }
+}
+
+// Root export forwarders call these wasm hooks; tokens are not native function addresses.
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  pub unsafe fn wasmAdapter(status: u32, handle: sys.WGPUAdapter, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, handle, WGPUStringView { data: data, length: length })
+  }
+  pub unsafe fn wasmDevice(status: u32, handle: sys.WGPUDevice, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe recordDeviceFuture(userdata2, handle)
+    unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, handle, WGPUStringView { data: data, length: length })
+  }
+  pub unsafe fn wasmMap(status: u32, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, Pointer.null<u8>(), WGPUStringView { data: data, length: length })
+  }
+  pub unsafe fn wasmScope(status: u32, errorType: u32, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe complete(userdata1, status, errorType, Pointer.null<u8>(), WGPUStringView { data: data, length: length })
+  }
+  pub unsafe fn wasmQueue(status: u32, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, Pointer.null<u8>(), WGPUStringView { data: data, length: length })
+  }
+  pub unsafe fn wasmLost(device: ?*const sys.WGPUDevice, reason: u32, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    if reason != sys.WGPUDeviceLostReason_CallbackCancelled && reason != sys.WGPUDeviceLostReason_Destroyed && reason != sys.WGPUDeviceLostReason_FailedCreation {
+      unsafe report(userdata1, reason, WGPUStringView { data: data, length: length })
+    }
+    unsafe markLossDelivered(userdata1)
+  }
+  pub unsafe fn wasmError(device: ?*const sys.WGPUDevice, errorType: u32, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe report(userdata1, errorType, WGPUStringView { data: data, length: length })
+  }
+}
+
+pub struct CompilationMessage {
+  pub message: List<u8>,
+  pub type_: sys.WGPUCompilationMessageType,
+  pub lineNum: u64,
+  pub linePos: u64,
+  pub offset: u64,
+  pub length: u64,
+}
+pub struct CompilationInfoRequest { pending: Pending<List<CompilationMessage>> }
+impl CompilationInfoRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> List<CompilationMessage> ! GpuError {
+    let mut owned = move self
+    let ignored = run owned.pending.take()
+    return Intrinsic.replace(owned.pending.slot.getMut()[0].extra, List<CompilationMessage>.make())
+  }
+}
+pub effect fn getCompilationInfoStart(device: &Device, shader: &ShaderModule) -> CompilationInfoRequest
+  ! OutOfMemoryError {
+  let mut pending = run makePendingWith(&device.instance, 8, List<CompilationMessage>.make())
+  let mut info = WGPUCompilationInfoCallbackInfo.default(compilationCallbackAddress())
+  info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+  info.userdata1 = pending.userdata
+  pending.future = unsafe sys.wgpuShaderModuleGetCompilationInfo(unsafe shader.raw(), info)
+  return CompilationInfoRequest { pending: move pending }
+}
+pub effect fn getCompilationInfo(device: &Device, shader: &ShaderModule) -> List<CompilationMessage>
+  ! GpuError | OutOfMemoryError {
+  let mut request = run getCompilationInfoStart(device, shader)
+  run request.pending.wait()
+  return run request.finish()
+}
+unsafe effect fn copyCompilationMessages(info: *const sys.WGPUCompilationInfo) -> List<CompilationMessage>
+  ! OutOfMemoryError ? &mut Allocator {
+  let anchor = ()
+  let source = unsafe Pointer.borrow(&anchor, info)
+  let mut messages = run List<CompilationMessage>.makeWithCapacity(source.messageCount)
+  if source.messageCount == 0 { return move messages }
+  let pointer = unsafe Intrinsic.pointerRequalify<?[*]const sys.WGPUCompilationMessage, [*]const sys.WGPUCompilationMessage>(source.messages)
+  let values = unsafe Pointer.borrowMany(&anchor, pointer, source.messageCount)
+  let mut index: usize = 0
+  while index < values.length {
+    let value = &values[index]
+    let bytes = match move unsafe copyMessage(value.message) {
+      Result<List<u8>, OutOfMemoryError>.Success { value: copied } => move copied
+      Result<List<u8>, OutOfMemoryError>.Failure { error } => { fail move error }
+    }
+    run messages.append(CompilationMessage {
+      message: move bytes, type_: value.type_, lineNum: value.lineNum,
+      linePos: value.linePos, offset: value.offset, length: value.length,
+    })
+    index = index + 1
+  }
+  return move messages
+}
+unsafe fn completeCompilation(status: u32, info: ?*const sys.WGPUCompilationInfo, userdata: ?*mut u8) -> () {
+  let mut anchor = ()
+  let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Completion<List<CompilationMessage>>>(userdata)
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut Completion<List<CompilationMessage>>, *mut Completion<List<CompilationMessage>>>(typed)
+  let slot = unsafe Pointer.borrowMut(&mut anchor, pointer)
+  slot.status = status
+  if status == sys.WGPUCompilationInfoRequestStatus_Success {
+    if Pointer.isNull(info) {
+      slot.status = 0xfffffffc
+    } else {
+      let source = unsafe Intrinsic.pointerRequalify<?*const sys.WGPUCompilationInfo, *const sys.WGPUCompilationInfo>(info)
+      let mut allocator = Allocator.systemAllocatorProvider()
+      match move run Effect.result(unsafe copyCompilationMessages(source) |> Effect.provideMut<Allocator>(&mut allocator)) {
+        Result<List<CompilationMessage>, OutOfMemoryError>.Success { value } => { slot.extra = move value }
+        Result<List<CompilationMessage>, OutOfMemoryError>.Failure { error } => { slot.status = 0xfffffffd }
+      }
+    }
+  }
+  slot.ready = true
+}
+export "C" fn compilationCallback(status: u32, info: ?*const sys.WGPUCompilationInfo, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe completeCompilation(status, info, userdata1)
+}
+fn compilationCallbackAddress() -> sys.WGPUCompilationInfoCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 8 } else { return compilationCallback }
+}
+
+pub struct ComputePipelineRequest { pending: Pending<()> }
+impl ComputePipelineRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> ComputePipeline ! GpuError {
+    let mut owned = move self
+    let handle = run owned.pending.take()
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    let observer = owned.pending.instance.diagnostics()
+    return unsafe ComputePipeline.adoptTracked(handle, &observer)
+  }
+}
+pub struct RenderPipelineRequest { pending: Pending<()> }
+impl RenderPipelineRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> RenderPipeline ! GpuError {
+    let mut owned = move self
+    let handle = run owned.pending.take()
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    let observer = owned.pending.instance.diagnostics()
+    return unsafe RenderPipeline.adoptTracked(handle, &observer)
+  }
+}
+pub effect fn createComputePipelineStart(device: &Device, descriptor: &ComputePipelineDescriptor) -> ComputePipelineRequest
+  ! OutOfMemoryError {
+  let mut pending = run makePending(&device.instance, 9)
+  let mut info = WGPUCreateComputePipelineAsyncCallbackInfo.default(computePipelineCallbackAddress())
+  info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+  info.userdata1 = pending.userdata
+  pending.future = unsafe sys.wgpuDeviceCreateComputePipelineAsync(unsafe device.raw(), unsafe descriptor.rawPointer(), info)
+  return ComputePipelineRequest { pending: move pending }
+}
+pub effect fn createComputePipelineAsync(device: &Device, descriptor: &ComputePipelineDescriptor) -> ComputePipeline
+  ! GpuError | OutOfMemoryError {
+  let mut request = run createComputePipelineStart(device, descriptor)
+  run request.pending.wait()
+  return run request.finish()
+}
+pub effect fn createRenderPipelineStart(device: &Device, descriptor: &RenderPipelineDescriptor) -> RenderPipelineRequest
+  ! OutOfMemoryError {
+  let mut pending = run makePending(&device.instance, 10)
+  let mut info = WGPUCreateRenderPipelineAsyncCallbackInfo.default(renderPipelineCallbackAddress())
+  info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+  info.userdata1 = pending.userdata
+  pending.future = unsafe sys.wgpuDeviceCreateRenderPipelineAsync(unsafe device.raw(), unsafe descriptor.rawPointer(), info)
+  return RenderPipelineRequest { pending: move pending }
+}
+pub effect fn createRenderPipelineAsync(device: &Device, descriptor: &RenderPipelineDescriptor) -> RenderPipeline
+  ! GpuError | OutOfMemoryError {
+  let mut request = run createRenderPipelineStart(device, descriptor)
+  run request.pending.wait()
+  return run request.finish()
+}
+export "C" fn computePipelineCallback(status: u32, pipeline: sys.WGPUComputePipeline, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, pipeline, message)
+}
+export "C" fn renderPipelineCallback(status: u32, pipeline: sys.WGPURenderPipeline, message: sys.WGPUStringView, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+  unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, pipeline, message)
+}
+fn computePipelineCallbackAddress() -> sys.WGPUCreateComputePipelineAsyncCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 9 } else { return computePipelineCallback }
+}
+fn renderPipelineCallbackAddress() -> sys.WGPUCreateRenderPipelineAsyncCallback {
+  static if Intrinsic.targetArchitecture() == "wasm32" { return 10 } else { return renderPipelineCallback }
+}
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  pub unsafe fn wasmCompilation(status: u32, info: ?*const sys.WGPUCompilationInfo, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe completeCompilation(status, info, userdata1)
+  }
+  pub unsafe fn wasmComputePipeline(status: u32, handle: sys.WGPUComputePipeline, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, handle, WGPUStringView { data: data, length: length })
+  }
+  pub unsafe fn wasmRenderPipeline(status: u32, handle: sys.WGPURenderPipeline, data: ?[*]const u8, length: usize, userdata1: ?*mut u8, userdata2: ?*mut u8) -> () {
+    unsafe complete(userdata1, status, sys.WGPUErrorType_NoError, handle, WGPUStringView { data: data, length: length })
+  }
+}
+
+// A mapped owner exposes checked copies, never aliased references into driver memory.
+pub struct MappedBuffer { buffer: Buffer }
+impl MappedBuffer {
+  pub effect fn read(self: &Self, offset: usize, destination: &mut [u8]) -> () ! GpuError {
+    run self.buffer.readMapped(offset, move destination)
+  }
+  pub effect fn write(self: &Self, offset: usize, source: &[u8]) -> () ! GpuError {
+    run self.buffer.writeMapped(offset, source)
+  }
+}
+impl Drop for MappedBuffer {
+  fn drop(self: &mut Self) -> () { self.buffer.unmap() }
+}
+pub struct BufferMapRequest { pending: Pending<()>, buffer: Option<Buffer> }
+impl BufferMapRequest {
+  pub fn poll(self: &mut Self) -> bool { return self.pending.poll() }
+  pub effect fn finish(self: Self) -> MappedBuffer ! GpuError {
+    let mut owned = move self
+    let ignored = run owned.pending.take()
+    return match move Intrinsic.replace(owned.buffer, Option<Buffer>.none()) {
+      Option<Buffer>.Some { value } => MappedBuffer { buffer: move value }
+      Option<Buffer>.None => { fail GpuError.status(0xfffffffc) }
+    }
+  }
+}
+impl Drop for BufferMapRequest {
+  fn drop(self: &mut Self) -> () {
+    match &self.buffer {
+      Option<Buffer>.Some { value } => { value.unmap() }
+      Option<Buffer>.None => ()
+    }
+  }
+}
+pub effect fn mapAsyncStart(device: &Device, buffer: &Buffer, mode: u64, offset: usize, size: usize) -> BufferMapRequest
+  ! OutOfMemoryError {
+  let mut pending = run makePending(&device.instance, 3)
+  let mut info = WGPUBufferMapCallbackInfo.default(mapCallbackAddress())
+  info.mode = sys.WGPUCallbackMode_AllowProcessEvents
+  info.userdata1 = pending.userdata
+  pending.future = unsafe sys.wgpuBufferMapAsync(unsafe buffer.raw(), mode, offset, size, info)
+  return BufferMapRequest { pending: move pending, buffer: Option<Buffer>.some(buffer.dup()) }
+}
+pub effect fn mapAsync(device: &Device, buffer: &Buffer, mode: u64, offset: usize, size: usize) -> MappedBuffer
+  ! GpuError | OutOfMemoryError {
+  let mut request = run mapAsyncStart(device, buffer, mode, offset, size)
+  run request.pending.wait()
+  return run request.finish()
+}
+
+unsafe fn recordDeviceFuture(userdata: ?*mut u8, device: sys.WGPUDevice) -> () {
+  if Pointer.isNull(device) { return () }
+  let future = unsafe sys.wgpuDeviceGetLostFuture(device)
+  let anchor = ()
+  let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Mutex<FailureState>>(userdata)
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut Mutex<FailureState>, *const Mutex<FailureState>>(typed)
+  let mailbox = unsafe Pointer.borrow(&anchor, pointer)
+  let mut guard = mailbox.lock()
+  let state = guard.getMut()
+  state.lostFuture = future
+}
+unsafe fn markLossDelivered(userdata: ?*mut u8) -> () {
+  let anchor = ()
+  let typed = unsafe Intrinsic.pointerReinterpret<?*mut u8, ?*mut Mutex<FailureState>>(userdata)
+  let pointer = unsafe Intrinsic.pointerRequalify<?*mut Mutex<FailureState>, *const Mutex<FailureState>>(typed)
+  let mailbox = unsafe Pointer.borrow(&anchor, pointer)
+  let mut guard = mailbox.lock()
+  let state = guard.getMut()
+  state.lostDelivered = true
+}

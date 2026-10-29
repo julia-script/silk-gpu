@@ -1,0 +1,239 @@
+//! Six headless WebGPU operations. All recording goes through the safe API.
+import webgpu.resources as gpu
+import webgpu.resources { Buffer, Texture, TextureView, RenderPipeline, BindGroup, CommandEncoder, Queue }
+import webgpu.runtime { Device, GpuError }
+import webgpu.descriptors {
+  BufferDescriptor, TextureDescriptor, TextureViewDescriptor, Extent3D,
+  RenderPassColorAttachment, RenderPassDescriptor, Color, VertexAttribute,
+  VertexBufferLayout, VertexState, FragmentState, ColorTargetState,
+  PrimitiveState, MultisampleState, RenderPipelineDescriptor, BindGroupEntry,
+  BindGroupDescriptor, TexelCopyTextureInfo, TexelCopyBufferInfo,
+  TexelCopyBufferLayout, SamplerDescriptor, ComputeState,
+  ComputePipelineDescriptor, ComputePassDescriptor,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.num.usize
+import silk.num.f32
+import generated_shaders as shaders
+import workloads
+
+pub fn name(index: u32) -> string<'static> {
+  return match index {
+    0 => "clear.rgba"
+    1 => "triangle.rgba"
+    2 => "textured-quad.rgba"
+    3 => "instanced-rects.rgba"
+    4 => "compute.rgba"
+    _ => "msaa.rgba"
+  }
+}
+pub fn readbackSize(index: u32) -> usize { return if index == 4 { 32768 } else { 16384 } }
+fn extent(width: u32, height: u32) -> Extent3D {
+  let mut size = Extent3D.default()
+  size.setWidth(width)
+  size.setHeight(height)
+  size.setDepthOrArrayLayers(1)
+  return size
+}
+effect fn texture(device: &Device, width: u32, height: u32, samples: u32, usage: u64) -> Texture ! GpuError {
+  let mut descriptor = TextureDescriptor.default().withLabel(b"headless texture")
+  descriptor.setSize(extent(width, height))
+  descriptor.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+  descriptor.setDimension(flags.WGPUTextureDimension_2D)
+  descriptor.setMipLevelCount(1)
+  descriptor.setSampleCount(samples)
+  descriptor.setUsage(usage)
+  return run gpu.createTexture(device, &descriptor)
+}
+fn black() -> Color {
+  let mut color = Color.default()
+  color.setA(1.0)
+  return color
+}
+fn attachment<'a>(view: &'a TextureView, clear: Color) -> RenderPassColorAttachment<'a> {
+  let mut result = RenderPassColorAttachment.default().withView(view)
+  result.setClearValue(clear)
+  result.setLoadOp(flags.WGPULoadOp_Clear)
+  result.setStoreOp(flags.WGPUStoreOp_Store)
+  return result
+}
+pub effect fn renderPipeline(device: &Device, code: &[u8], vertices: bool, sampleCount: u32) -> RenderPipeline ! GpuError {
+  let shader = run gpu.createShaderModule(device, b"sample WGSL", code)
+  let mut attribute: VertexAttribute = VertexAttribute.default()
+  attribute.setFormat(flags.WGPUVertexFormat_Float32x2)
+  attribute.setShaderLocation(0)
+  let attributes = [attribute]
+  let mut layout = VertexBufferLayout.default().withAttributes(&attributes)
+  layout.setArrayStride(8)
+  layout.setStepMode(flags.WGPUVertexStepMode_Vertex)
+  let layouts = [layout]
+  let activeLayouts = Slice.view<VertexBufferLayout>(&layouts, 0, if vertices { 1 } else { 0 })
+  let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs").withBuffers(activeLayouts)
+  let mut target: ColorTargetState = ColorTargetState.default()
+  target.setFormat(flags.WGPUTextureFormat_RGBA8Unorm)
+  target.setWriteMask(flags.WGPUColorWriteMask_All)
+  let targets = [target]
+  let fragment = FragmentState.default().withModule(&shader).withEntryPoint(b"fs").withTargets(&targets)
+  let mut primitive: PrimitiveState = PrimitiveState.default()
+  primitive.setTopology(flags.WGPUPrimitiveTopology_TriangleList)
+  let mut multisample: MultisampleState = MultisampleState.default()
+  multisample.setCount(sampleCount)
+  let mut descriptor = RenderPipelineDescriptor.default().withVertex(vertex).withFragment(&fragment)
+  descriptor.setPrimitive(primitive)
+  descriptor.setMultisample(multisample)
+  return run gpu.createRenderPipeline(device, &descriptor)
+}
+effect fn clear(encoder: &mut CommandEncoder, view: &TextureView) -> () ! GpuError {
+  let mut color = black()
+  color.setR(0.25)
+  color.setG(0.5)
+  color.setB(0.75)
+  let colors = [attachment(view, color)]
+  let descriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+  let pass = run encoder.beginRenderPass(&descriptor)
+  pass.end()
+}
+effect fn triangle(device: &Device, queue: &Queue, encoder: &mut CommandEncoder, target: &TextureView, multisampled: bool) -> () ! GpuError {
+  let count: u32 = if multisampled { 4 } else { 1 }
+  let code = if multisampled { shaders.msaa() } else { shaders.triangle() }
+  let pipeline = run renderPipeline(device, code, true, count)
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(b"triangle vertices", 24, flags.WGPUBufferUsage_Vertex | flags.WGPUBufferUsage_CopyDst, false))
+  let coordinates: [f32; 6] = [-0.75, -0.75, 0.75, -0.75, 0.0, 0.75]
+  let mut bytes: [u8; 24] = [0; 24]
+  let mut i: usize = 0
+  while i < 6 {
+    workloads.writeU32(&mut bytes, i * 4, f32.toBits(coordinates[i]))
+    i = i + 1
+  }
+  queue.writeBuffer(&buffer, 0, &bytes)
+  if multisampled {
+    let msaa = run texture(device, 64, 64, 4, flags.WGPUTextureUsage_RenderAttachment)
+    let view = run msaa.createView(&TextureViewDescriptor.default())
+    let mut color = attachment(&view, black()).withResolveTarget(target)
+    color.setStoreOp(flags.WGPUStoreOp_Discard)
+    let colors = [color]
+    let descriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+    let mut pass = run encoder.beginRenderPass(&descriptor)
+    pass.setPipeline(&pipeline)
+    pass.setVertexBuffer(0, &buffer, 0, 24)
+    pass.draw(3, 1, 0, 0)
+    pass.end()
+  } else {
+    let colors = [attachment(target, black())]
+    let descriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+    let mut pass = run encoder.beginRenderPass(&descriptor)
+    pass.setPipeline(&pipeline)
+    pass.setVertexBuffer(0, &buffer, 0, 24)
+    pass.draw(3, 1, 0, 0)
+    pass.end()
+  }
+}
+effect fn texturedQuad(device: &Device, queue: &Queue, encoder: &mut CommandEncoder, target: &TextureView) -> () ! GpuError {
+  let image = run texture(device, 2, 2, 1, flags.WGPUTextureUsage_TextureBinding | flags.WGPUTextureUsage_CopyDst)
+  let destination = TexelCopyTextureInfo.default().withTexture(&image)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(8)
+  layout.setRowsPerImage(2)
+  let texels: [u8; 16] = [255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255]
+  queue.writeTexture(&destination, &texels, &layout, &extent(2, 2))
+  let imageView = run image.createView(&TextureViewDescriptor.default())
+  let mut samplerDescriptor: SamplerDescriptor = SamplerDescriptor.default()
+  samplerDescriptor.setMagFilter(flags.WGPUFilterMode_Nearest)
+  samplerDescriptor.setMinFilter(flags.WGPUFilterMode_Nearest)
+  let sampler = run gpu.createSampler(device, &samplerDescriptor)
+  let pipeline = run renderPipeline(device, shaders.textured_quad(), false, 1)
+  let groupLayout = run pipeline.getBindGroupLayout(0)
+  let mut imageBinding = BindGroupEntry.default().withTextureView(&imageView)
+  imageBinding.setBinding(0)
+  let mut samplerBinding = BindGroupEntry.default().withSampler(&sampler)
+  samplerBinding.setBinding(1)
+  let entries = [imageBinding, samplerBinding]
+  let groupDescriptor = BindGroupDescriptor.default().withLayout(&groupLayout).withEntries(&entries)
+  let group = run gpu.createBindGroup(device, &groupDescriptor)
+  run drawBound(&mut encoder, target, &pipeline, &group, 6, 1)
+}
+effect fn drawBound(encoder: &mut CommandEncoder, target: &TextureView, pipeline: &RenderPipeline, group: &BindGroup, vertices: u32, instances: u32) -> () ! GpuError {
+  let colors = [attachment(target, black())]
+  let descriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+  let mut pass = run encoder.beginRenderPass(&descriptor)
+  pass.setPipeline(pipeline)
+  pass.setBindGroup(0, group, &[])
+  pass.draw(vertices, instances, 0, 0)
+  pass.end()
+}
+pub effect fn bufferGroup(device: &Device, pipeline: &RenderPipeline, buffer: &Buffer, binding: u32) -> BindGroup ! GpuError {
+  let layout = run pipeline.getBindGroupLayout(0)
+  let mut entry = BindGroupEntry.default().withBuffer(buffer)
+  entry.setBinding(binding)
+  entry.setSize(buffer.getSize())
+  let entries = [entry]
+  let descriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+  return run gpu.createBindGroup(device, &descriptor)
+}
+effect fn rectangles(device: &Device, queue: &Queue, encoder: &mut CommandEncoder, target: &TextureView) -> () ! GpuError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut data = List<u8>.make()
+  run data.appendRepeated(0, 2048 * 48) |> Effect.provideMut<Allocator>(&mut allocator)
+  workloads.fillRectBytes(data.asMutSlice(), 2048)
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(b"2048 rounded rectangles", 2048 * 48, flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopyDst, false))
+  queue.writeBuffer(&buffer, 0, data.asSlice())
+  let pipeline = run renderPipeline(device, shaders.instanced_rects(), false, 1)
+  let group = run bufferGroup(device, &pipeline, &buffer, 0)
+  run drawBound(&mut encoder, target, &pipeline, &group, 6, 2048)
+}
+effect fn compute(device: &Device, encoder: &mut CommandEncoder, target: &TextureView, readback: &Buffer) -> () ! GpuError {
+  let values = run gpu.createBuffer(device, &BufferDescriptor.make(b"compute values", 16384, flags.WGPUBufferUsage_Storage | flags.WGPUBufferUsage_CopySrc, false))
+  let shader = run gpu.createShaderModule(device, b"compute and visualization", shaders.compute())
+  let stage = ComputeState.default().withModule(&shader).withEntryPoint(b"compute")
+  let pipelineDescriptor = ComputePipelineDescriptor.default().withCompute(stage)
+  let pipeline = run gpu.createComputePipeline(device, &pipelineDescriptor)
+  let layout = run pipeline.getBindGroupLayout(0)
+  let mut entry = BindGroupEntry.default().withBuffer(&values)
+  entry.setBinding(0)
+  entry.setSize(16384)
+  let entries = [entry]
+  let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+  let group = run gpu.createBindGroup(device, &groupDescriptor)
+  let mut pass = run encoder.beginComputePass(&ComputePassDescriptor.default())
+  pass.setPipeline(&pipeline)
+  pass.setBindGroup(0, &group, &[])
+  pass.dispatchWorkgroups(64, 1, 1)
+  pass.end()
+  encoder.copyBufferToBuffer(&values, 0, readback, 16384, 16384)
+  let render = run renderPipeline(device, shaders.compute(), false, 1)
+  let renderGroup = run bufferGroup(device, &render, &values, 1)
+  run drawBound(&mut encoder, target, &render, &renderGroup, 3, 1)
+}
+pub effect fn submit(device: &Device, index: u32) -> Buffer ! GpuError | OutOfMemoryError {
+  if index >= 6 { fail GpuError.status(0xffffffff) }
+  let queue = run gpu.getQueue(device)
+  let output = run texture(device, 64, 64, 1, flags.WGPUTextureUsage_RenderAttachment | flags.WGPUTextureUsage_CopySrc)
+  let view = run output.createView(&TextureViewDescriptor.default())
+  let readback = run gpu.createBuffer(device, &BufferDescriptor.make(b"pixel and compute readback", usize.toU64(readbackSize(index)), flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead, false))
+  let mut encoder = run gpu.createCommandEncoder(device, b"headless sample")
+  match index {
+    0 => { run clear(&mut encoder, &view) }
+    1 => { run triangle(device, &queue, &mut encoder, &view, false) }
+    2 => { run texturedQuad(device, &queue, &mut encoder, &view) }
+    3 => { run rectangles(device, &queue, &mut encoder, &view) }
+    4 => { run compute(device, &mut encoder, &view, &readback) }
+    _ => { run triangle(device, &queue, &mut encoder, &view, true) }
+  }
+  let source = TexelCopyTextureInfo.default().withTexture(&output)
+  let mut copyLayout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  copyLayout.setBytesPerRow(256)
+  copyLayout.setRowsPerImage(64)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(copyLayout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(64, 64))
+  drop destination
+  drop source
+  let command = run encoder.finish(b"sample commands")
+  queue.submit(&[command.reference()])
+  run device.checkErrors()
+  return move readback
+}

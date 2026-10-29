@@ -1,0 +1,18 @@
+//! Browser-only canvas chains. Deliberately separate from the generated core schema.
+import webgpu_sys.generated_webgpu { WGPUChainedStruct, WGPUStringView }
+import silk.mem.pointer { Pointer }
+
+pub const selectorType: u32 = 0x00040000
+pub const idType: u32 = 0x00040001
+pub extern "C" struct CanvasSource {
+  pub chain: WGPUChainedStruct,
+  pub selector: WGPUStringView,
+}
+impl CanvasSource {
+  pub fn make(value: &[u8], byId: bool) -> CanvasSource {
+    return CanvasSource {
+      chain: WGPUChainedStruct { next: Pointer.null<WGPUChainedStruct>(), sType: if byId { idType } else { selectorType } },
+      selector: WGPUStringView { data: Pointer.fromSlice(value), length: value.length },
+    }
+  }
+}

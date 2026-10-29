@@ -60,9 +60,49 @@ Dawn's archive labels identify the upstream build runners, not a guaranteed mini
 
 Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Link the host C++ runtime as well. Windows uses the MSVC archive and SDK libraries listed in the release's `lib/cmake/Dawn/DawnTargets.cmake`. No unverified cross-platform build or test success is claimed here.
 
-### Raw binding gate
+### Native checks and CI
 
-Run `python3 scripts/check` to install and verify the pinned Silk, LLVM and Dawn binaries and fetch checksum-verified upstream schema inputs. The workspace contains the generated `webgpu_sys` package and the `native_tests` executable. The Ubuntu26 PR job provisions pinned lavapipe and validates its existing LLVM22 installation before running this gate, with a 15-minute timeout. Hosted timing evidence is recorded in the pull request after execution.
+`python3 scripts/check` checks raw generation and embedded WGSL freshness, the complete workspace, compiled C/Silk ABI layouts, native asynchronous ownership/validation scenarios, and all six headless pixel samples. `--skip-native` runs freshness and workspace checks only. The Ubuntu26 PR job selects checksum-pinned Mesa lavapipe and has a 15-minute timeout. Compiles run sequentially.
 
-The gate also checks generated binding freshness, checks the workspace, and creates, processes events on, and releases a native Dawn instance. `scripts/generate --check` validates generated declarations and ABI metadata against the pinned schema.
-The native gate also compiles an independent C ABI probe, compares all 92 generated record sizes and alignments with Silk `Layout.of`, and links addresses for all 202 WebGPU functions.
+The complete safe package includes owned resources, descriptors, capabilities, async requests and the foundational Surface type required by adapter options. Surface host handles remain host-owned; the binding does not create windows. Native device callback registration uses a small C ABI bridge so retained callbacks have explicit Silk foreign contracts.
+
+## Headless samples and pixel fixtures
+
+
+`examples/` is the `gpu_examples` package. It runs six 64×64 cases without a
+window: render-pass clear, a vertex-buffer triangle, an uploaded RGBA texture
+with a nearest sampler, 2,048 storage-buffer instanced rounded rectangles,
+compute storage writes plus their rendered visualization, and a 4× MSAA
+triangle resolved to a single-sampled texture. No scene renderer is included.
+
+```sh
+scripts/test-pixels
+scripts/test-pixels --binary /absolute/path/to/gpu_examples
+scripts/test-pixels --actual /path/to/browser-or-native-artifacts
+python3 -m unittest discover -s tests/pixels -p 'test_*.py'
+```
+
+The default command uses the pinned toolchains, builds the sample executable,
+runs all six cases, and writes raw RGBA, diagnostic PNGs, and `compute.u32`
+under `.cache/pixels/native/`. A directly invoked executable writes the raw
+artifacts into its working directory. A validation error, uncaptured error,
+device loss, failed readback, or incorrect compute value fails the process.
+The compute check compares all 4,096 full-width integers to `3*i+7`; the PNG
+visualizes their low two bytes and is not a substitute for the buffer check.
+Debug builds also retain an independent diagnostics observer for each sample
+and require zero live owned GPU handles after its session is dropped. Release
+builds erase these counters; run the default debug pixel command for leak checks.
+
+Small expected PNGs live in `tests/pixels/expected/`. Their independent CPU
+oracle uses pixel-space triangle half-planes, rectangle-and-circle membership,
+four-color texels, and integer arithmetic—not captured GPU output. Every RGBA
+channel has tolerance 2. At most 48 triangle pixels or 128 MSAA pixels may
+exceed that tolerance; the other four cases permit none. No edge or alpha
+channel is ignored. MSAA uses a standard rotated four-sample reference; other
+valid sample patterns still consume the same finite difference budget.
+
+To intentionally regenerate these analytic fixtures, run
+`python3 tests/pixels/harness.py --regenerate`. WGSL lives in
+`examples/shaders/`; after shader edits run `scripts/embed-shaders`, and use
+`scripts/embed-shaders --check` to detect stale embedded source.
+

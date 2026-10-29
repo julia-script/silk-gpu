@@ -1,0 +1,935 @@
+//! Owned WebGPU resources and allocation-free recording operations.
+//! Each handle owns one native reference. `dup` acquires another; Drop releases
+//! exactly one. Pass lifetimes are tied to an exclusive borrow of their encoder.
+//! Mapping only copies through WebGPU's checked range-copy operations: no view
+//! into mapped storage escapes, including when another Buffer handle is duplicated.
+//! Debug leases count owned wrapper references, including derived handles and dup.
+//! Native Drop runs before field cleanup releases the associated diagnostic lease.
+import webgpu_sys.generated_webgpu as sys
+import descriptors as desc
+import runtime { Device, GpuError }
+import silk.mem.pointer { Pointer }
+import silk.core.ownership { Copy, Drop }
+import webgpu_sys.generated_webgpu { WGPUCommandBufferDescriptor, WGPUCommandEncoderDescriptor, WGPURenderBundleDescriptor, WGPUShaderModuleDescriptor, WGPUShaderSourceWGSL }
+import webgpu_sys.generated_webgpu { WGPUShaderSourceSPIRV }
+import silk.num.usize
+import diagnostics { Diagnostics, HandleLease }
+
+pub struct BindGroup { handle: sys.WGPUBindGroup, lease: HandleLease }
+
+impl BindGroup {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUBindGroup) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUBindGroup, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBindGroup { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuBindGroupAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> BindGroupRef<'b> { return BindGroupRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuBindGroupSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for BindGroup {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuBindGroupRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct BindGroupRef<'a> { handle: sys.WGPUBindGroup }
+impl<'a> Copy for BindGroupRef<'a> {}
+
+pub struct BindGroupLayout { handle: sys.WGPUBindGroupLayout, lease: HandleLease }
+
+impl BindGroupLayout {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUBindGroupLayout) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUBindGroupLayout, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBindGroupLayout { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuBindGroupLayoutAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> BindGroupLayoutRef<'b> { return BindGroupLayoutRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuBindGroupLayoutSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for BindGroupLayout {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuBindGroupLayoutRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct BindGroupLayoutRef<'a> { handle: sys.WGPUBindGroupLayout }
+impl<'a> Copy for BindGroupLayoutRef<'a> {}
+
+pub struct Buffer { handle: sys.WGPUBuffer, lease: HandleLease }
+
+impl Buffer {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUBuffer) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUBuffer, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBuffer { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuBufferAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> BufferRef<'b> { return BufferRef<'b> { handle: self.handle } }
+  pub effect fn readMapped(self: &Self, offset: usize, data: &mut [u8]) -> () ! GpuError {
+    let status = unsafe sys.wgpuBufferReadMappedRange(self.handle, offset, Pointer.fromMutSlice<u8>(&mut data), data.length)
+    if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  }
+  pub effect fn writeMapped(self: &Self, offset: usize, data: &[u8]) -> () ! GpuError {
+    let status = unsafe sys.wgpuBufferWriteMappedRange(self.handle, offset, Pointer.fromSlice<u8>(data), data.length)
+    if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuBufferSetLabel(self.handle, desc.stringView(label))
+  }
+  pub fn getUsage(self: &Self) -> sys.WGPUBufferUsage {
+    return unsafe sys.wgpuBufferGetUsage(self.handle)
+  }
+  pub fn getSize(self: &Self) -> u64 {
+    return unsafe sys.wgpuBufferGetSize(self.handle)
+  }
+  pub fn getMapState(self: &Self) -> sys.WGPUBufferMapState {
+    return unsafe sys.wgpuBufferGetMapState(self.handle)
+  }
+  pub fn unmap(self: &Self) -> () {
+    unsafe sys.wgpuBufferUnmap(self.handle)
+  }
+  pub fn destroy(self: &Self) -> () {
+    unsafe sys.wgpuBufferDestroy(self.handle)
+  }
+}
+impl Drop for Buffer {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuBufferRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct BufferRef<'a> { handle: sys.WGPUBuffer }
+impl<'a> Copy for BufferRef<'a> {}
+
+pub struct CommandBuffer { handle: sys.WGPUCommandBuffer, lease: HandleLease }
+
+impl CommandBuffer {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUCommandBuffer) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUCommandBuffer, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUCommandBuffer { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuCommandBufferAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> CommandBufferRef<'b> { return CommandBufferRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuCommandBufferSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for CommandBuffer {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuCommandBufferRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct CommandBufferRef<'a> { handle: sys.WGPUCommandBuffer }
+impl<'a> Copy for CommandBufferRef<'a> {}
+
+pub struct CommandEncoder { handle: sys.WGPUCommandEncoder, lease: HandleLease }
+
+impl CommandEncoder {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUCommandEncoder) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUCommandEncoder, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUCommandEncoder { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuCommandEncoderAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> CommandEncoderRef<'b> { return CommandEncoderRef<'b> { handle: self.handle } }
+  pub effect fn beginComputePass<'encoder>(self: &'encoder mut Self, descriptor: &desc.ComputePassDescriptor) -> ComputePassEncoder<'encoder> ! GpuError {
+    let handle = unsafe sys.wgpuCommandEncoderBeginComputePass(self.handle, unsafe descriptor.rawPointer())
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return ComputePassEncoder<'encoder> { handle: handle, lease: self.lease.dup() }
+  }
+  pub effect fn beginRenderPass<'encoder>(self: &'encoder mut Self, descriptor: &desc.RenderPassDescriptor) -> RenderPassEncoder<'encoder> ! GpuError {
+    let handle = unsafe sys.wgpuCommandEncoderBeginRenderPass(self.handle, unsafe descriptor.rawPointer())
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return RenderPassEncoder<'encoder> { handle: handle, lease: self.lease.dup() }
+  }
+  pub fn copyBufferToBuffer(self: &mut Self, source: &Buffer, sourceOffset: u64, destination: &Buffer, destinationOffset: u64, size: u64) -> () {
+    unsafe sys.wgpuCommandEncoderCopyBufferToBuffer(self.handle, source.handle, sourceOffset, destination.handle, destinationOffset, size)
+  }
+  pub fn copyBufferToTexture(self: &mut Self, source: &desc.TexelCopyBufferInfo, destination: &desc.TexelCopyTextureInfo, copySize: &desc.Extent3D) -> () {
+    unsafe sys.wgpuCommandEncoderCopyBufferToTexture(self.handle, unsafe source.rawPointer(), unsafe destination.rawPointer(), unsafe copySize.rawPointer())
+  }
+  pub fn copyTextureToBuffer(self: &mut Self, source: &desc.TexelCopyTextureInfo, destination: &desc.TexelCopyBufferInfo, copySize: &desc.Extent3D) -> () {
+    unsafe sys.wgpuCommandEncoderCopyTextureToBuffer(self.handle, unsafe source.rawPointer(), unsafe destination.rawPointer(), unsafe copySize.rawPointer())
+  }
+  pub fn copyTextureToTexture(self: &mut Self, source: &desc.TexelCopyTextureInfo, destination: &desc.TexelCopyTextureInfo, copySize: &desc.Extent3D) -> () {
+    unsafe sys.wgpuCommandEncoderCopyTextureToTexture(self.handle, unsafe source.rawPointer(), unsafe destination.rawPointer(), unsafe copySize.rawPointer())
+  }
+  pub fn clearBuffer(self: &mut Self, buffer: &Buffer, offset: u64, size: u64) -> () {
+    unsafe sys.wgpuCommandEncoderClearBuffer(self.handle, buffer.handle, offset, size)
+  }
+  pub fn insertDebugMarker(self: &mut Self, markerLabel: &[u8]) -> () {
+    unsafe sys.wgpuCommandEncoderInsertDebugMarker(self.handle, desc.stringView(markerLabel))
+  }
+  pub fn popDebugGroup(self: &mut Self) -> () {
+    unsafe sys.wgpuCommandEncoderPopDebugGroup(self.handle)
+  }
+  pub fn pushDebugGroup(self: &mut Self, groupLabel: &[u8]) -> () {
+    unsafe sys.wgpuCommandEncoderPushDebugGroup(self.handle, desc.stringView(groupLabel))
+  }
+  pub fn resolveQuerySet(self: &mut Self, querySet: &QuerySet, firstQuery: u32, queryCount: u32, destination: &Buffer, destinationOffset: u64) -> () {
+    unsafe sys.wgpuCommandEncoderResolveQuerySet(self.handle, querySet.handle, firstQuery, queryCount, destination.handle, destinationOffset)
+  }
+  pub fn writeTimestamp(self: &mut Self, querySet: &QuerySet, queryIndex: u32) -> () {
+    unsafe sys.wgpuCommandEncoderWriteTimestamp(self.handle, querySet.handle, queryIndex)
+  }
+  pub fn setLabel(self: &mut Self, label: &[u8]) -> () {
+    unsafe sys.wgpuCommandEncoderSetLabel(self.handle, desc.stringView(label))
+  }
+  pub effect fn finish(self: Self, label: &[u8]) -> CommandBuffer ! GpuError {
+    let mut descriptor = WGPUCommandBufferDescriptor.default()
+    descriptor.label = desc.stringView(label)
+    let handle = unsafe sys.wgpuCommandEncoderFinish(self.handle, Pointer.fromRef(&descriptor))
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return CommandBuffer { handle: handle, lease: self.lease.dup() }
+  }
+}
+impl Drop for CommandEncoder {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuCommandEncoderRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct CommandEncoderRef<'a> { handle: sys.WGPUCommandEncoder }
+impl<'a> Copy for CommandEncoderRef<'a> {}
+
+pub struct ComputePassEncoder<'a> { handle: sys.WGPUComputePassEncoder, lease: HandleLease }
+
+impl<'a> ComputePassEncoder<'a> {
+  // `handle` must own one live reference from this encoder.
+  pub unsafe fn adopt(handle: sys.WGPUComputePassEncoder, encoder: &'a mut CommandEncoder) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUComputePassEncoder, encoder: &'a mut CommandEncoder, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUComputePassEncoder { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuComputePassEncoderAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn insertDebugMarker(self: &mut Self, markerLabel: &[u8]) -> () {
+    unsafe sys.wgpuComputePassEncoderInsertDebugMarker(self.handle, desc.stringView(markerLabel))
+  }
+  pub fn popDebugGroup(self: &mut Self) -> () {
+    unsafe sys.wgpuComputePassEncoderPopDebugGroup(self.handle)
+  }
+  pub fn pushDebugGroup(self: &mut Self, groupLabel: &[u8]) -> () {
+    unsafe sys.wgpuComputePassEncoderPushDebugGroup(self.handle, desc.stringView(groupLabel))
+  }
+  pub fn setPipeline(self: &mut Self, pipeline: &ComputePipeline) -> () {
+    unsafe sys.wgpuComputePassEncoderSetPipeline(self.handle, pipeline.handle)
+  }
+  pub fn setBindGroup(self: &mut Self, groupIndex: u32, group: &BindGroup, dynamicOffsets: &[u32]) -> () {
+    unsafe sys.wgpuComputePassEncoderSetBindGroup(self.handle, groupIndex, group.handle, dynamicOffsets.length, Pointer.fromSlice<u32>(dynamicOffsets))
+  }
+  pub fn setImmediates(self: &mut Self, offset: u32, data: &[u8]) -> () {
+    unsafe sys.wgpuComputePassEncoderSetImmediates(self.handle, offset, Pointer.fromSlice<u8>(data), data.length)
+  }
+  pub fn dispatchWorkgroups(self: &mut Self, workgroupCountX: u32, workgroupCountY: u32, workgroupCountZ: u32) -> () {
+    unsafe sys.wgpuComputePassEncoderDispatchWorkgroups(self.handle, workgroupCountX, workgroupCountY, workgroupCountZ)
+  }
+  pub fn dispatchWorkgroupsIndirect(self: &mut Self, indirectBuffer: &Buffer, indirectOffset: u64) -> () {
+    unsafe sys.wgpuComputePassEncoderDispatchWorkgroupsIndirect(self.handle, indirectBuffer.handle, indirectOffset)
+  }
+  pub fn end(self: Self) -> () {
+    unsafe sys.wgpuComputePassEncoderEnd(self.handle)
+  }
+  pub fn setLabel(self: &mut Self, label: &[u8]) -> () {
+    unsafe sys.wgpuComputePassEncoderSetLabel(self.handle, desc.stringView(label))
+  }
+  pub fn clearBindGroup(self: &mut Self, groupIndex: u32) -> () {
+    unsafe sys.wgpuComputePassEncoderSetBindGroup(self.handle, groupIndex, Pointer.null<u8>(), 0, unsafe Intrinsic.pointerRequalify<?*mut u32, ?[*]const u32>(Pointer.null<u32>()))
+  }
+}
+impl<'a> Drop for ComputePassEncoder<'a> {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuComputePassEncoderRelease(self.handle) }
+}
+
+pub struct ComputePipeline { handle: sys.WGPUComputePipeline, lease: HandleLease }
+
+impl ComputePipeline {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUComputePipeline) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUComputePipeline, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUComputePipeline { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuComputePipelineAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> ComputePipelineRef<'b> { return ComputePipelineRef<'b> { handle: self.handle } }
+  pub effect fn getBindGroupLayout(self: &Self, groupIndex: u32) -> BindGroupLayout ! GpuError {
+    let handle = unsafe sys.wgpuComputePipelineGetBindGroupLayout(self.handle, groupIndex)
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return BindGroupLayout { handle: handle, lease: self.lease.dup() }
+  }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuComputePipelineSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for ComputePipeline {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuComputePipelineRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct ComputePipelineRef<'a> { handle: sys.WGPUComputePipeline }
+impl<'a> Copy for ComputePipelineRef<'a> {}
+
+pub struct ExternalTexture { handle: sys.WGPUExternalTexture, lease: HandleLease }
+
+impl ExternalTexture {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUExternalTexture) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUExternalTexture, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUExternalTexture { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuExternalTextureAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> ExternalTextureRef<'b> { return ExternalTextureRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuExternalTextureSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for ExternalTexture {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuExternalTextureRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct ExternalTextureRef<'a> { handle: sys.WGPUExternalTexture }
+impl<'a> Copy for ExternalTextureRef<'a> {}
+
+pub struct PipelineLayout { handle: sys.WGPUPipelineLayout, lease: HandleLease }
+
+impl PipelineLayout {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUPipelineLayout) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUPipelineLayout, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUPipelineLayout { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuPipelineLayoutAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> PipelineLayoutRef<'b> { return PipelineLayoutRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuPipelineLayoutSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for PipelineLayout {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuPipelineLayoutRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct PipelineLayoutRef<'a> { handle: sys.WGPUPipelineLayout }
+impl<'a> Copy for PipelineLayoutRef<'a> {}
+
+pub struct QuerySet { handle: sys.WGPUQuerySet, lease: HandleLease }
+
+impl QuerySet {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUQuerySet) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUQuerySet, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUQuerySet { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuQuerySetAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> QuerySetRef<'b> { return QuerySetRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuQuerySetSetLabel(self.handle, desc.stringView(label))
+  }
+  pub fn getType(self: &Self) -> sys.WGPUQueryType {
+    return unsafe sys.wgpuQuerySetGetType(self.handle)
+  }
+  pub fn getCount(self: &Self) -> u32 {
+    return unsafe sys.wgpuQuerySetGetCount(self.handle)
+  }
+  pub fn destroy(self: &Self) -> () {
+    unsafe sys.wgpuQuerySetDestroy(self.handle)
+  }
+}
+impl Drop for QuerySet {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuQuerySetRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct QuerySetRef<'a> { handle: sys.WGPUQuerySet }
+impl<'a> Copy for QuerySetRef<'a> {}
+
+pub struct Queue { handle: sys.WGPUQueue, lease: HandleLease }
+
+impl Queue {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUQueue) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUQueue, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUQueue { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuQueueAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> QueueRef<'b> { return QueueRef<'b> { handle: self.handle } }
+  pub fn submit(self: &Self, commands: &[CommandBufferRef]) -> () {
+    unsafe sys.wgpuQueueSubmit(self.handle, commands.length, unsafe desc.rawEntries<CommandBufferRef, sys.WGPUCommandBuffer>(commands))
+  }
+  pub fn writeBuffer(self: &Self, buffer: &Buffer, bufferOffset: u64, data: &[u8]) -> () {
+    unsafe sys.wgpuQueueWriteBuffer(self.handle, buffer.handle, bufferOffset, Pointer.fromSlice<u8>(data), data.length)
+  }
+  pub fn writeTexture(self: &Self, destination: &desc.TexelCopyTextureInfo, data: &[u8], dataLayout: &desc.TexelCopyBufferLayout, writeSize: &desc.Extent3D) -> () {
+    unsafe sys.wgpuQueueWriteTexture(self.handle, unsafe destination.rawPointer(), Pointer.fromSlice<u8>(data), data.length, unsafe dataLayout.rawPointer(), unsafe writeSize.rawPointer())
+  }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuQueueSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for Queue {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuQueueRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct QueueRef<'a> { handle: sys.WGPUQueue }
+impl<'a> Copy for QueueRef<'a> {}
+
+pub struct RenderBundle { handle: sys.WGPURenderBundle, lease: HandleLease }
+
+impl RenderBundle {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPURenderBundle) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPURenderBundle, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderBundle { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuRenderBundleAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> RenderBundleRef<'b> { return RenderBundleRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuRenderBundleSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for RenderBundle {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuRenderBundleRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct RenderBundleRef<'a> { handle: sys.WGPURenderBundle }
+impl<'a> Copy for RenderBundleRef<'a> {}
+
+pub struct RenderBundleEncoder { handle: sys.WGPURenderBundleEncoder, lease: HandleLease }
+
+impl RenderBundleEncoder {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPURenderBundleEncoder) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPURenderBundleEncoder, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderBundleEncoder { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuRenderBundleEncoderAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> RenderBundleEncoderRef<'b> { return RenderBundleEncoderRef<'b> { handle: self.handle } }
+  pub fn setPipeline(self: &mut Self, pipeline: &RenderPipeline) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetPipeline(self.handle, pipeline.handle)
+  }
+  pub fn setBindGroup(self: &mut Self, groupIndex: u32, group: &BindGroup, dynamicOffsets: &[u32]) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetBindGroup(self.handle, groupIndex, group.handle, dynamicOffsets.length, Pointer.fromSlice<u32>(dynamicOffsets))
+  }
+  pub fn setImmediates(self: &mut Self, offset: u32, data: &[u8]) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetImmediates(self.handle, offset, Pointer.fromSlice<u8>(data), data.length)
+  }
+  pub fn draw(self: &mut Self, vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32) -> () {
+    unsafe sys.wgpuRenderBundleEncoderDraw(self.handle, vertexCount, instanceCount, firstVertex, firstInstance)
+  }
+  pub fn drawIndexed(self: &mut Self, indexCount: u32, instanceCount: u32, firstIndex: u32, baseVertex: i32, firstInstance: u32) -> () {
+    unsafe sys.wgpuRenderBundleEncoderDrawIndexed(self.handle, indexCount, instanceCount, firstIndex, baseVertex, firstInstance)
+  }
+  pub fn drawIndirect(self: &mut Self, indirectBuffer: &Buffer, indirectOffset: u64) -> () {
+    unsafe sys.wgpuRenderBundleEncoderDrawIndirect(self.handle, indirectBuffer.handle, indirectOffset)
+  }
+  pub fn drawIndexedIndirect(self: &mut Self, indirectBuffer: &Buffer, indirectOffset: u64) -> () {
+    unsafe sys.wgpuRenderBundleEncoderDrawIndexedIndirect(self.handle, indirectBuffer.handle, indirectOffset)
+  }
+  pub fn insertDebugMarker(self: &mut Self, markerLabel: &[u8]) -> () {
+    unsafe sys.wgpuRenderBundleEncoderInsertDebugMarker(self.handle, desc.stringView(markerLabel))
+  }
+  pub fn popDebugGroup(self: &mut Self) -> () {
+    unsafe sys.wgpuRenderBundleEncoderPopDebugGroup(self.handle)
+  }
+  pub fn pushDebugGroup(self: &mut Self, groupLabel: &[u8]) -> () {
+    unsafe sys.wgpuRenderBundleEncoderPushDebugGroup(self.handle, desc.stringView(groupLabel))
+  }
+  pub fn setVertexBuffer(self: &mut Self, slot: u32, buffer: &Buffer, offset: u64, size: u64) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetVertexBuffer(self.handle, slot, buffer.handle, offset, size)
+  }
+  pub fn setIndexBuffer(self: &mut Self, buffer: &Buffer, format: sys.WGPUIndexFormat, offset: u64, size: u64) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetIndexBuffer(self.handle, buffer.handle, format, offset, size)
+  }
+  pub fn setLabel(self: &mut Self, label: &[u8]) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetLabel(self.handle, desc.stringView(label))
+  }
+  pub effect fn finish(self: Self, label: &[u8]) -> RenderBundle ! GpuError {
+    let mut descriptor = WGPURenderBundleDescriptor.default()
+    descriptor.label = desc.stringView(label)
+    let handle = unsafe sys.wgpuRenderBundleEncoderFinish(self.handle, Pointer.fromRef(&descriptor))
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return RenderBundle { handle: handle, lease: self.lease.dup() }
+  }
+  pub fn clearBindGroup(self: &mut Self, groupIndex: u32) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetBindGroup(self.handle, groupIndex, Pointer.null<u8>(), 0, unsafe Intrinsic.pointerRequalify<?*mut u32, ?[*]const u32>(Pointer.null<u32>()))
+  }
+  pub fn clearVertexBuffer(self: &mut Self, slot: u32) -> () {
+    unsafe sys.wgpuRenderBundleEncoderSetVertexBuffer(self.handle, slot, Pointer.null<u8>(), 0, sys.WGPU_WHOLE_SIZE)
+  }
+}
+impl Drop for RenderBundleEncoder {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuRenderBundleEncoderRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct RenderBundleEncoderRef<'a> { handle: sys.WGPURenderBundleEncoder }
+impl<'a> Copy for RenderBundleEncoderRef<'a> {}
+
+pub struct RenderPassEncoder<'a> { handle: sys.WGPURenderPassEncoder, lease: HandleLease }
+
+impl<'a> RenderPassEncoder<'a> {
+  // `handle` must own one live reference from this encoder.
+  pub unsafe fn adopt(handle: sys.WGPURenderPassEncoder, encoder: &'a mut CommandEncoder) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPURenderPassEncoder, encoder: &'a mut CommandEncoder, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPassEncoder { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuRenderPassEncoderAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn setPipeline(self: &mut Self, pipeline: &RenderPipeline) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetPipeline(self.handle, pipeline.handle)
+  }
+  pub fn setBindGroup(self: &mut Self, groupIndex: u32, group: &BindGroup, dynamicOffsets: &[u32]) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetBindGroup(self.handle, groupIndex, group.handle, dynamicOffsets.length, Pointer.fromSlice<u32>(dynamicOffsets))
+  }
+  pub fn setImmediates(self: &mut Self, offset: u32, data: &[u8]) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetImmediates(self.handle, offset, Pointer.fromSlice<u8>(data), data.length)
+  }
+  pub fn draw(self: &mut Self, vertexCount: u32, instanceCount: u32, firstVertex: u32, firstInstance: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderDraw(self.handle, vertexCount, instanceCount, firstVertex, firstInstance)
+  }
+  pub fn drawIndexed(self: &mut Self, indexCount: u32, instanceCount: u32, firstIndex: u32, baseVertex: i32, firstInstance: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderDrawIndexed(self.handle, indexCount, instanceCount, firstIndex, baseVertex, firstInstance)
+  }
+  pub fn drawIndirect(self: &mut Self, indirectBuffer: &Buffer, indirectOffset: u64) -> () {
+    unsafe sys.wgpuRenderPassEncoderDrawIndirect(self.handle, indirectBuffer.handle, indirectOffset)
+  }
+  pub fn drawIndexedIndirect(self: &mut Self, indirectBuffer: &Buffer, indirectOffset: u64) -> () {
+    unsafe sys.wgpuRenderPassEncoderDrawIndexedIndirect(self.handle, indirectBuffer.handle, indirectOffset)
+  }
+  pub fn executeBundles(self: &mut Self, bundles: &[RenderBundleRef]) -> () {
+    unsafe sys.wgpuRenderPassEncoderExecuteBundles(self.handle, bundles.length, unsafe desc.rawEntries<RenderBundleRef, sys.WGPURenderBundle>(bundles))
+  }
+  pub fn insertDebugMarker(self: &mut Self, markerLabel: &[u8]) -> () {
+    unsafe sys.wgpuRenderPassEncoderInsertDebugMarker(self.handle, desc.stringView(markerLabel))
+  }
+  pub fn popDebugGroup(self: &mut Self) -> () {
+    unsafe sys.wgpuRenderPassEncoderPopDebugGroup(self.handle)
+  }
+  pub fn pushDebugGroup(self: &mut Self, groupLabel: &[u8]) -> () {
+    unsafe sys.wgpuRenderPassEncoderPushDebugGroup(self.handle, desc.stringView(groupLabel))
+  }
+  pub fn setStencilReference(self: &mut Self, reference: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetStencilReference(self.handle, reference)
+  }
+  pub fn setBlendConstant(self: &mut Self, color: &desc.Color) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetBlendConstant(self.handle, unsafe color.rawPointer())
+  }
+  pub fn setViewport(self: &mut Self, x: f32, y: f32, width: f32, height: f32, minDepth: f32, maxDepth: f32) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetViewport(self.handle, x, y, width, height, minDepth, maxDepth)
+  }
+  pub fn setScissorRect(self: &mut Self, x: u32, y: u32, width: u32, height: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetScissorRect(self.handle, x, y, width, height)
+  }
+  pub fn setVertexBuffer(self: &mut Self, slot: u32, buffer: &Buffer, offset: u64, size: u64) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetVertexBuffer(self.handle, slot, buffer.handle, offset, size)
+  }
+  pub fn setIndexBuffer(self: &mut Self, buffer: &Buffer, format: sys.WGPUIndexFormat, offset: u64, size: u64) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetIndexBuffer(self.handle, buffer.handle, format, offset, size)
+  }
+  pub fn beginOcclusionQuery(self: &mut Self, queryIndex: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderBeginOcclusionQuery(self.handle, queryIndex)
+  }
+  pub fn endOcclusionQuery(self: &mut Self) -> () {
+    unsafe sys.wgpuRenderPassEncoderEndOcclusionQuery(self.handle)
+  }
+  pub fn end(self: Self) -> () {
+    unsafe sys.wgpuRenderPassEncoderEnd(self.handle)
+  }
+  pub fn setLabel(self: &mut Self, label: &[u8]) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetLabel(self.handle, desc.stringView(label))
+  }
+  pub fn clearBindGroup(self: &mut Self, groupIndex: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetBindGroup(self.handle, groupIndex, Pointer.null<u8>(), 0, unsafe Intrinsic.pointerRequalify<?*mut u32, ?[*]const u32>(Pointer.null<u32>()))
+  }
+  pub fn clearVertexBuffer(self: &mut Self, slot: u32) -> () {
+    unsafe sys.wgpuRenderPassEncoderSetVertexBuffer(self.handle, slot, Pointer.null<u8>(), 0, sys.WGPU_WHOLE_SIZE)
+  }
+}
+impl<'a> Drop for RenderPassEncoder<'a> {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuRenderPassEncoderRelease(self.handle) }
+}
+
+pub struct RenderPipeline { handle: sys.WGPURenderPipeline, lease: HandleLease }
+
+impl RenderPipeline {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPURenderPipeline) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPURenderPipeline, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPipeline { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuRenderPipelineAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> RenderPipelineRef<'b> { return RenderPipelineRef<'b> { handle: self.handle } }
+  pub effect fn getBindGroupLayout(self: &Self, groupIndex: u32) -> BindGroupLayout ! GpuError {
+    let handle = unsafe sys.wgpuRenderPipelineGetBindGroupLayout(self.handle, groupIndex)
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return BindGroupLayout { handle: handle, lease: self.lease.dup() }
+  }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuRenderPipelineSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for RenderPipeline {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuRenderPipelineRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct RenderPipelineRef<'a> { handle: sys.WGPURenderPipeline }
+impl<'a> Copy for RenderPipelineRef<'a> {}
+
+pub struct Sampler { handle: sys.WGPUSampler, lease: HandleLease }
+
+impl Sampler {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUSampler) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUSampler, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUSampler { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuSamplerAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> SamplerRef<'b> { return SamplerRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuSamplerSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for Sampler {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuSamplerRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct SamplerRef<'a> { handle: sys.WGPUSampler }
+impl<'a> Copy for SamplerRef<'a> {}
+
+pub struct ShaderModule { handle: sys.WGPUShaderModule, lease: HandleLease }
+
+impl ShaderModule {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUShaderModule) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUShaderModule, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUShaderModule { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuShaderModuleAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> ShaderModuleRef<'b> { return ShaderModuleRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuShaderModuleSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for ShaderModule {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuShaderModuleRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct ShaderModuleRef<'a> { handle: sys.WGPUShaderModule }
+impl<'a> Copy for ShaderModuleRef<'a> {}
+
+pub struct Texture { handle: sys.WGPUTexture, lease: HandleLease }
+
+impl Texture {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUTexture) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUTexture, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTexture { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuTextureAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> TextureRef<'b> { return TextureRef<'b> { handle: self.handle } }
+  pub effect fn createView(self: &Self, descriptor: &desc.TextureViewDescriptor) -> TextureView ! GpuError {
+    let handle = unsafe sys.wgpuTextureCreateView(self.handle, unsafe descriptor.rawPointer())
+    if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+    return TextureView { handle: handle, lease: self.lease.dup() }
+  }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuTextureSetLabel(self.handle, desc.stringView(label))
+  }
+  pub fn getWidth(self: &Self) -> u32 {
+    return unsafe sys.wgpuTextureGetWidth(self.handle)
+  }
+  pub fn getHeight(self: &Self) -> u32 {
+    return unsafe sys.wgpuTextureGetHeight(self.handle)
+  }
+  pub fn getDepthOrArrayLayers(self: &Self) -> u32 {
+    return unsafe sys.wgpuTextureGetDepthOrArrayLayers(self.handle)
+  }
+  pub fn getMipLevelCount(self: &Self) -> u32 {
+    return unsafe sys.wgpuTextureGetMipLevelCount(self.handle)
+  }
+  pub fn getSampleCount(self: &Self) -> u32 {
+    return unsafe sys.wgpuTextureGetSampleCount(self.handle)
+  }
+  pub fn getDimension(self: &Self) -> sys.WGPUTextureDimension {
+    return unsafe sys.wgpuTextureGetDimension(self.handle)
+  }
+  pub fn getTextureBindingViewDimension(self: &Self) -> sys.WGPUTextureViewDimension {
+    return unsafe sys.wgpuTextureGetTextureBindingViewDimension(self.handle)
+  }
+  pub fn getFormat(self: &Self) -> sys.WGPUTextureFormat {
+    return unsafe sys.wgpuTextureGetFormat(self.handle)
+  }
+  pub fn getUsage(self: &Self) -> sys.WGPUTextureUsage {
+    return unsafe sys.wgpuTextureGetUsage(self.handle)
+  }
+  pub fn destroy(self: &Self) -> () {
+    unsafe sys.wgpuTextureDestroy(self.handle)
+  }
+}
+impl Drop for Texture {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuTextureRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct TextureRef<'a> { handle: sys.WGPUTexture }
+impl<'a> Copy for TextureRef<'a> {}
+
+pub struct TextureView { handle: sys.WGPUTextureView, lease: HandleLease }
+
+impl TextureView {
+  // `handle` must be non-null and transfer one owned native reference.
+  pub unsafe fn adopt(handle: sys.WGPUTextureView) -> Self { return Self { handle: handle, lease: HandleLease.untracked() } }
+  // Transfers one native reference and records it in this device's observer.
+  pub unsafe fn adoptTracked(handle: sys.WGPUTextureView, observer: &Diagnostics) -> Self {
+    return Self { handle: handle, lease: HandleLease.track(observer) }
+  }
+  // The caller must not release this borrowed handle or outlive its owner.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureView { return self.handle }
+  pub fn dup(self: &Self) -> Self {
+    unsafe sys.wgpuTextureViewAddRef(self.handle)
+    return Self { handle: self.handle, lease: self.lease.dup() }
+  }
+  pub fn reference<'b>(self: &'b Self) -> TextureViewRef<'b> { return TextureViewRef<'b> { handle: self.handle } }
+  pub fn setLabel(self: &Self, label: &[u8]) -> () {
+    unsafe sys.wgpuTextureViewSetLabel(self.handle, desc.stringView(label))
+  }
+}
+impl Drop for TextureView {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuTextureViewRelease(self.handle) }
+}
+
+// Borrowed one-word array entry, layout-compatible with the C handle.
+pub struct TextureViewRef<'a> { handle: sys.WGPUTextureView }
+impl<'a> Copy for TextureViewRef<'a> {}
+
+pub effect fn createBuffer(device: &Device, descriptor: &desc.BufferDescriptor) -> Buffer ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateBuffer(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe Buffer.adoptTracked(handle, &observer)
+}
+
+pub effect fn createTexture(device: &Device, descriptor: &desc.TextureDescriptor) -> Texture ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateTexture(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe Texture.adoptTracked(handle, &observer)
+}
+
+pub effect fn createSampler(device: &Device, descriptor: &desc.SamplerDescriptor) -> Sampler ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateSampler(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe Sampler.adoptTracked(handle, &observer)
+}
+
+pub effect fn createBindGroup(device: &Device, descriptor: &desc.BindGroupDescriptor) -> BindGroup ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateBindGroup(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe BindGroup.adoptTracked(handle, &observer)
+}
+
+pub effect fn createBindGroupLayout(device: &Device, descriptor: &desc.BindGroupLayoutDescriptor) -> BindGroupLayout ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateBindGroupLayout(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe BindGroupLayout.adoptTracked(handle, &observer)
+}
+
+pub effect fn createPipelineLayout(device: &Device, descriptor: &desc.PipelineLayoutDescriptor) -> PipelineLayout ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreatePipelineLayout(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe PipelineLayout.adoptTracked(handle, &observer)
+}
+
+pub effect fn createRenderPipeline(device: &Device, descriptor: &desc.RenderPipelineDescriptor) -> RenderPipeline ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateRenderPipeline(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe RenderPipeline.adoptTracked(handle, &observer)
+}
+
+pub effect fn createComputePipeline(device: &Device, descriptor: &desc.ComputePipelineDescriptor) -> ComputePipeline ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateComputePipeline(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe ComputePipeline.adoptTracked(handle, &observer)
+}
+
+pub effect fn createQuerySet(device: &Device, descriptor: &desc.QuerySetDescriptor) -> QuerySet ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateQuerySet(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe QuerySet.adoptTracked(handle, &observer)
+}
+
+pub effect fn createRenderBundleEncoder(device: &Device, descriptor: &desc.RenderBundleEncoderDescriptor) -> RenderBundleEncoder ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateRenderBundleEncoder(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe RenderBundleEncoder.adoptTracked(handle, &observer)
+}
+
+pub effect fn getQueue(device: &Device) -> Queue ! GpuError {
+  let handle = unsafe sys.wgpuDeviceGetQueue(unsafe device.raw())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe Queue.adoptTracked(handle, &observer)
+}
+
+pub effect fn createCommandEncoder(device: &Device, label: &[u8]) -> CommandEncoder ! GpuError {
+  let mut descriptor = WGPUCommandEncoderDescriptor.default()
+  descriptor.label = desc.stringView(label)
+  let handle = unsafe sys.wgpuDeviceCreateCommandEncoder(unsafe device.raw(), Pointer.fromRef(&descriptor))
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe CommandEncoder.adoptTracked(handle, &observer)
+}
+
+pub effect fn createShaderModule(device: &Device, label: &[u8], code: &[u8]) -> ShaderModule ! GpuError {
+  let mut source = WGPUShaderSourceWGSL.default()
+  source.code = desc.stringView(code)
+  let mut descriptor = WGPUShaderModuleDescriptor.default()
+  descriptor.label = desc.stringView(label)
+  descriptor.nextInChain = Pointer.fromMutRef(&mut source.chain)
+  let handle = unsafe sys.wgpuDeviceCreateShaderModule(unsafe device.raw(), Pointer.fromRef(&descriptor))
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe ShaderModule.adoptTracked(handle, &observer)
+}
+
+pub effect fn createShaderModuleFromDescriptor(device: &Device, descriptor: &desc.ShaderModuleDescriptor) -> ShaderModule ! GpuError {
+  let handle = unsafe sys.wgpuDeviceCreateShaderModule(unsafe device.raw(), unsafe descriptor.rawPointer())
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe ShaderModule.adoptTracked(handle, &observer)
+}
+
+pub effect fn createShaderModuleSpirV(device: &Device, label: &[u8], code: &[u32]) -> ShaderModule ! GpuError {
+  if code.length > 4294967295 { fail GpuError.status(sys.WGPUStatus_Error) }
+  let mut source = WGPUShaderSourceSPIRV.default()
+  source.codeSize = usize.toU32(code.length)
+  source.code = unsafe Intrinsic.pointerRequalify<?[*]const u32, ?*const u32>(Pointer.fromSlice<u32>(code))
+  let mut descriptor = WGPUShaderModuleDescriptor.default()
+  descriptor.label = desc.stringView(label)
+  descriptor.nextInChain = Pointer.fromMutRef(&mut source.chain)
+  let handle = unsafe sys.wgpuDeviceCreateShaderModule(unsafe device.raw(), Pointer.fromRef(&descriptor))
+  if Pointer.isNull(handle) { fail GpuError.status(sys.WGPUStatus_Error) }
+  let observer = device.diagnostics()
+  return unsafe ShaderModule.adoptTracked(handle, &observer)
+}

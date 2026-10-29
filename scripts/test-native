@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a raw native instance smoke test against pinned Dawn."""
+"""Run native ownership, callback, readback and validation scenarios against pinned Dawn."""
 import subprocess
 from _build import ROOT, build
 

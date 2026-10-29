@@ -1,10 +1,165 @@
 import webgpu_sys.generated_webgpu as sys
+import webgpu.runtime { Instance, RequestAdapterOptions, GpuError }
+import webgpu.runtime as runtime
+import webgpu.capabilities as capabilities
+import webgpu.descriptors { DeviceDescriptor, BufferDescriptor, ComputeState, ComputePipelineDescriptor, ComputePassDescriptor, Limits }
+import webgpu.resources as gpu
 import silk.mem.pointer { Pointer }
+import silk.mem.allocator { OutOfMemoryError }
+import silk.core.effect { Effect }
+import silk.core.result { Result }
+import silk.collections.list { List }
 
-pub fn main() -> i32 {
+import silk.platform.native.descriptor { write }
+
+fn rawInstanceSmoke() -> bool {
   let instance = unsafe sys.wgpuCreateInstance(Pointer.null<sys.WGPUInstanceDescriptor>())
-  if Pointer.isNull(instance) { return 1 }
+  if Pointer.isNull(instance) { return false }
   unsafe sys.wgpuInstanceProcessEvents(instance)
   unsafe sys.wgpuInstanceRelease(instance)
+  return true
+}
+effect fn scenarios(instance: &Instance) -> () ! GpuError | OutOfMemoryError {
+  let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
+  // Failed creation also owns a deferred device-lost callback. Its mailbox must
+  // survive the failed request and be drained before this later event pump.
+  let mut impossibleLimits = Limits.default()
+  impossibleLimits.setMaxTextureDimension2D(0xfffffffe)
+  let rejectedDescriptor = DeviceDescriptor.default().withRequiredLimits(&impossibleLimits)
+  match move run Effect.result(adapter.requestDevice(&rejectedDescriptor)) {
+    Result<runtime.Device, GpuError | OutOfMemoryError>.Success { value } => { fail GpuError.status(0xffff0006) }
+    Result<runtime.Device, GpuError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        GpuError rejected => {
+          if rejected.code != sys.WGPURequestDeviceStatus_Error { fail move rejected }
+        }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  instance.processEvents()
+  let device = run adapter.requestDevice(&DeviceDescriptor.default())
+  let available = capabilities.instanceFeatures()
+  let instanceLimits = run capabilities.instanceLimits()
+  if !available.has(sys.WGPUInstanceFeatureName_TimedWaitAny) || instanceLimits.timedWaitAnyMaxCount() < 1 {
+    fail GpuError.status(0xffff0007)
+  }
+  let adapterInfo = run adapter.getInfo()
+  let deviceInfo = run device.getAdapterInfo()
+  if adapterInfo.vendorID() != deviceInfo.vendorID() || adapterInfo.deviceID() != deviceInfo.deviceID() {
+    fail GpuError.status(0xffff0008)
+  }
+  let adapterLimits = run adapter.getLimits()
+  let deviceLimits = run device.getLimits()
+  if deviceLimits.maxBufferSize() < 16 || deviceLimits.maxBufferSize() > adapterLimits.maxBufferSize() {
+    fail GpuError.status(0xffff0009)
+  }
+  let supported = adapter.getFeatures()
+  let enabled = device.getFeatures()
+  let enabledValues = enabled.features()
+  let mut featureIndex: usize = 0
+  while featureIndex < enabledValues.length {
+    let feature = enabledValues[featureIndex]
+    if !supported.has(feature) || !device.hasFeature(feature) { fail GpuError.status(0xffff000a) }
+    featureIndex = featureIndex + 1
+  }
+  let queue = run gpu.getQueue(&device)
+  let upload = run gpu.createBuffer(&device, &BufferDescriptor.make(b"upload", 16, sys.WGPUBufferUsage_CopySrc | sys.WGPUBufferUsage_MapWrite, false))
+  let readback = run gpu.createBuffer(&device, &BufferDescriptor.make(b"readback", 16, sys.WGPUBufferUsage_CopyDst | sys.WGPUBufferUsage_MapRead, false))
+  let expected: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 248, 249, 250, 251, 252, 253, 254, 255]
+  let mapped = run runtime.mapAsync(&device, &upload, sys.WGPUMapMode_Write, 0, 16)
+  run mapped.write(0, &expected)
+  drop mapped
+  let mut encoder = run gpu.createCommandEncoder(&device, b"copy")
+  encoder.copyBufferToBuffer(&upload, 0, &readback, 0, 16)
+  let commands = run encoder.finish(b"copy")
+  queue.submit(&[commands.reference()])
+  let bytes = run runtime.mapRead(&device, &readback, 0, 16)
+  let actual = bytes.asSlice()
+  if actual.length != expected.length { fail GpuError.status(0xffff0001) }
+  let mut at: usize = 0
+  while at < expected.length {
+    if actual[at] != expected[at] { fail GpuError.status(0xffff0002) }
+    at = at + 1
+  }
+  run runtime.onSubmittedWorkDone(&device, &queue)
+
+  let shader = run gpu.createShaderModule(&device, b"async pipeline", b"@compute @workgroup_size(1) fn main() {}")
+  let messages = run runtime.getCompilationInfo(&device, &shader)
+  if messages.length() != 0 { fail GpuError.status(0xffff0004) }
+  let compute = ComputeState.default().withModule(&shader).withEntryPoint(b"main")
+  let pipelineDescriptor = ComputePipelineDescriptor.default().withCompute(compute)
+  let pipeline = run runtime.createComputePipelineAsync(&device, &pipelineDescriptor)
+  let mut computeEncoder = run gpu.createCommandEncoder(&device, b"async pipeline dispatch")
+  let mut pass = run computeEncoder.beginComputePass(&ComputePassDescriptor.default())
+  pass.setPipeline(&pipeline)
+  pass.dispatchWorkgroups(1, 1, 1)
+  pass.end()
+  let computeCommands = run computeEncoder.finish(b"async pipeline dispatch")
+  queue.submit(&[computeCommands.reference()])
+  run runtime.onSubmittedWorkDone(&device, &queue)
+
+  // Async pipeline validation is a typed completion, not an uncaptured device error.
+  let missingEntry = ComputeState.default().withModule(&shader).withEntryPoint(b"missing")
+  let invalidPipeline = ComputePipelineDescriptor.default().withCompute(missingEntry)
+  match move run Effect.result(runtime.createComputePipelineAsync(&device, &invalidPipeline)) {
+    Result<gpu.ComputePipeline, GpuError | OutOfMemoryError>.Success { value } => { fail GpuError.status(0xffff0005) }
+    Result<gpu.ComputePipeline, GpuError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        GpuError validation => {
+          if validation.code != sys.WGPUCreatePipelineAsyncStatus_ValidationError { fail move validation }
+        }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+
+  // A validation failure must be returned through the scope, never uncaptured or trapped.
+  device.pushErrorScope(sys.WGPUErrorFilter_Validation)
+  let invalid = run gpu.createBuffer(&device, &BufferDescriptor.make(b"invalid usage", 16, 0, false))
+  let scope = run Effect.result(device.popErrorScope())
+  match move scope {
+    Result<(), GpuError | OutOfMemoryError>.Success { value } => { fail GpuError.status(0xffff0003) }
+    Result<(), GpuError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        GpuError validation => {
+          if validation.code != sys.WGPUErrorType_Validation { fail move validation }
+        }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+  drop invalid
+  run device.checkErrors()
+
+  // Dropping an unfinished request must drain or cancel before its result slot is freed.
+  let pending = run instance.requestAdapterStart(&RequestAdapterOptions.default())
+  drop pending
+  let duplicate = readback.dup()
+  drop duplicate
+}
+effect fn program() -> i32 ! GpuError | OutOfMemoryError {
+  if !rawInstanceSmoke() { return 1 }
+  let instance = run Instance.create()
+  let observer = instance.diagnostics()
+  run scenarios(&instance)
+  drop instance
+  if observer.liveHandles() != 0 || observer.failureCount() != 0 { return 2 }
+  let message = b"PASS native instance, mapping, queue completion, validation scope, cancellation, and handle accounting\n"
+  drop unsafe write(1, Pointer.fromSlice(message), message.length)
   return 0
 }
+effect fn failed(error: GpuError | OutOfMemoryError) -> i32 {
+  match move error {
+    GpuError failure => {
+      let message = failure.message.asSlice()
+      drop unsafe write(2, Pointer.fromSlice(message), message.length)
+      drop unsafe write(2, Pointer.fromSlice(b"\n"), 1)
+    }
+    OutOfMemoryError allocation => {
+      drop unsafe write(2, Pointer.fromSlice(b"GPU test allocation failed\n"), 27)
+    }
+  }
+  return 1
+}
+pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }

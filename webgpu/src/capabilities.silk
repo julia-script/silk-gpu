@@ -1,0 +1,180 @@
+//! Capability queries own native output allocations and lend zero-copy views.
+//! Adapter information and feature arrays outlive the adapter/device that returned
+//! them, but borrowed strings and slices cannot outlive their output owner.
+//! Global instance capabilities describe the implementation, not one instance.
+import webgpu_sys.generated_webgpu as sys
+import webgpu_sys.generated_webgpu {
+  WGPUAdapterInfo,
+  WGPUSupportedFeatures,
+  WGPUSupportedInstanceFeatures,
+  WGPUSupportedWGSLLanguageFeatures,
+  WGPULimits,
+  WGPUInstanceLimits,
+}
+import runtime { Adapter, Device, Instance, GpuError }
+import descriptors { Limits }
+import silk.core.ownership { Copy, Drop }
+import silk.mem.pointer { Pointer }
+import silk.option { Option }
+
+const EMPTY_FEATURES: [u32; 0] = []
+
+// Native output strings have an explicit length when non-null. Preserve the
+// documented {null, WGPU_STRLEN} null value separately from an empty string.
+fn outputString<'a, A>(owner: &'a A, text: sys.WGPUStringView) -> Option<&'a [u8]> {
+  if text.length == 0 { return Option<&'a [u8]>.some(b"") }
+  if text.length == sys.WGPU_STRLEN {
+    if Pointer.isNullMany(text.data) { return Option<&'a [u8]>.none() }
+    return Intrinsic.trap("WebGPU returned a non-null output string without its explicit length")
+  }
+  return match Pointer.nonNullMany<u8>(text.data) {
+    Option<[*]const u8>.Some { value } => Option<&'a [u8]>.some(unsafe Pointer.borrowMany<A, u8>(owner, value, text.length))
+    Option<[*]const u8>.None => Intrinsic.trap("WebGPU returned a null output string with a nonzero explicit length")
+  }
+}
+
+fn featureSlice<'a, A>(owner: &'a A, data: ?[*]const u32, count: usize) -> &'a [u32] {
+  if count == 0 { return &EMPTY_FEATURES }
+  return match Pointer.nonNullMany<u32>(data) {
+    Option<[*]const u32>.Some { value } => unsafe Pointer.borrowMany<A, u32>(owner, value, count)
+    Option<[*]const u32>.None => Intrinsic.trap("WebGPU returned a nonempty feature list without storage")
+  }
+}
+
+fn contains(features: &[u32], feature: u32) -> bool {
+  let mut index: usize = 0
+  while index < features.length {
+    if features[index] == feature { return true }
+    index = index + 1
+  }
+  return false
+}
+
+pub struct AdapterInfo { value: sys.WGPUAdapterInfo }
+impl AdapterInfo {
+  pub fn vendor(self: &Self) -> Option<&[u8]> { return outputString(self, self.value.vendor) }
+  pub fn architecture(self: &Self) -> Option<&[u8]> { return outputString(self, self.value.architecture) }
+  pub fn device(self: &Self) -> Option<&[u8]> { return outputString(self, self.value.device) }
+  pub fn description(self: &Self) -> Option<&[u8]> { return outputString(self, self.value.description) }
+  pub fn backendType(self: &Self) -> sys.WGPUBackendType { return self.value.backendType }
+  pub fn adapterType(self: &Self) -> sys.WGPUAdapterType { return self.value.adapterType }
+  pub fn vendorID(self: &Self) -> u32 { return self.value.vendorID }
+  pub fn deviceID(self: &Self) -> u32 { return self.value.deviceID }
+  pub fn subgroupMinSize(self: &Self) -> u32 { return self.value.subgroupMinSize }
+  pub fn subgroupMaxSize(self: &Self) -> u32 { return self.value.subgroupMaxSize }
+}
+impl Drop for AdapterInfo {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuAdapterInfoFreeMembers(self.value) }
+}
+
+pub struct SupportedFeatures { value: sys.WGPUSupportedFeatures }
+impl SupportedFeatures {
+  pub fn features(self: &Self) -> &[sys.WGPUFeatureName] {
+    return featureSlice(self, self.value.features, self.value.featureCount)
+  }
+  pub fn has(self: &Self, feature: sys.WGPUFeatureName) -> bool {
+    return contains(self.features(), feature)
+  }
+}
+impl Drop for SupportedFeatures {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuSupportedFeaturesFreeMembers(self.value) }
+}
+
+pub struct SupportedInstanceFeatures { value: sys.WGPUSupportedInstanceFeatures }
+impl SupportedInstanceFeatures {
+  pub fn features(self: &Self) -> &[sys.WGPUInstanceFeatureName] {
+    return featureSlice(self, self.value.features, self.value.featureCount)
+  }
+  pub fn has(self: &Self, feature: sys.WGPUInstanceFeatureName) -> bool {
+    return contains(self.features(), feature)
+  }
+}
+impl Drop for SupportedInstanceFeatures {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuSupportedInstanceFeaturesFreeMembers(self.value) }
+}
+
+pub struct SupportedWGSLLanguageFeatures { value: sys.WGPUSupportedWGSLLanguageFeatures }
+impl SupportedWGSLLanguageFeatures {
+  pub fn features(self: &Self) -> &[sys.WGPUWGSLLanguageFeatureName] {
+    return featureSlice(self, self.value.features, self.value.featureCount)
+  }
+  pub fn has(self: &Self, feature: sys.WGPUWGSLLanguageFeatureName) -> bool {
+    return contains(self.features(), feature)
+  }
+}
+impl Drop for SupportedWGSLLanguageFeatures {
+  fn drop(self: &mut Self) -> () { unsafe sys.wgpuSupportedWGSLLanguageFeaturesFreeMembers(self.value) }
+}
+
+pub struct InstanceLimits { value: sys.WGPUInstanceLimits }
+impl Copy for InstanceLimits {}
+impl InstanceLimits {
+  pub fn timedWaitAnyMaxCount(self: &Self) -> usize { return self.value.timedWaitAnyMaxCount }
+}
+
+pub effect fn adapterInfo(adapter: &Adapter) -> AdapterInfo ! GpuError {
+  let mut info = AdapterInfo { value: WGPUAdapterInfo.default() }
+  let status = unsafe sys.wgpuAdapterGetInfo(unsafe adapter.raw(), Pointer.fromMutRef(&mut info.value))
+  if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  return move info
+}
+
+pub effect fn deviceAdapterInfo(device: &Device) -> AdapterInfo ! GpuError {
+  let mut info = AdapterInfo { value: WGPUAdapterInfo.default() }
+  let status = unsafe sys.wgpuDeviceGetAdapterInfo(unsafe device.raw(), Pointer.fromMutRef(&mut info.value))
+  if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  return move info
+}
+
+pub fn adapterFeatures(adapter: &Adapter) -> SupportedFeatures {
+  let mut features = SupportedFeatures { value: WGPUSupportedFeatures.default() }
+  unsafe sys.wgpuAdapterGetFeatures(unsafe adapter.raw(), Pointer.fromMutRef(&mut features.value))
+  return move features
+}
+
+pub fn deviceFeatures(device: &Device) -> SupportedFeatures {
+  let mut features = SupportedFeatures { value: WGPUSupportedFeatures.default() }
+  unsafe sys.wgpuDeviceGetFeatures(unsafe device.raw(), Pointer.fromMutRef(&mut features.value))
+  return move features
+}
+
+pub effect fn adapterLimits(adapter: &Adapter) -> Limits<'static> ! GpuError {
+  let mut limits = WGPULimits.default()
+  let status = unsafe sys.wgpuAdapterGetLimits(unsafe adapter.raw(), Pointer.fromMutRef(&mut limits))
+  if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  return Limits<'static>.fromRaw(limits)
+}
+
+pub effect fn deviceLimits(device: &Device) -> Limits<'static> ! GpuError {
+  let mut limits = WGPULimits.default()
+  let status = unsafe sys.wgpuDeviceGetLimits(unsafe device.raw(), Pointer.fromMutRef(&mut limits))
+  if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  return Limits<'static>.fromRaw(limits)
+}
+
+pub fn instanceFeatures() -> SupportedInstanceFeatures {
+  let mut features = SupportedInstanceFeatures { value: WGPUSupportedInstanceFeatures.default() }
+  unsafe sys.wgpuGetInstanceFeatures(Pointer.fromMutRef(&mut features.value))
+  return move features
+}
+
+pub effect fn instanceLimits() -> InstanceLimits ! GpuError {
+  let mut limits = WGPUInstanceLimits.default()
+  let status = unsafe sys.wgpuGetInstanceLimits(Pointer.fromMutRef(&mut limits))
+  if status != sys.WGPUStatus_Success { fail GpuError.status(status) }
+  return InstanceLimits { value: limits }
+}
+
+pub fn hasInstanceFeature(feature: sys.WGPUInstanceFeatureName) -> bool {
+  return unsafe sys.wgpuHasInstanceFeature(feature) != 0
+}
+
+pub fn wgslLanguageFeatures(instance: &Instance) -> SupportedWGSLLanguageFeatures {
+  let mut features = SupportedWGSLLanguageFeatures { value: WGPUSupportedWGSLLanguageFeatures.default() }
+  unsafe sys.wgpuInstanceGetWGSLLanguageFeatures(unsafe instance.raw(), Pointer.fromMutRef(&mut features.value))
+  return move features
+}
+
+pub fn hasWGSLLanguageFeature(instance: &Instance, feature: sys.WGPUWGSLLanguageFeatureName) -> bool {
+  return unsafe sys.wgpuInstanceHasWGSLLanguageFeature(unsafe instance.raw(), feature) != 0
+}

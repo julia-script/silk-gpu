@@ -1,0 +1,30 @@
+//! Shared deterministic storage layout and allocation-free recording workload.
+import webgpu.resources { RenderPassEncoder, RenderPipeline, BindGroup }
+import silk.num.u32
+import silk.num.usize
+import silk.num.f32
+
+pub fn writeU32(bytes: &mut [u8], offset: usize, value: u32) -> () {
+  bytes[offset] = u32.toU8(value & 255)
+  bytes[offset + 1] = u32.toU8(u32.shiftRight(value, 8) & 255)
+  bytes[offset + 2] = u32.toU8(u32.shiftRight(value, 16) & 255)
+  bytes[offset + 3] = u32.toU8(u32.shiftRight(value, 24))
+}
+pub fn fillRectBytes(bytes: &mut [u8], count: u32) -> () {
+  let mut i: u32 = 0
+  while i < count {
+    let tile = i % 64
+    let values: [f32; 12] = [u32.toF32((tile % 8) * 8 + 1), u32.toF32((tile / 8) * 8 + 1), 6.0, 6.0, 1.0, 0.5, 0.25, 1.0, 2.0, 0.0, 0.0, 0.0]
+    let mut j: usize = 0
+    while j < 12 {
+      writeU32(&mut bytes, u32.toUsize(i) * 48 + j * 4, f32.toBits(values[j]))
+      j = j + 1
+    }
+    i = i + 1
+  }
+}
+pub fn encodeRects(pass: &mut RenderPassEncoder, pipeline: &RenderPipeline, group: &BindGroup, count: u32) -> () {
+  pass.setPipeline(pipeline)
+  pass.setBindGroup(0, group, &[])
+  pass.draw(6, count, 0, 0)
+}

@@ -1,0 +1,1722 @@
+//! Borrowed WebGPU descriptors with checked zero-copy array conversion.
+//! Private raw fields and lifetime-bound builders keep labels, entry slices and resource
+//! references live until the descriptor's last use. Entry arrays are passed directly,
+//! without heap allocation, fixed implementation limits, or variable stack allocation.
+//! Borrowing fields use consuming withX builders so a default's static lifetime
+//! can safely shorten to the intersection of all resources already borrowed.
+//! Nested entry lifetimes are independent of their outer slice/reference borrow;
+//! the reference contract proves entries outlive the descriptor without forcing
+//! a local array to inherit a longer resource lifetime.
+import webgpu_sys.generated_webgpu as sys
+import resources as resource
+import silk.mem.pointer { Pointer }
+import silk.option { Option }
+import silk.core.ownership { Copy }
+import webgpu_sys.generated_webgpu {
+  WGPUBindGroupDescriptor,
+  WGPUBindGroupEntry,
+  WGPUBindGroupLayoutDescriptor,
+  WGPUBindGroupLayoutEntry,
+  WGPUBlendComponent,
+  WGPUBlendState,
+  WGPUBufferBindingLayout,
+  WGPUBufferDescriptor,
+  WGPUColor,
+  WGPUColorTargetState,
+  WGPUCommandBufferDescriptor,
+  WGPUCommandEncoderDescriptor,
+  WGPUCompatibilityModeLimits,
+  WGPUComputePassDescriptor,
+  WGPUComputePipelineDescriptor,
+  WGPUComputeState,
+  WGPUConstantEntry,
+  WGPUDepthStencilState,
+  WGPUDeviceDescriptor,
+  WGPUExtent3D,
+  WGPUExternalTextureBindingEntry,
+  WGPUExternalTextureBindingLayout,
+  WGPUFragmentState,
+  WGPULimits,
+  WGPUMultisampleState,
+  WGPUOrigin3D,
+  WGPUPassTimestampWrites,
+  WGPUPipelineLayoutDescriptor,
+  WGPUPrimitiveState,
+  WGPUQuerySetDescriptor,
+  WGPUQueueDescriptor,
+  WGPURenderBundleDescriptor,
+  WGPURenderBundleEncoderDescriptor,
+  WGPURenderPassColorAttachment,
+  WGPURenderPassDepthStencilAttachment,
+  WGPURenderPassDescriptor,
+  WGPURenderPassMaxDrawCount,
+  WGPURenderPipelineDescriptor,
+  WGPUSamplerBindingLayout,
+  WGPUSamplerDescriptor,
+  WGPUShaderModuleDescriptor,
+  WGPUShaderSourceWGSL,
+  WGPUStencilFaceState,
+  WGPUStorageTextureBindingLayout,
+  WGPUTexelCopyBufferInfo,
+  WGPUTexelCopyBufferLayout,
+  WGPUTexelCopyTextureInfo,
+  WGPUTextureBindingLayout,
+  WGPUTextureBindingViewDimension,
+  WGPUTextureComponentSwizzle,
+  WGPUTextureComponentSwizzleDescriptor,
+  WGPUTextureDescriptor,
+  WGPUTextureViewDescriptor,
+  WGPUVertexAttribute,
+  WGPUVertexBufferLayout,
+  WGPUVertexState,
+}
+import silk.layout { Layout }
+
+const EMPTY_FEATURES: [u32; 0] = []
+
+// LIMITATION-2: dev.27 rejects lifetime parameters on extern C records (SEM0205).
+// Every caller supplies a wrapper with exactly one stored U field. Equal byte
+// size proves that field starts at offset zero (otherwise it would not fit),
+// and equal alignment and stride prove that a wrapper slice is a C U array.
+// These are compiler-layout invariants, not restrictions on caller input.
+// The caller must additionally retain all pointer targets for the native call.
+pub unsafe fn rawEntries<T, U>(values: &[T]) -> ?[*]const U {
+  let wrapper = Layout.of<T>()
+  let raw = Layout.of<U>()
+  if wrapper.bytes != raw.bytes || wrapper.alignment != raw.alignment {
+    Intrinsic.trap("WebGPU single-field descriptor layout changed")
+  }
+  return unsafe Intrinsic.pointerReinterpret<?[*]const T, ?[*]const U>(Pointer.fromSlice<T>(values))
+}
+
+pub fn stringView(bytes: &[u8]) -> sys.WGPUStringView {
+  return sys.WGPUStringView { data: Pointer.fromSlice<u8>(bytes), length: bytes.length }
+}
+
+pub struct BindGroupDescriptor<'a> { value: sys.WGPUBindGroupDescriptor }
+impl<'a> Copy for BindGroupDescriptor<'a> {}
+
+impl<'a> BindGroupDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUBindGroupDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBindGroupDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBindGroupDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withLayout(self: Self, value: &'a resource.BindGroupLayout) -> Self {
+    let mut result = self
+    result.value.layout = unsafe value.raw()
+    return result
+  }
+  pub fn withEntries<'entry>(self: Self, value: &'a [BindGroupEntry<'entry>]) -> Self {
+    let mut result = self
+    result.value.entries = unsafe rawEntries<BindGroupEntry<'entry>, sys.WGPUBindGroupEntry>(value)
+    result.value.entryCount = value.length
+    return result
+  }
+}
+
+pub struct BindGroupEntry<'a> { value: sys.WGPUBindGroupEntry }
+impl<'a> Copy for BindGroupEntry<'a> {}
+
+impl<'a> BindGroupEntry<'a> {
+  pub fn default() -> Self { return Self { value: WGPUBindGroupEntry.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBindGroupEntry { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBindGroupEntry { return Pointer.fromRef(&self.value) }
+  pub fn setBinding(self: &mut Self, value: u32) -> () {
+    self.value.binding = value
+  }
+  pub fn binding(self: &Self) -> u32 { return self.value.binding }
+  pub fn withBuffer(self: Self, value: &'a resource.Buffer) -> Self {
+    let mut result = self
+    result.value.buffer = unsafe value.raw()
+    return result
+  }
+  pub fn setOffset(self: &mut Self, value: u64) -> () {
+    self.value.offset = value
+  }
+  pub fn offset(self: &Self) -> u64 { return self.value.offset }
+  pub fn setSize(self: &mut Self, value: u64) -> () {
+    self.value.size = value
+  }
+  pub fn size(self: &Self) -> u64 { return self.value.size }
+  pub fn withSampler(self: Self, value: &'a resource.Sampler) -> Self {
+    let mut result = self
+    result.value.sampler = unsafe value.raw()
+    return result
+  }
+  pub fn withTextureView(self: Self, value: &'a resource.TextureView) -> Self {
+    let mut result = self
+    result.value.textureView = unsafe value.raw()
+    return result
+  }
+}
+
+pub struct BindGroupLayoutDescriptor<'a> { value: sys.WGPUBindGroupLayoutDescriptor }
+impl<'a> Copy for BindGroupLayoutDescriptor<'a> {}
+
+impl<'a> BindGroupLayoutDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUBindGroupLayoutDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBindGroupLayoutDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBindGroupLayoutDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withEntries<'entry>(self: Self, value: &'a [BindGroupLayoutEntry<'entry>]) -> Self {
+    let mut result = self
+    result.value.entries = unsafe rawEntries<BindGroupLayoutEntry<'entry>, sys.WGPUBindGroupLayoutEntry>(value)
+    result.value.entryCount = value.length
+    return result
+  }
+}
+
+pub struct BindGroupLayoutEntry<'a> { value: sys.WGPUBindGroupLayoutEntry }
+impl<'a> Copy for BindGroupLayoutEntry<'a> {}
+
+impl<'a> BindGroupLayoutEntry<'a> {
+  pub fn default() -> Self { return Self { value: WGPUBindGroupLayoutEntry.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBindGroupLayoutEntry { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBindGroupLayoutEntry { return Pointer.fromRef(&self.value) }
+  pub fn setBinding(self: &mut Self, value: u32) -> () {
+    self.value.binding = value
+  }
+  pub fn binding(self: &Self) -> u32 { return self.value.binding }
+  pub fn setVisibility(self: &mut Self, value: sys.WGPUShaderStage) -> () {
+    self.value.visibility = value
+  }
+  pub fn visibility(self: &Self) -> sys.WGPUShaderStage { return self.value.visibility }
+  pub fn setBindingArraySize(self: &mut Self, value: u32) -> () {
+    self.value.bindingArraySize = value
+  }
+  pub fn bindingArraySize(self: &Self) -> u32 { return self.value.bindingArraySize }
+  pub fn setBuffer(self: &mut Self, value: BufferBindingLayout) -> () {
+    self.value.buffer = value.value
+  }
+  pub fn setSampler(self: &mut Self, value: SamplerBindingLayout) -> () {
+    self.value.sampler = value.value
+  }
+  pub fn setTexture(self: &mut Self, value: TextureBindingLayout) -> () {
+    self.value.texture = value.value
+  }
+  pub fn setStorageTexture(self: &mut Self, value: StorageTextureBindingLayout) -> () {
+    self.value.storageTexture = value.value
+  }
+}
+
+pub struct BlendComponent { value: sys.WGPUBlendComponent }
+impl Copy for BlendComponent {}
+
+impl BlendComponent {
+  pub fn default() -> Self { return Self { value: WGPUBlendComponent.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBlendComponent { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBlendComponent { return Pointer.fromRef(&self.value) }
+  pub fn setOperation(self: &mut Self, value: sys.WGPUBlendOperation) -> () {
+    self.value.operation = value
+  }
+  pub fn operation(self: &Self) -> sys.WGPUBlendOperation { return self.value.operation }
+  pub fn setSrcFactor(self: &mut Self, value: sys.WGPUBlendFactor) -> () {
+    self.value.srcFactor = value
+  }
+  pub fn srcFactor(self: &Self) -> sys.WGPUBlendFactor { return self.value.srcFactor }
+  pub fn setDstFactor(self: &mut Self, value: sys.WGPUBlendFactor) -> () {
+    self.value.dstFactor = value
+  }
+  pub fn dstFactor(self: &Self) -> sys.WGPUBlendFactor { return self.value.dstFactor }
+}
+
+pub struct BlendState { value: sys.WGPUBlendState }
+impl Copy for BlendState {}
+
+impl BlendState {
+  pub fn default() -> Self { return Self { value: WGPUBlendState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBlendState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBlendState { return Pointer.fromRef(&self.value) }
+  pub fn setColor(self: &mut Self, value: BlendComponent) -> () {
+    self.value.color = value.value
+  }
+  pub fn setAlpha(self: &mut Self, value: BlendComponent) -> () {
+    self.value.alpha = value.value
+  }
+}
+
+pub struct BufferBindingLayout { value: sys.WGPUBufferBindingLayout }
+impl Copy for BufferBindingLayout {}
+
+impl BufferBindingLayout {
+  pub fn default() -> Self { return Self { value: WGPUBufferBindingLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBufferBindingLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBufferBindingLayout { return Pointer.fromRef(&self.value) }
+  pub fn setType(self: &mut Self, value: sys.WGPUBufferBindingType) -> () {
+    self.value.type_ = value
+  }
+  pub fn getType(self: &Self) -> sys.WGPUBufferBindingType { return self.value.type_ }
+  pub fn setHasDynamicOffset(self: &mut Self, value: bool) -> () {
+    self.value.hasDynamicOffset = if value { 1 } else { 0 }
+  }
+  pub fn hasDynamicOffset(self: &Self) -> bool { return self.value.hasDynamicOffset != 0 }
+  pub fn setMinBindingSize(self: &mut Self, value: u64) -> () {
+    self.value.minBindingSize = value
+  }
+  pub fn minBindingSize(self: &Self) -> u64 { return self.value.minBindingSize }
+}
+
+pub struct BufferDescriptor<'a> { value: sys.WGPUBufferDescriptor }
+impl<'a> Copy for BufferDescriptor<'a> {}
+
+impl<'a> BufferDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUBufferDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUBufferDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUBufferDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn setUsage(self: &mut Self, value: sys.WGPUBufferUsage) -> () {
+    self.value.usage = value
+  }
+  pub fn usage(self: &Self) -> sys.WGPUBufferUsage { return self.value.usage }
+  pub fn setSize(self: &mut Self, value: u64) -> () {
+    self.value.size = value
+  }
+  pub fn size(self: &Self) -> u64 { return self.value.size }
+  pub fn setMappedAtCreation(self: &mut Self, value: bool) -> () {
+    self.value.mappedAtCreation = if value { 1 } else { 0 }
+  }
+  pub fn mappedAtCreation(self: &Self) -> bool { return self.value.mappedAtCreation != 0 }
+}
+
+pub struct Color { value: sys.WGPUColor }
+impl Copy for Color {}
+
+impl Color {
+  pub fn default() -> Self { return Self { value: WGPUColor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUColor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUColor { return Pointer.fromRef(&self.value) }
+  pub fn setR(self: &mut Self, value: f64) -> () {
+    self.value.r = value
+  }
+  pub fn r(self: &Self) -> f64 { return self.value.r }
+  pub fn setG(self: &mut Self, value: f64) -> () {
+    self.value.g = value
+  }
+  pub fn g(self: &Self) -> f64 { return self.value.g }
+  pub fn setB(self: &mut Self, value: f64) -> () {
+    self.value.b = value
+  }
+  pub fn b(self: &Self) -> f64 { return self.value.b }
+  pub fn setA(self: &mut Self, value: f64) -> () {
+    self.value.a = value
+  }
+  pub fn a(self: &Self) -> f64 { return self.value.a }
+}
+
+pub struct ColorTargetState<'a> { value: sys.WGPUColorTargetState }
+impl<'a> Copy for ColorTargetState<'a> {}
+
+impl<'a> ColorTargetState<'a> {
+  pub fn default() -> Self { return Self { value: WGPUColorTargetState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUColorTargetState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUColorTargetState { return Pointer.fromRef(&self.value) }
+  pub fn setFormat(self: &mut Self, value: sys.WGPUTextureFormat) -> () {
+    self.value.format = value
+  }
+  pub fn format(self: &Self) -> sys.WGPUTextureFormat { return self.value.format }
+  pub fn withBlend(self: Self, value: &'a BlendState) -> Self {
+    let mut result = self
+    result.value.blend = unsafe BlendState.rawPointer(value)
+    return result
+  }
+  pub fn setWriteMask(self: &mut Self, value: sys.WGPUColorWriteMask) -> () {
+    self.value.writeMask = value
+  }
+  pub fn writeMask(self: &Self) -> sys.WGPUColorWriteMask { return self.value.writeMask }
+}
+
+pub struct CommandBufferDescriptor<'a> { value: sys.WGPUCommandBufferDescriptor }
+impl<'a> Copy for CommandBufferDescriptor<'a> {}
+
+impl<'a> CommandBufferDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUCommandBufferDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUCommandBufferDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUCommandBufferDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+}
+
+pub struct CommandEncoderDescriptor<'a> { value: sys.WGPUCommandEncoderDescriptor }
+impl<'a> Copy for CommandEncoderDescriptor<'a> {}
+
+impl<'a> CommandEncoderDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUCommandEncoderDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUCommandEncoderDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUCommandEncoderDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+}
+
+pub struct CompatibilityModeLimits { value: sys.WGPUCompatibilityModeLimits }
+impl Copy for CompatibilityModeLimits {}
+
+impl CompatibilityModeLimits {
+  pub fn default() -> Self { return Self { value: WGPUCompatibilityModeLimits.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUCompatibilityModeLimits { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUCompatibilityModeLimits { return Pointer.fromRef(&self.value) }
+  pub fn setMaxStorageBuffersInVertexStage(self: &mut Self, value: u32) -> () {
+    self.value.maxStorageBuffersInVertexStage = value
+  }
+  pub fn maxStorageBuffersInVertexStage(self: &Self) -> u32 { return self.value.maxStorageBuffersInVertexStage }
+  pub fn setMaxStorageTexturesInVertexStage(self: &mut Self, value: u32) -> () {
+    self.value.maxStorageTexturesInVertexStage = value
+  }
+  pub fn maxStorageTexturesInVertexStage(self: &Self) -> u32 { return self.value.maxStorageTexturesInVertexStage }
+  pub fn setMaxStorageBuffersInFragmentStage(self: &mut Self, value: u32) -> () {
+    self.value.maxStorageBuffersInFragmentStage = value
+  }
+  pub fn maxStorageBuffersInFragmentStage(self: &Self) -> u32 { return self.value.maxStorageBuffersInFragmentStage }
+  pub fn setMaxStorageTexturesInFragmentStage(self: &mut Self, value: u32) -> () {
+    self.value.maxStorageTexturesInFragmentStage = value
+  }
+  pub fn maxStorageTexturesInFragmentStage(self: &Self) -> u32 { return self.value.maxStorageTexturesInFragmentStage }
+}
+
+pub struct ComputePassDescriptor<'a> { value: sys.WGPUComputePassDescriptor }
+impl<'a> Copy for ComputePassDescriptor<'a> {}
+
+impl<'a> ComputePassDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUComputePassDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUComputePassDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUComputePassDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withTimestampWrites<'entry>(self: Self, value: &'a PassTimestampWrites<'entry>) -> Self {
+    let mut result = self
+    result.value.timestampWrites = unsafe PassTimestampWrites.rawPointer(value)
+    return result
+  }
+}
+
+pub struct ComputePipelineDescriptor<'a> { value: sys.WGPUComputePipelineDescriptor }
+impl<'a> Copy for ComputePipelineDescriptor<'a> {}
+
+impl<'a> ComputePipelineDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUComputePipelineDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUComputePipelineDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUComputePipelineDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withLayout(self: Self, value: &'a resource.PipelineLayout) -> Self {
+    let mut result = self
+    result.value.layout = unsafe value.raw()
+    return result
+  }
+  pub fn withCompute(self: Self, value: ComputeState<'a>) -> Self {
+    let mut result = self
+    result.value.compute = value.value
+    return result
+  }
+}
+
+pub struct ComputeState<'a> { value: sys.WGPUComputeState }
+impl<'a> Copy for ComputeState<'a> {}
+
+impl<'a> ComputeState<'a> {
+  pub fn default() -> Self { return Self { value: WGPUComputeState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUComputeState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUComputeState { return Pointer.fromRef(&self.value) }
+  pub fn withModule(self: Self, value: &'a resource.ShaderModule) -> Self {
+    let mut result = self
+    result.value.module = unsafe value.raw()
+    return result
+  }
+  pub fn withEntryPoint(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.entryPoint = stringView(value)
+    return result
+  }
+  pub fn withConstants<'entry>(self: Self, value: &'a [ConstantEntry<'entry>]) -> Self {
+    let mut result = self
+    result.value.constants = unsafe rawEntries<ConstantEntry<'entry>, sys.WGPUConstantEntry>(value)
+    result.value.constantCount = value.length
+    return result
+  }
+}
+
+pub struct ConstantEntry<'a> { value: sys.WGPUConstantEntry }
+impl<'a> Copy for ConstantEntry<'a> {}
+
+impl<'a> ConstantEntry<'a> {
+  pub fn default() -> Self { return Self { value: WGPUConstantEntry.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUConstantEntry { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUConstantEntry { return Pointer.fromRef(&self.value) }
+  pub fn withKey(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.key = stringView(value)
+    return result
+  }
+  pub fn setValue(self: &mut Self, value: f64) -> () {
+    self.value.value = value
+  }
+  pub fn getValue(self: &Self) -> f64 { return self.value.value }
+}
+
+pub struct DepthStencilState { value: sys.WGPUDepthStencilState }
+impl Copy for DepthStencilState {}
+
+impl DepthStencilState {
+  pub fn default() -> Self { return Self { value: WGPUDepthStencilState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUDepthStencilState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUDepthStencilState { return Pointer.fromRef(&self.value) }
+  pub fn setFormat(self: &mut Self, value: sys.WGPUTextureFormat) -> () {
+    self.value.format = value
+  }
+  pub fn format(self: &Self) -> sys.WGPUTextureFormat { return self.value.format }
+  pub fn setDepthWriteEnabled(self: &mut Self, value: sys.WGPUOptionalBool) -> () {
+    self.value.depthWriteEnabled = value
+  }
+  pub fn depthWriteEnabled(self: &Self) -> sys.WGPUOptionalBool { return self.value.depthWriteEnabled }
+  pub fn setDepthCompare(self: &mut Self, value: sys.WGPUCompareFunction) -> () {
+    self.value.depthCompare = value
+  }
+  pub fn depthCompare(self: &Self) -> sys.WGPUCompareFunction { return self.value.depthCompare }
+  pub fn setStencilFront(self: &mut Self, value: StencilFaceState) -> () {
+    self.value.stencilFront = value.value
+  }
+  pub fn setStencilBack(self: &mut Self, value: StencilFaceState) -> () {
+    self.value.stencilBack = value.value
+  }
+  pub fn setStencilReadMask(self: &mut Self, value: u32) -> () {
+    self.value.stencilReadMask = value
+  }
+  pub fn stencilReadMask(self: &Self) -> u32 { return self.value.stencilReadMask }
+  pub fn setStencilWriteMask(self: &mut Self, value: u32) -> () {
+    self.value.stencilWriteMask = value
+  }
+  pub fn stencilWriteMask(self: &Self) -> u32 { return self.value.stencilWriteMask }
+  pub fn setDepthBias(self: &mut Self, value: i32) -> () {
+    self.value.depthBias = value
+  }
+  pub fn depthBias(self: &Self) -> i32 { return self.value.depthBias }
+  pub fn setDepthBiasSlopeScale(self: &mut Self, value: f32) -> () {
+    self.value.depthBiasSlopeScale = value
+  }
+  pub fn depthBiasSlopeScale(self: &Self) -> f32 { return self.value.depthBiasSlopeScale }
+  pub fn setDepthBiasClamp(self: &mut Self, value: f32) -> () {
+    self.value.depthBiasClamp = value
+  }
+  pub fn depthBiasClamp(self: &Self) -> f32 { return self.value.depthBiasClamp }
+}
+
+pub struct Extent3D { value: sys.WGPUExtent3D }
+impl Copy for Extent3D {}
+
+impl Extent3D {
+  pub fn default() -> Self { return Self { value: WGPUExtent3D.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUExtent3D { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUExtent3D { return Pointer.fromRef(&self.value) }
+  pub fn setWidth(self: &mut Self, value: u32) -> () {
+    self.value.width = value
+  }
+  pub fn width(self: &Self) -> u32 { return self.value.width }
+  pub fn setHeight(self: &mut Self, value: u32) -> () {
+    self.value.height = value
+  }
+  pub fn height(self: &Self) -> u32 { return self.value.height }
+  pub fn setDepthOrArrayLayers(self: &mut Self, value: u32) -> () {
+    self.value.depthOrArrayLayers = value
+  }
+  pub fn depthOrArrayLayers(self: &Self) -> u32 { return self.value.depthOrArrayLayers }
+}
+
+pub struct ExternalTextureBindingEntry<'a> { value: sys.WGPUExternalTextureBindingEntry }
+impl<'a> Copy for ExternalTextureBindingEntry<'a> {}
+
+impl<'a> ExternalTextureBindingEntry<'a> {
+  pub fn default() -> Self { return Self { value: WGPUExternalTextureBindingEntry.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUExternalTextureBindingEntry { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUExternalTextureBindingEntry { return Pointer.fromRef(&self.value) }
+  pub fn withExternalTexture(self: Self, value: &'a resource.ExternalTexture) -> Self {
+    let mut result = self
+    result.value.externalTexture = unsafe value.raw()
+    return result
+  }
+}
+
+pub struct ExternalTextureBindingLayout { value: sys.WGPUExternalTextureBindingLayout }
+impl Copy for ExternalTextureBindingLayout {}
+
+impl ExternalTextureBindingLayout {
+  pub fn default() -> Self { return Self { value: WGPUExternalTextureBindingLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUExternalTextureBindingLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUExternalTextureBindingLayout { return Pointer.fromRef(&self.value) }
+}
+
+pub struct FragmentState<'a> { value: sys.WGPUFragmentState }
+impl<'a> Copy for FragmentState<'a> {}
+
+impl<'a> FragmentState<'a> {
+  pub fn default() -> Self { return Self { value: WGPUFragmentState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUFragmentState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUFragmentState { return Pointer.fromRef(&self.value) }
+  pub fn withModule(self: Self, value: &'a resource.ShaderModule) -> Self {
+    let mut result = self
+    result.value.module = unsafe value.raw()
+    return result
+  }
+  pub fn withEntryPoint(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.entryPoint = stringView(value)
+    return result
+  }
+  pub fn withConstants<'entry>(self: Self, value: &'a [ConstantEntry<'entry>]) -> Self {
+    let mut result = self
+    result.value.constants = unsafe rawEntries<ConstantEntry<'entry>, sys.WGPUConstantEntry>(value)
+    result.value.constantCount = value.length
+    return result
+  }
+  pub fn withTargets<'entry>(self: Self, value: &'a [ColorTargetState<'entry>]) -> Self {
+    let mut result = self
+    result.value.targets = unsafe rawEntries<ColorTargetState<'entry>, sys.WGPUColorTargetState>(value)
+    result.value.targetCount = value.length
+    return result
+  }
+}
+
+pub struct Limits<'a> { value: sys.WGPULimits }
+impl<'a> Copy for Limits<'a> {}
+
+impl<'a> Limits<'a> {
+  pub fn default() -> Self { return Self { value: WGPULimits.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPULimits { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPULimits { return Pointer.fromRef(&self.value) }
+  pub fn setMaxTextureDimension1D(self: &mut Self, value: u32) -> () {
+    self.value.maxTextureDimension1D = value
+  }
+  pub fn maxTextureDimension1D(self: &Self) -> u32 { return self.value.maxTextureDimension1D }
+  pub fn setMaxTextureDimension2D(self: &mut Self, value: u32) -> () {
+    self.value.maxTextureDimension2D = value
+  }
+  pub fn maxTextureDimension2D(self: &Self) -> u32 { return self.value.maxTextureDimension2D }
+  pub fn setMaxTextureDimension3D(self: &mut Self, value: u32) -> () {
+    self.value.maxTextureDimension3D = value
+  }
+  pub fn maxTextureDimension3D(self: &Self) -> u32 { return self.value.maxTextureDimension3D }
+  pub fn setMaxTextureArrayLayers(self: &mut Self, value: u32) -> () {
+    self.value.maxTextureArrayLayers = value
+  }
+  pub fn maxTextureArrayLayers(self: &Self) -> u32 { return self.value.maxTextureArrayLayers }
+  pub fn setMaxBindGroups(self: &mut Self, value: u32) -> () {
+    self.value.maxBindGroups = value
+  }
+  pub fn maxBindGroups(self: &Self) -> u32 { return self.value.maxBindGroups }
+  pub fn setMaxBindGroupsPlusVertexBuffers(self: &mut Self, value: u32) -> () {
+    self.value.maxBindGroupsPlusVertexBuffers = value
+  }
+  pub fn maxBindGroupsPlusVertexBuffers(self: &Self) -> u32 { return self.value.maxBindGroupsPlusVertexBuffers }
+  pub fn setMaxBindingsPerBindGroup(self: &mut Self, value: u32) -> () {
+    self.value.maxBindingsPerBindGroup = value
+  }
+  pub fn maxBindingsPerBindGroup(self: &Self) -> u32 { return self.value.maxBindingsPerBindGroup }
+  pub fn setMaxDynamicUniformBuffersPerPipelineLayout(self: &mut Self, value: u32) -> () {
+    self.value.maxDynamicUniformBuffersPerPipelineLayout = value
+  }
+  pub fn maxDynamicUniformBuffersPerPipelineLayout(self: &Self) -> u32 { return self.value.maxDynamicUniformBuffersPerPipelineLayout }
+  pub fn setMaxDynamicStorageBuffersPerPipelineLayout(self: &mut Self, value: u32) -> () {
+    self.value.maxDynamicStorageBuffersPerPipelineLayout = value
+  }
+  pub fn maxDynamicStorageBuffersPerPipelineLayout(self: &Self) -> u32 { return self.value.maxDynamicStorageBuffersPerPipelineLayout }
+  pub fn setMaxSampledTexturesPerShaderStage(self: &mut Self, value: u32) -> () {
+    self.value.maxSampledTexturesPerShaderStage = value
+  }
+  pub fn maxSampledTexturesPerShaderStage(self: &Self) -> u32 { return self.value.maxSampledTexturesPerShaderStage }
+  pub fn setMaxSamplersPerShaderStage(self: &mut Self, value: u32) -> () {
+    self.value.maxSamplersPerShaderStage = value
+  }
+  pub fn maxSamplersPerShaderStage(self: &Self) -> u32 { return self.value.maxSamplersPerShaderStage }
+  pub fn setMaxStorageBuffersPerShaderStage(self: &mut Self, value: u32) -> () {
+    self.value.maxStorageBuffersPerShaderStage = value
+  }
+  pub fn maxStorageBuffersPerShaderStage(self: &Self) -> u32 { return self.value.maxStorageBuffersPerShaderStage }
+  pub fn setMaxStorageTexturesPerShaderStage(self: &mut Self, value: u32) -> () {
+    self.value.maxStorageTexturesPerShaderStage = value
+  }
+  pub fn maxStorageTexturesPerShaderStage(self: &Self) -> u32 { return self.value.maxStorageTexturesPerShaderStage }
+  pub fn setMaxUniformBuffersPerShaderStage(self: &mut Self, value: u32) -> () {
+    self.value.maxUniformBuffersPerShaderStage = value
+  }
+  pub fn maxUniformBuffersPerShaderStage(self: &Self) -> u32 { return self.value.maxUniformBuffersPerShaderStage }
+  pub fn setMaxUniformBufferBindingSize(self: &mut Self, value: u64) -> () {
+    self.value.maxUniformBufferBindingSize = value
+  }
+  pub fn maxUniformBufferBindingSize(self: &Self) -> u64 { return self.value.maxUniformBufferBindingSize }
+  pub fn setMaxStorageBufferBindingSize(self: &mut Self, value: u64) -> () {
+    self.value.maxStorageBufferBindingSize = value
+  }
+  pub fn maxStorageBufferBindingSize(self: &Self) -> u64 { return self.value.maxStorageBufferBindingSize }
+  pub fn setMinUniformBufferOffsetAlignment(self: &mut Self, value: u32) -> () {
+    self.value.minUniformBufferOffsetAlignment = value
+  }
+  pub fn minUniformBufferOffsetAlignment(self: &Self) -> u32 { return self.value.minUniformBufferOffsetAlignment }
+  pub fn setMinStorageBufferOffsetAlignment(self: &mut Self, value: u32) -> () {
+    self.value.minStorageBufferOffsetAlignment = value
+  }
+  pub fn minStorageBufferOffsetAlignment(self: &Self) -> u32 { return self.value.minStorageBufferOffsetAlignment }
+  pub fn setMaxVertexBuffers(self: &mut Self, value: u32) -> () {
+    self.value.maxVertexBuffers = value
+  }
+  pub fn maxVertexBuffers(self: &Self) -> u32 { return self.value.maxVertexBuffers }
+  pub fn setMaxBufferSize(self: &mut Self, value: u64) -> () {
+    self.value.maxBufferSize = value
+  }
+  pub fn maxBufferSize(self: &Self) -> u64 { return self.value.maxBufferSize }
+  pub fn setMaxVertexAttributes(self: &mut Self, value: u32) -> () {
+    self.value.maxVertexAttributes = value
+  }
+  pub fn maxVertexAttributes(self: &Self) -> u32 { return self.value.maxVertexAttributes }
+  pub fn setMaxVertexBufferArrayStride(self: &mut Self, value: u32) -> () {
+    self.value.maxVertexBufferArrayStride = value
+  }
+  pub fn maxVertexBufferArrayStride(self: &Self) -> u32 { return self.value.maxVertexBufferArrayStride }
+  pub fn setMaxInterStageShaderVariables(self: &mut Self, value: u32) -> () {
+    self.value.maxInterStageShaderVariables = value
+  }
+  pub fn maxInterStageShaderVariables(self: &Self) -> u32 { return self.value.maxInterStageShaderVariables }
+  pub fn setMaxColorAttachments(self: &mut Self, value: u32) -> () {
+    self.value.maxColorAttachments = value
+  }
+  pub fn maxColorAttachments(self: &Self) -> u32 { return self.value.maxColorAttachments }
+  pub fn setMaxColorAttachmentBytesPerSample(self: &mut Self, value: u32) -> () {
+    self.value.maxColorAttachmentBytesPerSample = value
+  }
+  pub fn maxColorAttachmentBytesPerSample(self: &Self) -> u32 { return self.value.maxColorAttachmentBytesPerSample }
+  pub fn setMaxComputeWorkgroupStorageSize(self: &mut Self, value: u32) -> () {
+    self.value.maxComputeWorkgroupStorageSize = value
+  }
+  pub fn maxComputeWorkgroupStorageSize(self: &Self) -> u32 { return self.value.maxComputeWorkgroupStorageSize }
+  pub fn setMaxComputeInvocationsPerWorkgroup(self: &mut Self, value: u32) -> () {
+    self.value.maxComputeInvocationsPerWorkgroup = value
+  }
+  pub fn maxComputeInvocationsPerWorkgroup(self: &Self) -> u32 { return self.value.maxComputeInvocationsPerWorkgroup }
+  pub fn setMaxComputeWorkgroupSizeX(self: &mut Self, value: u32) -> () {
+    self.value.maxComputeWorkgroupSizeX = value
+  }
+  pub fn maxComputeWorkgroupSizeX(self: &Self) -> u32 { return self.value.maxComputeWorkgroupSizeX }
+  pub fn setMaxComputeWorkgroupSizeY(self: &mut Self, value: u32) -> () {
+    self.value.maxComputeWorkgroupSizeY = value
+  }
+  pub fn maxComputeWorkgroupSizeY(self: &Self) -> u32 { return self.value.maxComputeWorkgroupSizeY }
+  pub fn setMaxComputeWorkgroupSizeZ(self: &mut Self, value: u32) -> () {
+    self.value.maxComputeWorkgroupSizeZ = value
+  }
+  pub fn maxComputeWorkgroupSizeZ(self: &Self) -> u32 { return self.value.maxComputeWorkgroupSizeZ }
+  pub fn setMaxComputeWorkgroupsPerDimension(self: &mut Self, value: u32) -> () {
+    self.value.maxComputeWorkgroupsPerDimension = value
+  }
+  pub fn maxComputeWorkgroupsPerDimension(self: &Self) -> u32 { return self.value.maxComputeWorkgroupsPerDimension }
+  pub fn setMaxImmediateSize(self: &mut Self, value: u32) -> () {
+    self.value.maxImmediateSize = value
+  }
+  pub fn maxImmediateSize(self: &Self) -> u32 { return self.value.maxImmediateSize }
+}
+
+pub struct MultisampleState { value: sys.WGPUMultisampleState }
+impl Copy for MultisampleState {}
+
+impl MultisampleState {
+  pub fn default() -> Self { return Self { value: WGPUMultisampleState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUMultisampleState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUMultisampleState { return Pointer.fromRef(&self.value) }
+  pub fn setCount(self: &mut Self, value: u32) -> () {
+    self.value.count = value
+  }
+  pub fn count(self: &Self) -> u32 { return self.value.count }
+  pub fn setMask(self: &mut Self, value: u32) -> () {
+    self.value.mask = value
+  }
+  pub fn mask(self: &Self) -> u32 { return self.value.mask }
+  pub fn setAlphaToCoverageEnabled(self: &mut Self, value: bool) -> () {
+    self.value.alphaToCoverageEnabled = if value { 1 } else { 0 }
+  }
+  pub fn alphaToCoverageEnabled(self: &Self) -> bool { return self.value.alphaToCoverageEnabled != 0 }
+}
+
+pub struct Origin3D { value: sys.WGPUOrigin3D }
+impl Copy for Origin3D {}
+
+impl Origin3D {
+  pub fn default() -> Self { return Self { value: WGPUOrigin3D.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUOrigin3D { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUOrigin3D { return Pointer.fromRef(&self.value) }
+  pub fn setX(self: &mut Self, value: u32) -> () {
+    self.value.x = value
+  }
+  pub fn x(self: &Self) -> u32 { return self.value.x }
+  pub fn setY(self: &mut Self, value: u32) -> () {
+    self.value.y = value
+  }
+  pub fn y(self: &Self) -> u32 { return self.value.y }
+  pub fn setZ(self: &mut Self, value: u32) -> () {
+    self.value.z = value
+  }
+  pub fn z(self: &Self) -> u32 { return self.value.z }
+}
+
+pub struct PassTimestampWrites<'a> { value: sys.WGPUPassTimestampWrites }
+impl<'a> Copy for PassTimestampWrites<'a> {}
+
+impl<'a> PassTimestampWrites<'a> {
+  pub fn default() -> Self { return Self { value: WGPUPassTimestampWrites.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUPassTimestampWrites { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUPassTimestampWrites { return Pointer.fromRef(&self.value) }
+  pub fn withQuerySet(self: Self, value: &'a resource.QuerySet) -> Self {
+    let mut result = self
+    result.value.querySet = unsafe value.raw()
+    return result
+  }
+  pub fn setBeginningOfPassWriteIndex(self: &mut Self, value: u32) -> () {
+    self.value.beginningOfPassWriteIndex = value
+  }
+  pub fn beginningOfPassWriteIndex(self: &Self) -> u32 { return self.value.beginningOfPassWriteIndex }
+  pub fn setEndOfPassWriteIndex(self: &mut Self, value: u32) -> () {
+    self.value.endOfPassWriteIndex = value
+  }
+  pub fn endOfPassWriteIndex(self: &Self) -> u32 { return self.value.endOfPassWriteIndex }
+}
+
+pub struct PipelineLayoutDescriptor<'a> { value: sys.WGPUPipelineLayoutDescriptor }
+impl<'a> Copy for PipelineLayoutDescriptor<'a> {}
+
+impl<'a> PipelineLayoutDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUPipelineLayoutDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUPipelineLayoutDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUPipelineLayoutDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withBindGroupLayouts<'entry>(self: Self, value: &'a [resource.BindGroupLayoutRef<'entry>]) -> Self {
+    let mut result = self
+    result.value.bindGroupLayouts = unsafe rawEntries<resource.BindGroupLayoutRef<'entry>, sys.WGPUBindGroupLayout>(value)
+    result.value.bindGroupLayoutCount = value.length
+    return result
+  }
+  pub fn setImmediateSize(self: &mut Self, value: u32) -> () {
+    self.value.immediateSize = value
+  }
+  pub fn immediateSize(self: &Self) -> u32 { return self.value.immediateSize }
+}
+
+pub struct PrimitiveState { value: sys.WGPUPrimitiveState }
+impl Copy for PrimitiveState {}
+
+impl PrimitiveState {
+  pub fn default() -> Self { return Self { value: WGPUPrimitiveState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUPrimitiveState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUPrimitiveState { return Pointer.fromRef(&self.value) }
+  pub fn setTopology(self: &mut Self, value: sys.WGPUPrimitiveTopology) -> () {
+    self.value.topology = value
+  }
+  pub fn topology(self: &Self) -> sys.WGPUPrimitiveTopology { return self.value.topology }
+  pub fn setStripIndexFormat(self: &mut Self, value: sys.WGPUIndexFormat) -> () {
+    self.value.stripIndexFormat = value
+  }
+  pub fn stripIndexFormat(self: &Self) -> sys.WGPUIndexFormat { return self.value.stripIndexFormat }
+  pub fn setFrontFace(self: &mut Self, value: sys.WGPUFrontFace) -> () {
+    self.value.frontFace = value
+  }
+  pub fn frontFace(self: &Self) -> sys.WGPUFrontFace { return self.value.frontFace }
+  pub fn setCullMode(self: &mut Self, value: sys.WGPUCullMode) -> () {
+    self.value.cullMode = value
+  }
+  pub fn cullMode(self: &Self) -> sys.WGPUCullMode { return self.value.cullMode }
+  pub fn setUnclippedDepth(self: &mut Self, value: bool) -> () {
+    self.value.unclippedDepth = if value { 1 } else { 0 }
+  }
+  pub fn unclippedDepth(self: &Self) -> bool { return self.value.unclippedDepth != 0 }
+}
+
+pub struct QuerySetDescriptor<'a> { value: sys.WGPUQuerySetDescriptor }
+impl<'a> Copy for QuerySetDescriptor<'a> {}
+
+impl<'a> QuerySetDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUQuerySetDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUQuerySetDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUQuerySetDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn setType(self: &mut Self, value: sys.WGPUQueryType) -> () {
+    self.value.type_ = value
+  }
+  pub fn getType(self: &Self) -> sys.WGPUQueryType { return self.value.type_ }
+  pub fn setCount(self: &mut Self, value: u32) -> () {
+    self.value.count = value
+  }
+  pub fn count(self: &Self) -> u32 { return self.value.count }
+}
+
+pub struct QueueDescriptor<'a> { value: sys.WGPUQueueDescriptor }
+impl<'a> Copy for QueueDescriptor<'a> {}
+
+impl<'a> QueueDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUQueueDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUQueueDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUQueueDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+}
+
+pub struct RenderBundleDescriptor<'a> { value: sys.WGPURenderBundleDescriptor }
+impl<'a> Copy for RenderBundleDescriptor<'a> {}
+
+impl<'a> RenderBundleDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPURenderBundleDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderBundleDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderBundleDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+}
+
+pub struct RenderBundleEncoderDescriptor<'a> { value: sys.WGPURenderBundleEncoderDescriptor }
+impl<'a> Copy for RenderBundleEncoderDescriptor<'a> {}
+
+impl<'a> RenderBundleEncoderDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPURenderBundleEncoderDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderBundleEncoderDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderBundleEncoderDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withColorFormats(self: Self, value: &'a [sys.WGPUTextureFormat]) -> Self {
+    let mut result = self
+    result.value.colorFormats = Pointer.fromSlice<sys.WGPUTextureFormat>(value)
+    result.value.colorFormatCount = value.length
+    return result
+  }
+  pub fn setDepthStencilFormat(self: &mut Self, value: sys.WGPUTextureFormat) -> () {
+    self.value.depthStencilFormat = value
+  }
+  pub fn depthStencilFormat(self: &Self) -> sys.WGPUTextureFormat { return self.value.depthStencilFormat }
+  pub fn setSampleCount(self: &mut Self, value: u32) -> () {
+    self.value.sampleCount = value
+  }
+  pub fn sampleCount(self: &Self) -> u32 { return self.value.sampleCount }
+  pub fn setDepthReadOnly(self: &mut Self, value: bool) -> () {
+    self.value.depthReadOnly = if value { 1 } else { 0 }
+  }
+  pub fn depthReadOnly(self: &Self) -> bool { return self.value.depthReadOnly != 0 }
+  pub fn setStencilReadOnly(self: &mut Self, value: bool) -> () {
+    self.value.stencilReadOnly = if value { 1 } else { 0 }
+  }
+  pub fn stencilReadOnly(self: &Self) -> bool { return self.value.stencilReadOnly != 0 }
+}
+
+pub struct RenderPassColorAttachment<'a> { value: sys.WGPURenderPassColorAttachment }
+impl<'a> Copy for RenderPassColorAttachment<'a> {}
+
+impl<'a> RenderPassColorAttachment<'a> {
+  pub fn default() -> Self { return Self { value: WGPURenderPassColorAttachment.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPassColorAttachment { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderPassColorAttachment { return Pointer.fromRef(&self.value) }
+  pub fn withView(self: Self, value: &'a resource.TextureView) -> Self {
+    let mut result = self
+    result.value.view = unsafe value.raw()
+    return result
+  }
+  pub fn setDepthSlice(self: &mut Self, value: u32) -> () {
+    self.value.depthSlice = value
+  }
+  pub fn depthSlice(self: &Self) -> u32 { return self.value.depthSlice }
+  pub fn withResolveTarget(self: Self, value: &'a resource.TextureView) -> Self {
+    let mut result = self
+    result.value.resolveTarget = unsafe value.raw()
+    return result
+  }
+  pub fn setLoadOp(self: &mut Self, value: sys.WGPULoadOp) -> () {
+    self.value.loadOp = value
+  }
+  pub fn loadOp(self: &Self) -> sys.WGPULoadOp { return self.value.loadOp }
+  pub fn setStoreOp(self: &mut Self, value: sys.WGPUStoreOp) -> () {
+    self.value.storeOp = value
+  }
+  pub fn storeOp(self: &Self) -> sys.WGPUStoreOp { return self.value.storeOp }
+  pub fn setClearValue(self: &mut Self, value: Color) -> () {
+    self.value.clearValue = value.value
+  }
+}
+
+pub struct RenderPassDepthStencilAttachment<'a> { value: sys.WGPURenderPassDepthStencilAttachment }
+impl<'a> Copy for RenderPassDepthStencilAttachment<'a> {}
+
+impl<'a> RenderPassDepthStencilAttachment<'a> {
+  pub fn default() -> Self { return Self { value: WGPURenderPassDepthStencilAttachment.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPassDepthStencilAttachment { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderPassDepthStencilAttachment { return Pointer.fromRef(&self.value) }
+  pub fn withView(self: Self, value: &'a resource.TextureView) -> Self {
+    let mut result = self
+    result.value.view = unsafe value.raw()
+    return result
+  }
+  pub fn setDepthLoadOp(self: &mut Self, value: sys.WGPULoadOp) -> () {
+    self.value.depthLoadOp = value
+  }
+  pub fn depthLoadOp(self: &Self) -> sys.WGPULoadOp { return self.value.depthLoadOp }
+  pub fn setDepthStoreOp(self: &mut Self, value: sys.WGPUStoreOp) -> () {
+    self.value.depthStoreOp = value
+  }
+  pub fn depthStoreOp(self: &Self) -> sys.WGPUStoreOp { return self.value.depthStoreOp }
+  pub fn setDepthClearValue(self: &mut Self, value: f32) -> () {
+    self.value.depthClearValue = value
+  }
+  pub fn depthClearValue(self: &Self) -> f32 { return self.value.depthClearValue }
+  pub fn setDepthReadOnly(self: &mut Self, value: bool) -> () {
+    self.value.depthReadOnly = if value { 1 } else { 0 }
+  }
+  pub fn depthReadOnly(self: &Self) -> bool { return self.value.depthReadOnly != 0 }
+  pub fn setStencilLoadOp(self: &mut Self, value: sys.WGPULoadOp) -> () {
+    self.value.stencilLoadOp = value
+  }
+  pub fn stencilLoadOp(self: &Self) -> sys.WGPULoadOp { return self.value.stencilLoadOp }
+  pub fn setStencilStoreOp(self: &mut Self, value: sys.WGPUStoreOp) -> () {
+    self.value.stencilStoreOp = value
+  }
+  pub fn stencilStoreOp(self: &Self) -> sys.WGPUStoreOp { return self.value.stencilStoreOp }
+  pub fn setStencilClearValue(self: &mut Self, value: u32) -> () {
+    self.value.stencilClearValue = value
+  }
+  pub fn stencilClearValue(self: &Self) -> u32 { return self.value.stencilClearValue }
+  pub fn setStencilReadOnly(self: &mut Self, value: bool) -> () {
+    self.value.stencilReadOnly = if value { 1 } else { 0 }
+  }
+  pub fn stencilReadOnly(self: &Self) -> bool { return self.value.stencilReadOnly != 0 }
+}
+
+pub struct RenderPassDescriptor<'a> { value: sys.WGPURenderPassDescriptor }
+impl<'a> Copy for RenderPassDescriptor<'a> {}
+
+impl<'a> RenderPassDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPURenderPassDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPassDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderPassDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withColorAttachments<'entry>(self: Self, value: &'a [RenderPassColorAttachment<'entry>]) -> Self {
+    let mut result = self
+    result.value.colorAttachments = unsafe rawEntries<RenderPassColorAttachment<'entry>, sys.WGPURenderPassColorAttachment>(value)
+    result.value.colorAttachmentCount = value.length
+    return result
+  }
+  pub fn withDepthStencilAttachment<'entry>(self: Self, value: &'a RenderPassDepthStencilAttachment<'entry>) -> Self {
+    let mut result = self
+    result.value.depthStencilAttachment = unsafe RenderPassDepthStencilAttachment.rawPointer(value)
+    return result
+  }
+  pub fn withOcclusionQuerySet(self: Self, value: &'a resource.QuerySet) -> Self {
+    let mut result = self
+    result.value.occlusionQuerySet = unsafe value.raw()
+    return result
+  }
+  pub fn withTimestampWrites<'entry>(self: Self, value: &'a PassTimestampWrites<'entry>) -> Self {
+    let mut result = self
+    result.value.timestampWrites = unsafe PassTimestampWrites.rawPointer(value)
+    return result
+  }
+}
+
+pub struct RenderPassMaxDrawCount { value: sys.WGPURenderPassMaxDrawCount }
+impl Copy for RenderPassMaxDrawCount {}
+
+impl RenderPassMaxDrawCount {
+  pub fn default() -> Self { return Self { value: WGPURenderPassMaxDrawCount.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPassMaxDrawCount { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderPassMaxDrawCount { return Pointer.fromRef(&self.value) }
+  pub fn setMaxDrawCount(self: &mut Self, value: u64) -> () {
+    self.value.maxDrawCount = value
+  }
+  pub fn maxDrawCount(self: &Self) -> u64 { return self.value.maxDrawCount }
+}
+
+pub struct RenderPipelineDescriptor<'a> { value: sys.WGPURenderPipelineDescriptor }
+impl<'a> Copy for RenderPipelineDescriptor<'a> {}
+
+impl<'a> RenderPipelineDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPURenderPipelineDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPURenderPipelineDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPURenderPipelineDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn withLayout(self: Self, value: &'a resource.PipelineLayout) -> Self {
+    let mut result = self
+    result.value.layout = unsafe value.raw()
+    return result
+  }
+  pub fn withVertex(self: Self, value: VertexState<'a>) -> Self {
+    let mut result = self
+    result.value.vertex = value.value
+    return result
+  }
+  pub fn setPrimitive(self: &mut Self, value: PrimitiveState) -> () {
+    self.value.primitive = value.value
+  }
+  pub fn withDepthStencil(self: Self, value: &'a DepthStencilState) -> Self {
+    let mut result = self
+    result.value.depthStencil = unsafe DepthStencilState.rawPointer(value)
+    return result
+  }
+  pub fn setMultisample(self: &mut Self, value: MultisampleState) -> () {
+    self.value.multisample = value.value
+  }
+  pub fn withFragment<'entry>(self: Self, value: &'a FragmentState<'entry>) -> Self {
+    let mut result = self
+    result.value.fragment = unsafe FragmentState.rawPointer(value)
+    return result
+  }
+}
+
+pub struct SamplerBindingLayout { value: sys.WGPUSamplerBindingLayout }
+impl Copy for SamplerBindingLayout {}
+
+impl SamplerBindingLayout {
+  pub fn default() -> Self { return Self { value: WGPUSamplerBindingLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUSamplerBindingLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUSamplerBindingLayout { return Pointer.fromRef(&self.value) }
+  pub fn setType(self: &mut Self, value: sys.WGPUSamplerBindingType) -> () {
+    self.value.type_ = value
+  }
+  pub fn getType(self: &Self) -> sys.WGPUSamplerBindingType { return self.value.type_ }
+}
+
+pub struct SamplerDescriptor<'a> { value: sys.WGPUSamplerDescriptor }
+impl<'a> Copy for SamplerDescriptor<'a> {}
+
+impl<'a> SamplerDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUSamplerDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUSamplerDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUSamplerDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn setAddressModeU(self: &mut Self, value: sys.WGPUAddressMode) -> () {
+    self.value.addressModeU = value
+  }
+  pub fn addressModeU(self: &Self) -> sys.WGPUAddressMode { return self.value.addressModeU }
+  pub fn setAddressModeV(self: &mut Self, value: sys.WGPUAddressMode) -> () {
+    self.value.addressModeV = value
+  }
+  pub fn addressModeV(self: &Self) -> sys.WGPUAddressMode { return self.value.addressModeV }
+  pub fn setAddressModeW(self: &mut Self, value: sys.WGPUAddressMode) -> () {
+    self.value.addressModeW = value
+  }
+  pub fn addressModeW(self: &Self) -> sys.WGPUAddressMode { return self.value.addressModeW }
+  pub fn setMagFilter(self: &mut Self, value: sys.WGPUFilterMode) -> () {
+    self.value.magFilter = value
+  }
+  pub fn magFilter(self: &Self) -> sys.WGPUFilterMode { return self.value.magFilter }
+  pub fn setMinFilter(self: &mut Self, value: sys.WGPUFilterMode) -> () {
+    self.value.minFilter = value
+  }
+  pub fn minFilter(self: &Self) -> sys.WGPUFilterMode { return self.value.minFilter }
+  pub fn setMipmapFilter(self: &mut Self, value: sys.WGPUMipmapFilterMode) -> () {
+    self.value.mipmapFilter = value
+  }
+  pub fn mipmapFilter(self: &Self) -> sys.WGPUMipmapFilterMode { return self.value.mipmapFilter }
+  pub fn setLodMinClamp(self: &mut Self, value: f32) -> () {
+    self.value.lodMinClamp = value
+  }
+  pub fn lodMinClamp(self: &Self) -> f32 { return self.value.lodMinClamp }
+  pub fn setLodMaxClamp(self: &mut Self, value: f32) -> () {
+    self.value.lodMaxClamp = value
+  }
+  pub fn lodMaxClamp(self: &Self) -> f32 { return self.value.lodMaxClamp }
+  pub fn setCompare(self: &mut Self, value: sys.WGPUCompareFunction) -> () {
+    self.value.compare = value
+  }
+  pub fn compare(self: &Self) -> sys.WGPUCompareFunction { return self.value.compare }
+  pub fn setMaxAnisotropy(self: &mut Self, value: u16) -> () {
+    self.value.maxAnisotropy = value
+  }
+  pub fn maxAnisotropy(self: &Self) -> u16 { return self.value.maxAnisotropy }
+}
+
+pub struct ShaderModuleDescriptor<'a> { value: sys.WGPUShaderModuleDescriptor }
+impl<'a> Copy for ShaderModuleDescriptor<'a> {}
+
+impl<'a> ShaderModuleDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUShaderModuleDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUShaderModuleDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUShaderModuleDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+}
+
+pub struct ShaderSourceWGSL<'a> { value: sys.WGPUShaderSourceWGSL }
+impl<'a> Copy for ShaderSourceWGSL<'a> {}
+
+impl<'a> ShaderSourceWGSL<'a> {
+  pub fn default() -> Self { return Self { value: WGPUShaderSourceWGSL.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUShaderSourceWGSL { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUShaderSourceWGSL { return Pointer.fromRef(&self.value) }
+  pub fn withCode(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.code = stringView(value)
+    return result
+  }
+}
+
+pub struct StencilFaceState { value: sys.WGPUStencilFaceState }
+impl Copy for StencilFaceState {}
+
+impl StencilFaceState {
+  pub fn default() -> Self { return Self { value: WGPUStencilFaceState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUStencilFaceState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUStencilFaceState { return Pointer.fromRef(&self.value) }
+  pub fn setCompare(self: &mut Self, value: sys.WGPUCompareFunction) -> () {
+    self.value.compare = value
+  }
+  pub fn compare(self: &Self) -> sys.WGPUCompareFunction { return self.value.compare }
+  pub fn setFailOp(self: &mut Self, value: sys.WGPUStencilOperation) -> () {
+    self.value.failOp = value
+  }
+  pub fn failOp(self: &Self) -> sys.WGPUStencilOperation { return self.value.failOp }
+  pub fn setDepthFailOp(self: &mut Self, value: sys.WGPUStencilOperation) -> () {
+    self.value.depthFailOp = value
+  }
+  pub fn depthFailOp(self: &Self) -> sys.WGPUStencilOperation { return self.value.depthFailOp }
+  pub fn setPassOp(self: &mut Self, value: sys.WGPUStencilOperation) -> () {
+    self.value.passOp = value
+  }
+  pub fn passOp(self: &Self) -> sys.WGPUStencilOperation { return self.value.passOp }
+}
+
+pub struct StorageTextureBindingLayout { value: sys.WGPUStorageTextureBindingLayout }
+impl Copy for StorageTextureBindingLayout {}
+
+impl StorageTextureBindingLayout {
+  pub fn default() -> Self { return Self { value: WGPUStorageTextureBindingLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUStorageTextureBindingLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUStorageTextureBindingLayout { return Pointer.fromRef(&self.value) }
+  pub fn setAccess(self: &mut Self, value: sys.WGPUStorageTextureAccess) -> () {
+    self.value.access = value
+  }
+  pub fn access(self: &Self) -> sys.WGPUStorageTextureAccess { return self.value.access }
+  pub fn setFormat(self: &mut Self, value: sys.WGPUTextureFormat) -> () {
+    self.value.format = value
+  }
+  pub fn format(self: &Self) -> sys.WGPUTextureFormat { return self.value.format }
+  pub fn setViewDimension(self: &mut Self, value: sys.WGPUTextureViewDimension) -> () {
+    self.value.viewDimension = value
+  }
+  pub fn viewDimension(self: &Self) -> sys.WGPUTextureViewDimension { return self.value.viewDimension }
+}
+
+pub struct TexelCopyBufferInfo<'a> { value: sys.WGPUTexelCopyBufferInfo }
+impl<'a> Copy for TexelCopyBufferInfo<'a> {}
+
+impl<'a> TexelCopyBufferInfo<'a> {
+  pub fn default() -> Self { return Self { value: WGPUTexelCopyBufferInfo.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTexelCopyBufferInfo { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTexelCopyBufferInfo { return Pointer.fromRef(&self.value) }
+  pub fn setLayout(self: &mut Self, value: TexelCopyBufferLayout) -> () {
+    self.value.layout = value.value
+  }
+  pub fn withBuffer(self: Self, value: &'a resource.Buffer) -> Self {
+    let mut result = self
+    result.value.buffer = unsafe value.raw()
+    return result
+  }
+}
+
+pub struct TexelCopyBufferLayout { value: sys.WGPUTexelCopyBufferLayout }
+impl Copy for TexelCopyBufferLayout {}
+
+impl TexelCopyBufferLayout {
+  pub fn default() -> Self { return Self { value: WGPUTexelCopyBufferLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTexelCopyBufferLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTexelCopyBufferLayout { return Pointer.fromRef(&self.value) }
+  pub fn setOffset(self: &mut Self, value: u64) -> () {
+    self.value.offset = value
+  }
+  pub fn offset(self: &Self) -> u64 { return self.value.offset }
+  pub fn setBytesPerRow(self: &mut Self, value: u32) -> () {
+    self.value.bytesPerRow = value
+  }
+  pub fn bytesPerRow(self: &Self) -> u32 { return self.value.bytesPerRow }
+  pub fn setRowsPerImage(self: &mut Self, value: u32) -> () {
+    self.value.rowsPerImage = value
+  }
+  pub fn rowsPerImage(self: &Self) -> u32 { return self.value.rowsPerImage }
+}
+
+pub struct TexelCopyTextureInfo<'a> { value: sys.WGPUTexelCopyTextureInfo }
+impl<'a> Copy for TexelCopyTextureInfo<'a> {}
+
+impl<'a> TexelCopyTextureInfo<'a> {
+  pub fn default() -> Self { return Self { value: WGPUTexelCopyTextureInfo.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTexelCopyTextureInfo { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTexelCopyTextureInfo { return Pointer.fromRef(&self.value) }
+  pub fn withTexture(self: Self, value: &'a resource.Texture) -> Self {
+    let mut result = self
+    result.value.texture = unsafe value.raw()
+    return result
+  }
+  pub fn setMipLevel(self: &mut Self, value: u32) -> () {
+    self.value.mipLevel = value
+  }
+  pub fn mipLevel(self: &Self) -> u32 { return self.value.mipLevel }
+  pub fn setOrigin(self: &mut Self, value: Origin3D) -> () {
+    self.value.origin = value.value
+  }
+  pub fn setAspect(self: &mut Self, value: sys.WGPUTextureAspect) -> () {
+    self.value.aspect = value
+  }
+  pub fn aspect(self: &Self) -> sys.WGPUTextureAspect { return self.value.aspect }
+}
+
+pub struct TextureBindingLayout { value: sys.WGPUTextureBindingLayout }
+impl Copy for TextureBindingLayout {}
+
+impl TextureBindingLayout {
+  pub fn default() -> Self { return Self { value: WGPUTextureBindingLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureBindingLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTextureBindingLayout { return Pointer.fromRef(&self.value) }
+  pub fn setSampleType(self: &mut Self, value: sys.WGPUTextureSampleType) -> () {
+    self.value.sampleType = value
+  }
+  pub fn sampleType(self: &Self) -> sys.WGPUTextureSampleType { return self.value.sampleType }
+  pub fn setViewDimension(self: &mut Self, value: sys.WGPUTextureViewDimension) -> () {
+    self.value.viewDimension = value
+  }
+  pub fn viewDimension(self: &Self) -> sys.WGPUTextureViewDimension { return self.value.viewDimension }
+  pub fn setMultisampled(self: &mut Self, value: bool) -> () {
+    self.value.multisampled = if value { 1 } else { 0 }
+  }
+  pub fn multisampled(self: &Self) -> bool { return self.value.multisampled != 0 }
+}
+
+pub struct TextureBindingViewDimension { value: sys.WGPUTextureBindingViewDimension }
+impl Copy for TextureBindingViewDimension {}
+
+impl TextureBindingViewDimension {
+  pub fn default() -> Self { return Self { value: WGPUTextureBindingViewDimension.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureBindingViewDimension { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTextureBindingViewDimension { return Pointer.fromRef(&self.value) }
+  pub fn setTextureBindingViewDimension(self: &mut Self, value: sys.WGPUTextureViewDimension) -> () {
+    self.value.textureBindingViewDimension = value
+  }
+  pub fn textureBindingViewDimension(self: &Self) -> sys.WGPUTextureViewDimension { return self.value.textureBindingViewDimension }
+}
+
+pub struct TextureComponentSwizzle { value: sys.WGPUTextureComponentSwizzle }
+impl Copy for TextureComponentSwizzle {}
+
+impl TextureComponentSwizzle {
+  pub fn default() -> Self { return Self { value: WGPUTextureComponentSwizzle.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureComponentSwizzle { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTextureComponentSwizzle { return Pointer.fromRef(&self.value) }
+  pub fn setR(self: &mut Self, value: sys.WGPUComponentSwizzle) -> () {
+    self.value.r = value
+  }
+  pub fn r(self: &Self) -> sys.WGPUComponentSwizzle { return self.value.r }
+  pub fn setG(self: &mut Self, value: sys.WGPUComponentSwizzle) -> () {
+    self.value.g = value
+  }
+  pub fn g(self: &Self) -> sys.WGPUComponentSwizzle { return self.value.g }
+  pub fn setB(self: &mut Self, value: sys.WGPUComponentSwizzle) -> () {
+    self.value.b = value
+  }
+  pub fn b(self: &Self) -> sys.WGPUComponentSwizzle { return self.value.b }
+  pub fn setA(self: &mut Self, value: sys.WGPUComponentSwizzle) -> () {
+    self.value.a = value
+  }
+  pub fn a(self: &Self) -> sys.WGPUComponentSwizzle { return self.value.a }
+}
+
+pub struct TextureComponentSwizzleDescriptor { value: sys.WGPUTextureComponentSwizzleDescriptor }
+impl Copy for TextureComponentSwizzleDescriptor {}
+
+impl TextureComponentSwizzleDescriptor {
+  pub fn default() -> Self { return Self { value: WGPUTextureComponentSwizzleDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureComponentSwizzleDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTextureComponentSwizzleDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn setSwizzle(self: &mut Self, value: TextureComponentSwizzle) -> () {
+    self.value.swizzle = value.value
+  }
+}
+
+pub struct TextureDescriptor<'a> { value: sys.WGPUTextureDescriptor }
+impl<'a> Copy for TextureDescriptor<'a> {}
+
+impl<'a> TextureDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUTextureDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTextureDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn setUsage(self: &mut Self, value: sys.WGPUTextureUsage) -> () {
+    self.value.usage = value
+  }
+  pub fn usage(self: &Self) -> sys.WGPUTextureUsage { return self.value.usage }
+  pub fn setDimension(self: &mut Self, value: sys.WGPUTextureDimension) -> () {
+    self.value.dimension = value
+  }
+  pub fn dimension(self: &Self) -> sys.WGPUTextureDimension { return self.value.dimension }
+  pub fn setSize(self: &mut Self, value: Extent3D) -> () {
+    self.value.size = value.value
+  }
+  pub fn setFormat(self: &mut Self, value: sys.WGPUTextureFormat) -> () {
+    self.value.format = value
+  }
+  pub fn format(self: &Self) -> sys.WGPUTextureFormat { return self.value.format }
+  pub fn setMipLevelCount(self: &mut Self, value: u32) -> () {
+    self.value.mipLevelCount = value
+  }
+  pub fn mipLevelCount(self: &Self) -> u32 { return self.value.mipLevelCount }
+  pub fn setSampleCount(self: &mut Self, value: u32) -> () {
+    self.value.sampleCount = value
+  }
+  pub fn sampleCount(self: &Self) -> u32 { return self.value.sampleCount }
+  pub fn withViewFormats(self: Self, value: &'a [sys.WGPUTextureFormat]) -> Self {
+    let mut result = self
+    result.value.viewFormats = Pointer.fromSlice<sys.WGPUTextureFormat>(value)
+    result.value.viewFormatCount = value.length
+    return result
+  }
+}
+
+pub struct TextureViewDescriptor<'a> { value: sys.WGPUTextureViewDescriptor }
+impl<'a> Copy for TextureViewDescriptor<'a> {}
+
+impl<'a> TextureViewDescriptor<'a> {
+  pub fn default() -> Self { return Self { value: WGPUTextureViewDescriptor.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUTextureViewDescriptor { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUTextureViewDescriptor { return Pointer.fromRef(&self.value) }
+  pub fn withLabel(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.label = stringView(value)
+    return result
+  }
+  pub fn setFormat(self: &mut Self, value: sys.WGPUTextureFormat) -> () {
+    self.value.format = value
+  }
+  pub fn format(self: &Self) -> sys.WGPUTextureFormat { return self.value.format }
+  pub fn setDimension(self: &mut Self, value: sys.WGPUTextureViewDimension) -> () {
+    self.value.dimension = value
+  }
+  pub fn dimension(self: &Self) -> sys.WGPUTextureViewDimension { return self.value.dimension }
+  pub fn setBaseMipLevel(self: &mut Self, value: u32) -> () {
+    self.value.baseMipLevel = value
+  }
+  pub fn baseMipLevel(self: &Self) -> u32 { return self.value.baseMipLevel }
+  pub fn setMipLevelCount(self: &mut Self, value: u32) -> () {
+    self.value.mipLevelCount = value
+  }
+  pub fn mipLevelCount(self: &Self) -> u32 { return self.value.mipLevelCount }
+  pub fn setBaseArrayLayer(self: &mut Self, value: u32) -> () {
+    self.value.baseArrayLayer = value
+  }
+  pub fn baseArrayLayer(self: &Self) -> u32 { return self.value.baseArrayLayer }
+  pub fn setArrayLayerCount(self: &mut Self, value: u32) -> () {
+    self.value.arrayLayerCount = value
+  }
+  pub fn arrayLayerCount(self: &Self) -> u32 { return self.value.arrayLayerCount }
+  pub fn setAspect(self: &mut Self, value: sys.WGPUTextureAspect) -> () {
+    self.value.aspect = value
+  }
+  pub fn aspect(self: &Self) -> sys.WGPUTextureAspect { return self.value.aspect }
+  pub fn setUsage(self: &mut Self, value: sys.WGPUTextureUsage) -> () {
+    self.value.usage = value
+  }
+  pub fn usage(self: &Self) -> sys.WGPUTextureUsage { return self.value.usage }
+}
+
+pub struct VertexAttribute { value: sys.WGPUVertexAttribute }
+impl Copy for VertexAttribute {}
+
+impl VertexAttribute {
+  pub fn default() -> Self { return Self { value: WGPUVertexAttribute.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUVertexAttribute { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUVertexAttribute { return Pointer.fromRef(&self.value) }
+  pub fn setFormat(self: &mut Self, value: sys.WGPUVertexFormat) -> () {
+    self.value.format = value
+  }
+  pub fn format(self: &Self) -> sys.WGPUVertexFormat { return self.value.format }
+  pub fn setOffset(self: &mut Self, value: u64) -> () {
+    self.value.offset = value
+  }
+  pub fn offset(self: &Self) -> u64 { return self.value.offset }
+  pub fn setShaderLocation(self: &mut Self, value: u32) -> () {
+    self.value.shaderLocation = value
+  }
+  pub fn shaderLocation(self: &Self) -> u32 { return self.value.shaderLocation }
+}
+
+pub struct VertexBufferLayout<'a> { value: sys.WGPUVertexBufferLayout }
+impl<'a> Copy for VertexBufferLayout<'a> {}
+
+impl<'a> VertexBufferLayout<'a> {
+  pub fn default() -> Self { return Self { value: WGPUVertexBufferLayout.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUVertexBufferLayout { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUVertexBufferLayout { return Pointer.fromRef(&self.value) }
+  pub fn setStepMode(self: &mut Self, value: sys.WGPUVertexStepMode) -> () {
+    self.value.stepMode = value
+  }
+  pub fn stepMode(self: &Self) -> sys.WGPUVertexStepMode { return self.value.stepMode }
+  pub fn setArrayStride(self: &mut Self, value: u64) -> () {
+    self.value.arrayStride = value
+  }
+  pub fn arrayStride(self: &Self) -> u64 { return self.value.arrayStride }
+  pub fn withAttributes(self: Self, value: &'a [VertexAttribute]) -> Self {
+    let mut result = self
+    result.value.attributes = unsafe rawEntries<VertexAttribute, sys.WGPUVertexAttribute>(value)
+    result.value.attributeCount = value.length
+    return result
+  }
+}
+
+pub struct VertexState<'a> { value: sys.WGPUVertexState }
+impl<'a> Copy for VertexState<'a> {}
+
+impl<'a> VertexState<'a> {
+  pub fn default() -> Self { return Self { value: WGPUVertexState.default() } }
+  // The caller must keep all borrows alive while using the returned C record.
+  pub unsafe fn raw(self: &Self) -> sys.WGPUVertexState { return self.value }
+  pub unsafe fn rawPointer(self: &Self) -> *const sys.WGPUVertexState { return Pointer.fromRef(&self.value) }
+  pub fn withModule(self: Self, value: &'a resource.ShaderModule) -> Self {
+    let mut result = self
+    result.value.module = unsafe value.raw()
+    return result
+  }
+  pub fn withEntryPoint(self: Self, value: &'a [u8]) -> Self {
+    let mut result = self
+    result.value.entryPoint = stringView(value)
+    return result
+  }
+  pub fn withConstants<'entry>(self: Self, value: &'a [ConstantEntry<'entry>]) -> Self {
+    let mut result = self
+    result.value.constants = unsafe rawEntries<ConstantEntry<'entry>, sys.WGPUConstantEntry>(value)
+    result.value.constantCount = value.length
+    return result
+  }
+  pub fn withBuffers<'entry>(self: Self, value: &'a [VertexBufferLayout<'entry>]) -> Self {
+    let mut result = self
+    result.value.buffers = unsafe rawEntries<VertexBufferLayout<'entry>, sys.WGPUVertexBufferLayout>(value)
+    result.value.bufferCount = value.length
+    return result
+  }
+}
+
+impl<'a> BufferDescriptor<'a> {
+  pub fn make(label: &'a [u8], size: u64, usage: sys.WGPUBufferUsage, mappedAtCreation: bool) -> Self {
+    let mut descriptor = BufferDescriptor<'a>.default().withLabel(label)
+    descriptor.setSize(size)
+    descriptor.setUsage(usage)
+    descriptor.setMappedAtCreation(mappedAtCreation)
+    return descriptor
+  }
+}
+
+// Runtime supplies callback infos; this descriptor never accepts raw callbacks.
+pub struct DeviceDescriptor<'a> {
+  pub label: &'a [u8],
+  pub requiredFeatures: &'a [sys.WGPUFeatureName],
+  pub requiredLimits: Option<&'a Limits<'a>>,
+  pub defaultQueue: QueueDescriptor<'a>,
+}
+impl<'a> Copy for DeviceDescriptor<'a> {}
+impl<'a> DeviceDescriptor<'a> {
+  pub fn default() -> Self {
+    return Self { label: b"", requiredFeatures: &EMPTY_FEATURES, requiredLimits: Option<&'a Limits<'a>>.none(), defaultQueue: QueueDescriptor.default() }
+  }
+  pub unsafe fn raw(self: &Self, lost: sys.WGPUDeviceLostCallbackInfo, error: sys.WGPUUncapturedErrorCallbackInfo) -> sys.WGPUDeviceDescriptor {
+    let mut result = WGPUDeviceDescriptor.default(lost, error)
+    result.label = stringView(self.label)
+    result.requiredFeatureCount = self.requiredFeatures.length
+    result.requiredFeatures = Pointer.fromSlice(self.requiredFeatures)
+    result.requiredLimits = match self.requiredLimits {
+      Option<&'a Limits<'a>>.Some { value } => unsafe value.rawPointer()
+      Option<&'a Limits<'a>>.None => Pointer.null<sys.WGPULimits>()
+    }
+    result.defaultQueue = self.defaultQueue.value
+    return result
+  }
+}
+
+impl<'a> Limits<'a> {
+  // Returned limits contain only scalar values; discard any foreign chain.
+  pub fn fromRaw(value: sys.WGPULimits) -> Self {
+    let mut clean = value
+    clean.nextInChain = Pointer.null<sys.WGPUChainedStruct>()
+    return Self { value: clean }
+  }
+  pub fn withCompatibilityModeLimits(self: Self, extension: &'a mut CompatibilityModeLimits) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut extension.value.chain)
+    return result
+  }
+}
+
+impl<'a> ShaderModuleDescriptor<'a> {
+  pub fn withSourceWGSL<'entry>(self: Self, source: &'a mut ShaderSourceWGSL<'entry>) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut source.value.chain)
+    return result
+  }
+}
+
+impl<'a> RenderPassDescriptor<'a> {
+  pub fn withMaxDrawCount(self: Self, extension: &'a mut RenderPassMaxDrawCount) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut extension.value.chain)
+    return result
+  }
+}
+
+impl<'a> TextureDescriptor<'a> {
+  pub fn withBindingViewDimension(self: Self, extension: &'a mut TextureBindingViewDimension) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut extension.value.chain)
+    return result
+  }
+}
+
+impl<'a> TextureViewDescriptor<'a> {
+  pub fn withComponentSwizzle(self: Self, extension: &'a mut TextureComponentSwizzleDescriptor) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut extension.value.chain)
+    return result
+  }
+}
+
+impl<'a> BindGroupEntry<'a> {
+  pub fn withExternalTexture<'entry>(self: Self, extension: &'a mut ExternalTextureBindingEntry<'entry>) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut extension.value.chain)
+    return result
+  }
+}
+
+impl<'a> BindGroupLayoutEntry<'a> {
+  pub fn withExternalTexture(self: Self, extension: &'a mut ExternalTextureBindingLayout) -> Self {
+    let mut result = self
+    result.value.nextInChain = Pointer.fromMutRef(&mut extension.value.chain)
+    return result
+  }
+}
+
+impl<'a> DeviceDescriptor<'a> {
+  pub fn withLabel(self: Self, label: &'a [u8]) -> Self {
+    let mut result = self
+    result.label = label
+    return result
+  }
+  pub fn withRequiredFeatures(self: Self, features: &'a [sys.WGPUFeatureName]) -> Self {
+    let mut result = self
+    result.requiredFeatures = features
+    return result
+  }
+  pub fn withRequiredLimits<'entry>(self: Self, limits: &'a Limits<'entry>) -> Self {
+    let mut result = self
+    result.requiredLimits = Option<&'a Limits<'a>>.some(limits)
+    return result
+  }
+  pub fn withDefaultQueue(self: Self, queue: QueueDescriptor<'a>) -> Self {
+    let mut result = self
+    result.defaultQueue = queue
+    return result
+  }
+}

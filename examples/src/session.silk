@@ -1,0 +1,113 @@
+//! One polling state machine for native and browser execution; no global state.
+import webgpu.runtime {
+  Instance, Device, GpuError, RequestAdapterOptions, AdapterRequest,
+  DeviceRequest, MapReadRequest, StatusRequest,
+}
+import webgpu.runtime as runtime
+import webgpu.diagnostics { Diagnostics }
+import webgpu.descriptors { DeviceDescriptor }
+import webgpu_sys.generated_webgpu as flags
+import silk.mem.allocator { OutOfMemoryError }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.num.u8
+import silk.num.u32
+import samples
+
+struct Failed {}
+struct FindingAdapter { request: AdapterRequest<'static> }
+struct FindingDevice { request: DeviceRequest }
+struct Reading { device: Device, request: MapReadRequest }
+struct Checking { device: Device, request: StatusRequest, bytes: List<u8> }
+struct Complete { device: Device, bytes: List<u8> }
+
+pub struct Session {
+  index: u32,
+  observer: Diagnostics,
+  stage: Failed | FindingAdapter | FindingDevice | Reading | Checking | Complete,
+}
+impl Session {
+  pub effect fn start(index: u32) -> Self ! GpuError | OutOfMemoryError {
+    if index >= 6 { fail GpuError.status(0xffffffff) }
+    let instance = run Instance.create()
+    let observer = instance.diagnostics()
+    let request = run instance.requestAdapterStart(&RequestAdapterOptions.default())
+    return Self { index: index, observer: move observer, stage: FindingAdapter { request: move request } }
+  }
+  pub fn diagnostics(self: &Self) -> Diagnostics { return self.observer.dup() }
+  pub effect fn poll(self: &mut Self) -> bool ! GpuError | OutOfMemoryError {
+    let previous = Intrinsic.replace(self.stage, Failed {})
+    match move previous {
+      Failed failed => { fail GpuError.status(0xffffffff) }
+      FindingAdapter { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let adapter = run pending.finish()
+          let next = run adapter.requestDeviceStart(&DeviceDescriptor.default())
+          self.stage = FindingDevice { request: move next }
+        } else { self.stage = FindingAdapter { request: move pending } }
+      }
+      FindingDevice { request } => {
+        let mut pending = move request
+        if pending.poll() {
+          let device = run pending.finish()
+          device.pushErrorScope(flags.WGPUErrorFilter_Validation)
+          let buffer = run samples.submit(&device, self.index)
+          let map = run runtime.mapReadStart(&device, &buffer, 0, samples.readbackSize(self.index))
+          self.stage = Reading { device: move device, request: move map }
+        } else { self.stage = FindingDevice { request: move pending } }
+      }
+      Reading { device, request } => {
+        let mut pending = move request
+        run device.checkErrors()
+        if pending.poll() {
+          let bytes = run pending.finish()
+          run validateCompute(self.index, bytes.asSlice())
+          let scope = run device.popErrorScopeStart()
+          self.stage = Checking { device: move device, request: move scope, bytes: move bytes }
+        } else { self.stage = Reading { device: move device, request: move pending } }
+      }
+      Checking { device, request, bytes } => {
+        let mut pending = move request
+        run device.checkErrors()
+        if pending.poll() {
+          run pending.finish()
+          run device.checkErrors()
+          self.stage = Complete { device: move device, bytes: move bytes }
+          return true
+        } else { self.stage = Checking { device: move device, request: move pending, bytes: move bytes } }
+      }
+      Complete { device, bytes } => {
+        run device.checkErrors()
+        self.stage = Complete { device: move device, bytes: move bytes }
+        return true
+      }
+    }
+    return false
+  }
+  pub fn rgba(self: &Self) -> &[u8] {
+    return match &self.stage {
+      Complete complete => Slice.view(complete.bytes.asSlice(), 0, 16384)
+      _ => b""
+    }
+  }
+  pub fn computeValues(self: &Self) -> &[u8] {
+    if self.index != 4 { return b"" }
+    return match &self.stage {
+      Complete complete => Slice.view(complete.bytes.asSlice(), 16384, 16384)
+      _ => b""
+    }
+  }
+}
+effect fn validateCompute(index: u32, bytes: &[u8]) -> () ! GpuError {
+  if bytes.length != samples.readbackSize(index) { fail GpuError.status(0xfffffffd) }
+  if index != 4 { return () }
+  let mut offset: usize = 16384
+  let mut expected: u32 = 7
+  while offset < 32768 {
+    let actual = u8.toU32(bytes[offset]) | u32.shiftLeft(u8.toU32(bytes[offset + 1]), 8) | u32.shiftLeft(u8.toU32(bytes[offset + 2]), 16) | u32.shiftLeft(u8.toU32(bytes[offset + 3]), 24)
+    if actual != expected { fail GpuError.status(0xfffffffc) }
+    expected = expected + 3
+    offset = offset + 4
+  }
+}

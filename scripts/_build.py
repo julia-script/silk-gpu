@@ -4,6 +4,7 @@ from pathlib import Path
 import platform
 import subprocess
 import tomllib
+import hashlib
 
 from _install import ROOT, CACHE
 
@@ -15,6 +16,27 @@ def command_path(script):
 def quoted(value):
     import json
     return json.dumps(str(value))
+
+
+def callback_archive(clang, dawn):
+    source = ROOT / "webgpu" / "native" / "callbacks.c"
+    flags = ["-std=c11", "-O2", "-I", str(dawn / "include")]
+    if platform.system() == "Darwin":
+        sdk = subprocess.check_output(["xcrun", "--show-sdk-path"], text=True).strip()
+        flags += ["-isysroot", sdk, "-mmacosx-version-min=26.0"]
+    identity = repr((str(clang), clang.stat().st_mtime_ns, platform.machine(), flags))
+    key = hashlib.sha256(source.read_bytes() + identity.encode()).hexdigest()[:20]
+    stage = CACHE / "native-callbacks" / key
+    archive = stage / "libsilk_webgpu_callbacks.a"
+    if not archive.exists():
+        stage.mkdir(parents=True, exist_ok=True)
+        object_path = stage / f"callbacks-{os.getpid()}.o"
+        subprocess.run([str(clang), *flags, "-c", str(source), "-o", str(object_path)], check=True)
+        temporary = stage / f"callbacks-{os.getpid()}.a"
+        subprocess.run([str(clang.parent / "llvm-ar"), "rcs", str(temporary), str(object_path)], check=True)
+        temporary.replace(archive)
+        object_path.unlink()
+    return archive
 
 
 def build(package_path, release=False, extra_links=(), target=None):
@@ -57,7 +79,7 @@ def build(package_path, release=False, extra_links=(), target=None):
         else:
             raise RuntimeError("The pinned Silk release has no supported native Windows target")
         # Support archives precede Dawn so their WebGPU references resolve with traditional linkers.
-        links = list(extra_links) + links
+        links = list(extra_links) + [{"static-archive": callback_archive(clang, dawn)}] + links
         staged_links = []
         for index, link in enumerate(links):
             link = dict(link)
