@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Build the real Silk samples for wasm and test them in already-installed Chromium."""
+import subprocess
+from _build import ROOT, build
+
+binary = build(ROOT / "examples", target="wasm32-unknown-unknown")
+subprocess.run(["node", str(ROOT / "browser/test.mjs"), "--wasm", str(binary), "--fixtures", str(ROOT / "browser/fixtures.json")], cwd=ROOT, check=True, timeout=180)

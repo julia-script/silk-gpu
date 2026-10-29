@@ -106,3 +106,44 @@ To intentionally regenerate these analytic fixtures, run
 `examples/shaders/`; after shader edits run `scripts/embed-shaders`, and use
 `scripts/embed-shaders --check` to detect stale embedded source.
 
+
+## Browser backend
+
+Run `python3 scripts/check --browser` to add real compiled wasm samples and canvas resize/presentation tests in an existing Chromium installation. The scheduled browser workflow provisions pinned Playwright JavaScript packages only; it never downloads Chromium.
+
+Native and wasm use one owned start/poll state machine. The browser exports
+`sample_start(index)`, `sample_poll(state)` (0 pending, 1 complete, negative
+failure), and `sample_drop(state)`. The host polls from animation frames and
+async wake notifications rather than blocking the browser. `sample_output`
+kind 0 carries little-endian `u32[width,height]`, kind 1 RGBA bytes, kind 2 the
+compute `u32` bytes, and kind 3 UTF-8 diagnostics. The host must copy output
+synchronously and drop each state exactly once.
+
+### Browser embedding ABI
+
+`scripts/generate-browser` generates both the dependency-free TypeScript ABI
+metadata and `examples/src/generated_webgpu_exports.silk`. An embedding application
+must include that generated forwarding module in its **root package**, as the
+examples do: Silk intentionally does not export symbols declared only in a
+dependency. The root module forwards the ten `webgpu_callback_*` entrypoints and
+`webgpu_alloc` / `webgpu_free` to the safe package's host hooks.
+
+The pinned compiler's wasm32 C ABI passes multi-field aggregates indirectly.
+Single-scalar records are scalarized: `WGPUFuture { id: u64 }` returns an `i64`
+(JavaScript `bigint`), **not** a hidden sret pointer. Generated layout metadata
+preserves each field's actual width, including 16-bit sampler anisotropy.
+Callback strings use flattened pointer/length pairs; callback tokens are explicit
+registry IDs, not wasm function-table indices.
+
+Enter Silk through `WebGPUHost.call`. Browser promises retain JS-owned results
+and enqueue completion; only an explicit event pump invokes the exported callback.
+Its userdata slot must remain pinned until completion or cancellation, with no
+outstanding loan to that slot while pumping. Dropping a pending operation cancels
+its host registration before releasing the slot. Allocator exports run
+synchronously, never during promise settlement. The browser supports zero-timeout
+polling, not blocking `WaitAny`.
+
+The six compiled Silk samples have been exercised in installed Chromium through
+`browser/test.mjs`: all PNG comparisons, compute values, validation checks, and
+handle/allocation cleanup checks passed. The harness never substitutes JavaScript
+implementations of sample rendering.

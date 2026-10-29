@@ -1,0 +1,79 @@
+//! The only unsafe sample code is the host ABI and stable state allocation.
+static if Intrinsic.targetArchitecture() == "wasm32" {
+  import silk.mem.pointer { Pointer }
+  import silk.mem.box { Box }
+  import silk.mem.allocator { Allocator, OutOfMemoryError }
+  import silk.core.effect { Effect }
+  import webgpu.runtime { GpuError }
+  import session { Session }
+  import generated_webgpu_exports
+
+  unsafe extern "C" fn hostOutput(kind: u32, bytes: ?[*]const u8, length: usize) -> ()
+    as "sample_output" with Intrinsic.foreign(module: "host", name: "sample_output", noCapture: ("bytes",))
+
+  struct Unrooted {}
+  struct Root { storage: Box<State> }
+  struct State { session: Session, emitted: bool, root: Unrooted | Root }
+
+  fn output(kind: u32, bytes: &[u8]) -> () {
+    unsafe hostOutput(kind, Pointer.fromSlice(bytes), bytes.length)
+  }
+  effect fn start(index: u32) -> ?*mut u8 ! GpuError | OutOfMemoryError {
+    let session = run Session.start(index)
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let mut storage = run Box<State>.make(State { session: move session, emitted: false, root: Unrooted {} })
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let pinned = Pointer.fromMutRef(&mut storage.getMut()[0])
+    let mut anchor = ()
+    // Same self-rooted Box pattern as silk.concurrency.sync. The host owns this
+    // token until sample_drop; it must not poll concurrently or reuse it after drop.
+    let fresh = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    fresh.root = Root { storage: move storage }
+    let bytes = unsafe Intrinsic.pointerReinterpret<*mut State, *mut u8>(pinned)
+    return bytes
+  }
+  effect fn startFailed<E>(error: E) -> ?*mut u8 {
+    drop error
+    output(3, b"sample_start failed: adapter/device or allocation error")
+    return Pointer.null<u8>()
+  }
+  effect fn pollFailed<E>(error: E) -> i32 {
+    drop error
+    output(3, b"sample failed: validation, device loss, map, allocation or compute mismatch")
+    return -1
+  }
+  effect fn poll(state: &mut State) -> i32 ! GpuError | OutOfMemoryError {
+    if !run state.session.poll() { return 0 }
+    if !state.emitted {
+      output(0, &[64, 0, 0, 0, 64, 0, 0, 0])
+      output(1, state.session.rgba())
+      let values = state.session.computeValues()
+      if values.length != 0 { output(2, values) }
+      state.emitted = true
+    }
+    return 1
+  }
+  export "C" fn sampleStart(index: u32) -> ?*mut u8 as "sample_start" {
+    return run Effect.catchAll(start(index), startFailed)
+  }
+  export "C" fn samplePoll(token: ?*mut u8) -> i32 as "sample_poll" {
+    if Pointer.isNull(token) { return -1 }
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+    let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(pointer)
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    return run Effect.catchAll(poll(&mut state), pollFailed)
+  }
+  export "C" fn sampleDrop(token: ?*mut u8) -> () as "sample_drop" {
+    if Pointer.isNull(token) { return () }
+    let pointer = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(token)
+    let pinned = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut State>(pointer)
+    let mut anchor = ()
+    let state = unsafe Pointer.borrowMut(&mut anchor, pinned)
+    let root = Intrinsic.replace(state.root, Unrooted {})
+    match move root {
+      Root { storage } => { drop storage }
+      Unrooted empty => ()
+    }
+  }
+}

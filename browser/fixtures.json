@@ -1,0 +1,10 @@
+{
+  "samples": [
+    { "index": 0, "name": "clear", "png": "../tests/pixels/expected/clear.png", "tolerance": 2, "maxDifferentPixels": 0 },
+    { "index": 1, "name": "triangle", "png": "../tests/pixels/expected/triangle.png", "tolerance": 2, "maxDifferentPixels": 48 },
+    { "index": 2, "name": "textured-quad", "png": "../tests/pixels/expected/textured-quad.png", "tolerance": 2, "maxDifferentPixels": 0 },
+    { "index": 3, "name": "instanced-rects", "png": "../tests/pixels/expected/instanced-rects.png", "tolerance": 2, "maxDifferentPixels": 0 },
+    { "index": 4, "name": "compute", "png": "../tests/pixels/expected/compute.png", "tolerance": 2, "maxDifferentPixels": 0, "compute": { "count": 4096, "multiplier": 3, "addend": 7 } },
+    { "index": 5, "name": "msaa", "png": "../tests/pixels/expected/msaa.png", "tolerance": 2, "maxDifferentPixels": 128 }
+  ]
+}

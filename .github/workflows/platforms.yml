@@ -1,0 +1,30 @@
+name: Scheduled browser
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: browser-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  browser:
+    name: Compiled Silk wasm in installed Chromium
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/silk
+            .cache/llvm
+            .cache/playwright
+            .cache/downloads
+            .cache/webgpu-headers
+          key: browser-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains.lock.json', 'scripts/ci-lock.json', 'scripts/schema-lock.json') }}
+      - name: Validate existing Chromium and install pinned Playwright JavaScript only
+        run: python3 scripts/setup-ci --browser
+      - name: Freshness, workspace and browser pixel/compute tests
+        run: python3 scripts/check --skip-native --browser
