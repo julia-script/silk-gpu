@@ -1,0 +1,46 @@
+{
+  "registration": {
+    "clause": "deferredCallbacks",
+    "path": "callbackInfo.callback",
+    "allowed_modes": ["WGPUCallbackMode_WaitAnyOnly", "WGPUCallbackMode_AllowProcessEvents"],
+    "source": "https://github.com/webgpu-native/webgpu-headers/blob/a1dc77409bb2b8bd80540cbf4b8db219e123e909/doc/articles/Asynchronous%20Operations.md#creation",
+    "obligation": "The caller must register and pump on the same thread and keep callback userdata alive until completion/cancellation. AllowSpontaneous is not permitted by these declarations."
+  },
+  "pointer_reachable_callbacks": {
+    "wgpuAdapterRequestDevice": {
+      "descriptor.deviceLostCallbackInfo.callback": "Deferred only when mode is WaitAnyOnly or AllowProcessEvents; descriptor pointer traversal is not checked by Silk.",
+      "descriptor.uncapturedErrorCallbackInfo.callback": "Thread callback: may be invoked at any time from any thread; descriptor pointer traversal is not checked by Silk.",
+      "source": "https://github.com/webgpu-native/webgpu-headers/blob/a1dc77409bb2b8bd80540cbf4b8db219e123e909/doc/articles/Asynchronous%20Operations.md#callbackreentrancy"
+    }
+  },
+  "pumps": {
+    "wgpuInstanceProcessEvents": {
+      "reason": "Invokes completed AllowProcessEvents callbacks.",
+      "source": "https://webgpu-native.github.io/webgpu-headers/Asynchronous-Operations.html#Process-Events"
+    },
+    "wgpuInstanceWaitAny": {
+      "reason": "Invokes completed callbacks for the supplied futures.",
+      "source": "https://webgpu-native.github.io/webgpu-headers/Asynchronous-Operations.html#Wait-Any"
+    },
+    "wgpuInstanceRelease": {
+      "reason": "Releasing the final external instance reference cancels retained callbacks, including outstanding asynchronous operations.",
+      "source": "https://webgpu-native.github.io/webgpu-headers/Asynchronous-Operations.html#CallbackStatuses"
+    },
+    "wgpuDeviceDestroy": {
+      "reason": "Conservative cancellation boundary: destroys the device and completes its lost event. Nonspontaneous callbacks still follow their configured pump policy.",
+      "source": "https://webgpu-native.github.io/webgpu-headers/Device.html#DeviceRelease"
+    },
+    "wgpuDeviceRelease": {
+      "reason": "Releasing the last device reference calls DeviceDestroy; retain the conservative cancellation-boundary marker.",
+      "source": "https://github.com/webgpu-native/webgpu-headers/blob/a1dc77409bb2b8bd80540cbf4b8db219e123e909/webgpu.yml"
+    },
+    "wgpuBufferUnmap": {
+      "reason": "Cancels pending mapping; conservatively treated as a cancellation boundary even though nonspontaneous callbacks remain pump-driven.",
+      "source": "https://www.w3.org/TR/webgpu/#dom-gpubuffer-unmap"
+    },
+    "wgpuBufferDestroy": {
+      "reason": "Unmaps the buffer and cancels pending mapping; conservatively treated as a cancellation boundary.",
+      "source": "https://www.w3.org/TR/webgpu/#dom-gpubuffer-destroy"
+    }
+  }
+}

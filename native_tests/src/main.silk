@@ -1,0 +1,10 @@
+import webgpu_sys.generated_webgpu as sys
+import silk.mem.pointer { Pointer }
+
+fn main() -> i32 {
+  let instance = unsafe sys.wgpuCreateInstance(Pointer.null<sys.WGPUInstanceDescriptor>())
+  if Pointer.isNull(instance) { return 1 }
+  unsafe sys.wgpuInstanceProcessEvents(instance)
+  unsafe sys.wgpuInstanceRelease(instance)
+  return 0
+}

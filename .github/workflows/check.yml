@@ -27,5 +27,5 @@ jobs:
           key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains.lock.json', 'scripts/ci-lock.json', 'scripts/schema-lock.json') }}
       - name: Pin lavapipe and validate preinstalled LLVM22
         run: python3 scripts/setup-ci
-      - name: Verify pinned tools and upstream schema
+      - name: Raw binding freshness, workspace and native instance smoke
         run: python3 scripts/check

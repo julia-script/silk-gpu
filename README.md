@@ -60,6 +60,8 @@ Dawn's archive labels identify the upstream build runners, not a guaranteed mini
 
 Dawn is a C++ static archive. Its release CMake metadata specifies Threads on all hosts; Linux additionally needs `dl` and `rt`, and macOS needs CoreFoundation, Foundation, IOSurface, QuartzCore, Cocoa, IOKit, and Metal. Link the host C++ runtime as well. Windows uses the MSVC archive and SDK libraries listed in the release's `lib/cmake/Dawn/DawnTargets.cmake`. No unverified cross-platform build or test success is claimed here.
 
-### Toolchain gate
+### Raw binding gate
 
-Run `python3 scripts/check` to install and verify the pinned Silk, LLVM and Dawn binaries and fetch checksum-verified upstream schema inputs. The workspace has no packages yet. The Ubuntu26 PR job provisions pinned lavapipe and validates its existing LLVM22 installation before running this gate, with a 15-minute timeout. Hosted timing evidence is recorded in the pull request after execution.
+Run `python3 scripts/check` to install and verify the pinned Silk, LLVM and Dawn binaries and fetch checksum-verified upstream schema inputs. The workspace contains the generated `webgpu_sys` package and the `native_tests` executable. The Ubuntu26 PR job provisions pinned lavapipe and validates its existing LLVM22 installation before running this gate, with a 15-minute timeout. Hosted timing evidence is recorded in the pull request after execution.
+
+The gate also checks generated binding freshness, checks the workspace, and creates, processes events on, and releases a native Dawn instance. `scripts/generate --check` validates generated declarations and ABI metadata against the pinned schema.
