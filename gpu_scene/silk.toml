@@ -1,0 +1,11 @@
+[package]
+name = "gpu_scene"
+version = "0.1.0"
+silk-version = "0.1.0-dev.27+323ceb59e7ee"
+kind = "library"
+exports = ["scene", "renderer", "generated_shaders"]
+
+[dependencies]
+vector = { path = "../vector" }
+webgpu = { path = "../webgpu" }
+webgpu_sys = { path = "../webgpu_sys" }

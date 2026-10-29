@@ -30,5 +30,6 @@ if not args.skip_native:
     run([sys.executable, ROOT / "scripts/test-abi"])
     run([sys.executable, ROOT / "scripts/test-native"])
     run([sys.executable, ROOT / "scripts/test-pixels"])
+    run([sys.executable, ROOT / "scripts/test-scene"])
 if args.browser:
     run([sys.executable, ROOT / "scripts/test-browser"])

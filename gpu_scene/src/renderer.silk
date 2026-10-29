@@ -1,0 +1,119 @@
+//! Records a [`Scene`] into a render pass on an RGBA8Unorm target.
+import webgpu.resources as gpu
+import webgpu.resources { Buffer, RenderPipeline, TextureView, Queue }
+import webgpu.runtime { Device, GpuError }
+import webgpu.descriptors {
+  BufferDescriptor, Color, RenderPassColorAttachment, RenderPassDescriptor, VertexState, FragmentState,
+  ColorTargetState, BlendComponent, BlendState, PrimitiveState, MultisampleState, RenderPipelineDescriptor,
+  BindGroupEntry, BindGroupDescriptor,
+}
+import webgpu_sys.generated_webgpu as flags
+import silk.num.u8
+import silk.num.u32
+import silk.num.usize
+import vector.pixmap { Rgba8 }
+import scene { Scene }
+import generated_shaders as shaders
+
+/// The target format the pipeline renders to.
+pub const FORMAT: u32 = flags.WGPUTextureFormat_RGBA8Unorm
+
+pub struct SceneRenderer {
+  pipeline: RenderPipeline,
+}
+
+/// Premultiplied source-over: the blend unit computes `s + d (1 - as)` exactly for unorm8.
+fn premultipliedOver() -> BlendComponent {
+  let mut component = BlendComponent.default()
+  component.setOperation(flags.WGPUBlendOperation_Add)
+  component.setSrcFactor(flags.WGPUBlendFactor_One)
+  component.setDstFactor(flags.WGPUBlendFactor_OneMinusSrcAlpha)
+  return component
+}
+
+effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8], usage: u64) -> Buffer ! GpuError {
+  // Bindings must not be empty; keep at least 16 bytes.
+  let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
+  let buffer = run gpu.createBuffer(device, &BufferDescriptor.make(label, usize.toU64(size), usage | flags.WGPUBufferUsage_CopyDst, false))
+  if bytes.length > 0 && bytes.length % 4 == 0 { queue.writeBuffer(&buffer, 0, bytes) }
+  return move buffer
+}
+
+fn entry<'a>(binding: u32, buffer: &'a Buffer) -> BindGroupEntry<'a> {
+  let mut result = BindGroupEntry.default().withBuffer(buffer)
+  result.setBinding(binding)
+  result.setSize(buffer.getSize())
+  return result
+}
+
+impl SceneRenderer {
+  pub effect fn make(device: &Device) -> SceneRenderer ! GpuError {
+    let shader = run gpu.createShaderModule(device, b"vector scene", shaders.scene())
+    let vertex = VertexState.default().withModule(&shader).withEntryPoint(b"vs")
+    let mut blend = BlendState.default()
+    blend.setColor(premultipliedOver())
+    blend.setAlpha(premultipliedOver())
+    let mut target: ColorTargetState = ColorTargetState.default().withBlend(&blend)
+    target.setFormat(FORMAT)
+    target.setWriteMask(flags.WGPUColorWriteMask_All)
+    let targets = [target]
+    let fragment = FragmentState.default().withModule(&shader).withEntryPoint(b"fs").withTargets(&targets)
+    let mut primitive: PrimitiveState = PrimitiveState.default()
+    primitive.setTopology(flags.WGPUPrimitiveTopology_TriangleList)
+    let mut multisample: MultisampleState = MultisampleState.default()
+    multisample.setCount(1)
+    let mut descriptor = RenderPipelineDescriptor.default().withVertex(vertex).withFragment(&fragment)
+    descriptor.setPrimitive(primitive)
+    descriptor.setMultisample(multisample)
+    let pipeline = run gpu.createRenderPipeline(device, &descriptor)
+    return SceneRenderer { pipeline: move pipeline }
+  }
+
+  /// Clears `target` to the premultiplied form of `background` and draws `scene` on it, then
+  /// submits. `target` must be `scene.width()` x `scene.height()` and RGBA8Unorm.
+  pub effect fn render(self: &Self, device: &Device, queue: &Queue, scene: &Scene, target: &TextureView, background: Rgba8) -> () ! GpuError {
+    let mut header: [u8; 16] = [0; 16]
+    writeU32(&mut header, 0, scene.width())
+    writeU32(&mut header, 4, scene.height())
+    writeU32(&mut header, 8, scene.runCount())
+    let canvas = run storage(device, queue, b"scene canvas", &header, flags.WGPUBufferUsage_Uniform)
+    let runs = run storage(device, queue, b"scene runs", scene.runs(), flags.WGPUBufferUsage_Storage)
+    let alphas = run storage(device, queue, b"scene alphas", scene.alphas(), flags.WGPUBufferUsage_Storage)
+    let paints = run storage(device, queue, b"scene paints", scene.paints(), flags.WGPUBufferUsage_Storage)
+    let ramps = run storage(device, queue, b"scene ramps", scene.ramps(), flags.WGPUBufferUsage_Storage)
+    let layout = run self.pipeline.getBindGroupLayout(0)
+    let entries = [entry(0, &canvas), entry(1, &runs), entry(2, &alphas), entry(3, &paints), entry(4, &ramps)]
+    let groupDescriptor = BindGroupDescriptor.default().withLayout(&layout).withEntries(&entries)
+    let group = run gpu.createBindGroup(device, &groupDescriptor)
+
+    let premultiplied = background.premultiply()
+    let mut clear = Color.default()
+    clear.setR(u8.toF64(premultiplied.r) / 255.0)
+    clear.setG(u8.toF64(premultiplied.g) / 255.0)
+    clear.setB(u8.toF64(premultiplied.b) / 255.0)
+    clear.setA(u8.toF64(premultiplied.a) / 255.0)
+    let mut color = RenderPassColorAttachment.default().withView(target)
+    color.setClearValue(clear)
+    color.setLoadOp(flags.WGPULoadOp_Clear)
+    color.setStoreOp(flags.WGPUStoreOp_Store)
+    let colors = [color]
+    let mut encoder = run gpu.createCommandEncoder(device, b"vector scene")
+    let passDescriptor = RenderPassDescriptor.default().withColorAttachments(&colors)
+    let mut pass = run encoder.beginRenderPass(&passDescriptor)
+    if scene.runCount() > 0 {
+      pass.setPipeline(&self.pipeline)
+      pass.setBindGroup(0, &group, &[])
+      pass.draw(6, scene.runCount(), 0, 0)
+    }
+    pass.end()
+    let commands = run encoder.finish(b"vector scene")
+    queue.submit(&[commands.reference()])
+  }
+}
+
+fn writeU32(bytes: &mut [u8], offset: usize, value: u32) -> () {
+  bytes[offset] = u32.toU8(value & 255)
+  bytes[offset + 1] = u32.toU8(u32.shiftRight(value, 8) & 255)
+  bytes[offset + 2] = u32.toU8(u32.shiftRight(value, 16) & 255)
+  bytes[offset + 3] = u32.toU8(u32.shiftRight(value, 24))
+}

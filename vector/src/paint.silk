@@ -106,6 +106,16 @@ impl Gradient {
   pub fn setPremultipliedInterpolation(self: &mut Self, premultiplied: bool) -> () {
     self.premultipliedInterpolation = premultiplied
   }
+  pub fn isRadial(self: &Self) -> bool { return self.kind == RADIAL }
+  /// True when the gradient paints its last stop everywhere.
+  pub fn isSingle(self: &Self) -> bool { return self.single }
+  pub fn spreadMode(self: &Self) -> u8 { return self.spread }
+  /// The device-to-gradient-space transform.
+  pub fn inverseTransform(self: &Self) -> Affine { return self.inverse }
+  /// Linear: `x1 y1 0 x2 y2 0`. Radial: `fx fy fr cx cy r`.
+  pub fn geometry(self: &Self) -> [f64; 6] { return [self.x0, self.y0, self.r0, self.x1, self.y1, self.r1] }
+  /// The premultiplied RGBA8 ramp, [`RAMP_SIZE`] entries (empty before [`setStops`]).
+  pub fn rampBytes(self: &Self) -> &[u8] { return self.ramp.asSlice() }
   /// True once stops are set and the transform is invertible.
   pub fn isPaintable(self: &Self) -> bool { return self.valid && self.ramp.length() > 0 }
 

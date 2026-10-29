@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Render vector scenes on the CPU and through gpu_scene on pinned Dawn, and compare bytes."""
+import subprocess
+from _build import ROOT, build
+
+binary = build(ROOT / "scene_tests")
+subprocess.run([str(binary)], check=True, timeout=120)
