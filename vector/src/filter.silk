@@ -207,7 +207,7 @@ fn arithmetic(i1: u8, i2: u8, k: [f32; 4], limit: f32) -> u8 {
   let a = u8.toF32(i1) / 255.0
   let b = u8.toF32(i2) / 255.0
   let v = k[0] * a * b + k[1] * a + k[2] * b + k[3]
-  return f32.toU8(f32.floor(f32.min(f32.max(v, 0.0), limit) * 255.0 + 0.5))
+  return f32.toU8(f32.min(f32.max(v, 0.0), limit) * 255.0 + 0.5)
 }
 
 /// `feBlend`: `input` blended onto `backdrop` (`in2`) with a `vector.layer` BLEND_ mode.
@@ -308,7 +308,9 @@ pub fn matrixPixel(c: Rgba8, m: [f32; 20]) -> Rgba8 with Intrinsic.inlineAlways(
 }
 
 fn clamp01(v: f32) -> f32 with Intrinsic.inlineAlways() { return f32.min(f32.max(v, 0.0), 1.0) }
-fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() { return f32.toU8(f32.floor(v * 255.0 + 0.5)) }
+/// `floor(v * 255 + 0.5)` for `v` in `0 ..= 1`, where the floor is the conversion's truncation
+/// (x86-64's baseline has no SSE4.1 round, so an explicit floor is a dozen instructions).
+fn byte(v: f32) -> u8 with Intrinsic.inlineAlways() { return f32.toU8(v * 255.0 + 0.5) }
 
 /// The passes of an `feGaussianBlur` along one axis with standard deviation `sigma` (device
 /// pixels): three box blurs for `sigma >= 2` as the spec prescribes, else one kernel of
@@ -1575,6 +1577,13 @@ pub fn lighting(out: &mut Pixmap, input: &Pixmap, lighting: &Lighting, region: R
   let stride = u32.toUsize(out.width()) * 4
   let s = input.data()
   let d = out.dataMut()
+  // The surface height of each alpha byte, as the GPU computes it.
+  let mut heights: [f32; 256] = [0.0; 256]
+  let mut i: u32 = 0
+  while i < 256 {
+    heights[u32.toUsize(i)] = lighting.surfaceScale * u32.toF32(i) / 255.0
+    i = i + 1
+  }
   let mut y = r.y0
   while y < r.y1 {
     let mut x = r.x0
@@ -1584,7 +1593,7 @@ pub fn lighting(out: &mut Pixmap, input: &Pixmap, lighting: &Lighting, region: R
       } else {
         surfaceNormal(s, stride, r, x, y, lighting.surfaceScale)
       }
-      let z = lighting.surfaceScale * i32.toF32(alphaAt(s, stride, x, y)) / 255.0
+      let z = heights[i32.toUsize(alphaAt(s, stride, x, y))]
       store(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, lightPixel(n[0], n[1], u32.toF32(x), u32.toF32(y), z, lighting, &setup))
       x = x + 1
     }
