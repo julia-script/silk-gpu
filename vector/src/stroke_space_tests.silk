@@ -13,10 +13,21 @@ import flatten { Line }
 import projective
 import silk.num.u32
 import geometry { Point, Rect, Affine }
-import geometry_error { GeometryError }
+import geometry_error { GeometryError, ACCURACY_LIMIT }
 import path { Path, MOVE, CLOSE }
 import projective { Homography }
-import stroke { Stroker, Stroke, StrokeBounds, CAP_SQUARE, CAP_ROUND, JOIN_ARCS, JOIN_MITER_CLIP }
+import stroke {
+  Stroker,
+  Stroke,
+  StrokeBounds,
+  CAP_BUTT,
+  CAP_SQUARE,
+  CAP_ROUND,
+  JOIN_ARCS,
+  JOIN_MITER_CLIP,
+  measureLength,
+  measureLengthInSpace
+}
 
 fn identity() -> Homography {
   return Homography.fromAffine(&Affine.identity())
@@ -74,6 +85,198 @@ fn nearest(p: Point, path: &Path) -> f64 {
     i = i + 1
   }
   return best
+}
+
+// Match SVG's four exact arc primitives, including its supplied cardinal endpoints.
+// The reference contains only the first and third quarters, with no dash calculation.
+effect fn calibratedQuarters(reference: bool) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let endpoints = [
+    Point.make(12.0, 8.0),
+    Point.make(8.0, 12.0),
+    Point.make(4.0, 8.0),
+    Point.make(8.0, 4.0),
+    Point.make(12.0, 8.0),
+  ]
+  let mut p = Path.make()
+  let mut i: usize = 0
+  let mut angle = 0.0
+  while i < 4 {
+    if !reference || i % 2 == 0 {
+      if reference || i == 0 {
+        run p.moveTo(endpoints[i].x, endpoints[i].y)
+      }
+      run p.ellipseArcTo(
+        Point.make(8.0, 8.0),
+        Point.make(4.0, 0.0),
+        Point.make(0.0, 4.0),
+        angle,
+        1.5707963267948966,
+        endpoints[i + 1],
+      )
+    }
+    angle = angle + 1.5707963267948966
+    i = i + 1
+  }
+  if !reference {
+    run p.close()
+  }
+  return move p
+}
+
+effect fn outlineNear(actual: &Path, expected: &Path, tolerance: f64) -> ()
+  ! AssertionError<'static> {
+  run Testing.expect(actual.pointList().length > 0, "calibrated outline is nonempty")
+  let mut i: usize = 0
+  while i < actual.pointList().length {
+    run Testing.expect(
+      nearest(actual.pointList()[i], expected) <= tolerance,
+      "calibrated outline follows the exact quarter-arc reference",
+    )
+    i = i + 1
+  }
+}
+
+test effect fn calibratedDashBoundariesFollowSmoothArcsInBothSpaces() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run calibratedQuarters(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let reference = run calibratedQuarters(true) |> Effect.provideMut<Allocator>(&mut allocator)
+  let host = Homography.fromAffine(&Affine.scale(2.0, 1.0))
+  let mut mode: usize = 0
+  while mode < 2 {
+    let length = if mode == 0 {
+      run measureLength(&p, 1.0e-4)
+    } else {
+      run measureLengthInSpace(&p, &host, 1.0e-4)
+    }
+    let tolerance = if mode == 0 {
+      0.25
+    } else {
+      0.125
+    }
+
+    // Perturb the butt pattern to exercise both sides of the closed-seam interval,
+    // not just whichever side the independent length estimator happens to choose.
+    let caps = [CAP_BUTT, CAP_ROUND, CAP_SQUARE, CAP_BUTT, CAP_BUTT]
+    let mut capIndex: usize = 0
+    while capIndex < caps.length {
+      let mut style = Stroke.make(1.0)
+      style.cap = caps[capIndex]
+      let shift = if capIndex == 3 {
+        -1.0e-5
+      } else if capIndex == 4 {
+        1.0e-5
+      } else {
+        0.0
+      }
+      run style.setDashes(&[length * 0.25 + shift, length * 0.25 + shift])
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      let mut solid = Stroke.make(1.0)
+      solid.cap = style.cap
+      let mut stroker = Stroker.make()
+      let mut actual = Path.make()
+      let mut expected = Path.make()
+      if mode == 0 {
+        run stroker.stroke(&p, &style, &Affine.identity(), tolerance, &mut actual)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        run stroker.stroke(&reference, &solid, &Affine.identity(), tolerance, &mut expected)
+          |> Effect.provideMut<Allocator>(&mut allocator)
+      } else {
+        run stroker.strokeInSpace(
+          &p,
+          &style,
+          &host,
+          &identity(),
+          Rect.make(0.0, 0.0, 32.0, 32.0),
+          tolerance,
+          &mut actual,
+        )
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        run stroker.strokeInSpace(
+          &reference,
+          &solid,
+          &host,
+          &identity(),
+          Rect.make(0.0, 0.0, 32.0, 32.0),
+          tolerance,
+          &mut expected,
+        )
+          |> Effect.provideMut<Allocator>(&mut allocator)
+      }
+      run outlineNear(&actual, &expected, tolerance)
+      run outlineNear(&expected, &actual, tolerance)
+      capIndex = capIndex + 1
+    }
+    mode = mode + 1
+  }
+}
+
+effect fn expectDashAccuracy(result: &Result<(), GeometryError | OutOfMemoryError>) -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  match &result.* {
+    Result<(), GeometryError | OutOfMemoryError>.Failure { error } => match &error {
+      GeometryError e => {
+        run Testing.expect(e.code == ACCURACY_LIMIT, "unresolved dash topology refuses accuracy")
+      }
+      OutOfMemoryError e => {
+        fail OutOfMemoryError {}
+      }
+    }
+    _ => {
+      run Testing.expect(false, "uncertainty must not erase or invent a visible cap")
+    }
+  }
+}
+
+test effect fn calibratedDashStillRefusesSharpAndOpenBoundaries() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(12.0, 8.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArcTo(
+    Point.make(8.0, 8.0),
+    Point.make(4.0, 0.0),
+    Point.make(0.0, 4.0),
+    0.0,
+    1.5707963267948966,
+    Point.make(8.0, 12.0),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let quarter = run measureLength(&p, 1.0e-4)
+  let mut style = Stroke.make(1.0)
+  run style.setDashes(&[quarter, quarter]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let mut out = Path.make()
+  let open = run Effect.result(stroker.stroke(&p, &style, &Affine.identity(), 0.25, &mut out))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectDashAccuracy(&open)
+  run p.lineTo(8.0, 16.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let sharp = run Effect.result(stroker.stroke(&p, &style, &Affine.identity(), 0.25, &mut out))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectDashAccuracy(&sharp)
+}
+
+test effect fn closedSmoothSeamCannotInventAnIsolatedCap() -> ()
+  ! AssertionError<'static> | GeometryError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run calibratedQuarters(false) |> Effect.provideMut<Allocator>(&mut allocator)
+  let quarter = (run measureLength(&p, 1.0e-4)) * 0.25
+  let caps = [CAP_ROUND, CAP_SQUARE]
+  let mut i: usize = 0
+  while i < caps.length {
+    let mut style = Stroke.make(1.0)
+    style.cap = caps[i]
+    run style.setDashes(&[quarter, quarter * 2.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+    style.dashOffset = quarter * 2.0
+    let mut stroker = Stroker.make()
+    let mut out = Path.make()
+    let result = run Effect.result(stroker.stroke(&p, &style, &Affine.identity(), 0.25, &mut out))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run expectDashAccuracy(&result)
+    i = i + 1
+  }
 }
 
 test effect fn strokeHostAffineReflectionSkewAndNonuniformCaps() -> ()

@@ -158,6 +158,39 @@ fn unit(a: Point) -> Point {
   return Point.make(a.x / n, a.y / n)
 }
 
+// A source boundary need not be a discontinuity of the offset/cap geometry.
+// For forward unit tangents with angle <= pi/2, the miter excursion from either
+// offset is h*tan(angle/2) <= h*|incoming-outgoing|. A square cap's rotation costs
+// at most sqrt(2)*h*|incoming-outgoing|; bevel/round caps and joins cost less.
+// Four times that tangent jump covers both the join and cap change. Dividing the
+// join budget across all vertices also bounds transitions crossing several joins.
+// Osculating-circle joins need more than tangent continuity when curvature jumps;
+// retain their refusal unless the existing join emitter itself sees equal tangents.
+fn dashSmooth(v: Vertex, pen: Pen, joinBudget: f64) -> bool {
+  if !v.corner || same(v.incoming, v.outgoing) {
+    return true
+  }
+  return pen.join != JOIN_ARCS && dot(v.incoming, v.outgoing) >= 0.0
+    && 4.0 * pen.half * distance(v.incoming, v.outgoing) <= joinBudget
+}
+
+// Across a closed seam, uncertainty may move an existing cap, but must not
+// create/delete a capped component or split a continuously painted join.
+// Matching the state after the cut to the initial state makes the last fragment
+// an extension of the first dash (or a retraction of the final dash). The three
+// interval bounds exclude a second transition inside the uncertainty window.
+fn dashSeamTransition(
+  pattern: &[f64],
+  index: usize,
+  on: bool,
+  initialOn: bool,
+  initialRemaining: f64,
+  error: f64,
+) -> bool {
+  return on != initialOn && initialRemaining > 2.0 * error && pattern[index] > 2.0 * error
+    && pattern[(index + 1) % pattern.length] > 2.0 * error
+}
+
 fn at(vertices: &[Vertex], sub: Subpath, i: usize, backwards: bool) -> Vertex {
   let mut v = vertices[if backwards {
     sub.start + sub.count - 1 - i
@@ -1434,8 +1467,12 @@ impl Stroker {
       }
       let mut remaining = pattern[index] - phase
       let mut on = index % 2 == 0
+      let initialOn = on
+      let initialRemaining = remaining
+      let joinBudget = pen.tolerance * 0.015625 / usize.toF64(sub.count)
       let firstDash = self.dashSubpaths.length()
       let first = self.vertices.asSlice()[sub.start]
+      let smoothSeam = sub.closed && dashSmooth(first, pen, joinBudget)
       if on {
         run self.dashBegin(first)
       }
@@ -1463,7 +1500,7 @@ impl Stroker {
         }
         let before = uncertainty
         uncertainty = uncertainty + curve.lengthError(start, b.parameter) + endpointError
-        if a.corner {
+        if !dashSmooth(a, pen, joinBudget) {
           sinceCorner = 0.0
         }
         let length = distance(a.point, b.point)
@@ -1479,13 +1516,18 @@ impl Stroker {
           } else {
             uncertainty
           }
-          if cutError * self.dashMetric > pen.tolerance * 0.03125 {
+
+          // Square cap corners move at most twice the offset metric.
+          if 2.0 * cutError * self.dashMetric > pen.tolerance * 0.03125 {
             fail GeometryError { code: ACCURACY_LIMIT }
           }
           if cutError > 0.0 && sinceCorner + done <= cutError {
             fail GeometryError { code: ACCURACY_LIMIT }
           }
-          if cutError > 0.0 && (b.corner || k + 1 == n) && length - done <= cutError {
+          let seamTransition = k + 1 == n && smoothSeam
+            && dashSeamTransition(pattern, index, on, initialOn, initialRemaining, cutError)
+          if cutError > 0.0 && (!dashSmooth(b, pen, joinBudget) || (k + 1 == n && !seamTransition))
+            && length - done <= cutError {
             fail GeometryError { code: ACCURACY_LIMIT }
           }
           let cut = run self.cut(
@@ -1517,9 +1559,15 @@ impl Stroker {
         remaining = remaining - (length - done)
         sinceCorner = sinceCorner + length
 
-        // A phase uncertainty straddling a real corner or the end can change cap topology,
-        // not merely move a cap. Never certify such an unresolved dash transition.
-        if uncertainty > 0.0 && (b.corner || k + 1 == n) && remaining <= uncertainty {
+        // Only geometrically bounded joins may be crossed by a phase interval.
+        // At a closed seam additionally certify that one existing cap merely moves.
+        let seamTransition = k + 1 == n && smoothSeam
+          && dashSeamTransition(pattern, index, on, initialOn, initialRemaining, uncertainty)
+        if uncertainty > 0.0 && remaining <= uncertainty
+          && (!dashSmooth(b, pen, joinBudget)
+            || (k + 1 == n
+              && (!seamTransition
+                || 2.0 * uncertainty * self.dashMetric > pen.tolerance * 0.03125))) {
           fail GeometryError { code: ACCURACY_LIMIT }
         }
         if on {
