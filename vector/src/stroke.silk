@@ -225,7 +225,7 @@ fn maxScale(m: &Affine) -> f64 {
 /// and closing segment. tolerance is a positive finite absolute error budget for
 /// the entire path. No stroke style, device transform, allocation or mutable state
 /// is involved. Uncertifiable finite precision fails with ACCURACY_LIMIT.
-pub effect fn measureLength(path: &Path, tolerance: f64) -> f64
+pub effect fn measureLength(path: &Path, tolerance: f64) -> LengthEstimate
   ! GeometryError {
   return run measureCenterline(path, &Homography.fromAffine(&Affine.identity()), tolerance, false)
 }
@@ -236,14 +236,20 @@ pub effect fn measureLength(path: &Path, tolerance: f64) -> f64
 /// INVALID_INPUT rejects nonfinite inputs or nonpositive/nonfinite tolerance;
 /// NUMERIC_LIMIT rejects nonfinite arithmetic or a detected eye-plane crossing;
 /// ACCURACY_LIMIT rejects unresolved visibility or unattainable error budgets.
-pub effect fn measureLengthInSpace(path: &Path, sourceToStroke: &Homography, tolerance: f64) -> f64
+pub effect fn measureLengthInSpace(
+  path: &Path,
+  sourceToStroke: &Homography,
+  tolerance: f64,
+) -> LengthEstimate
   ! GeometryError {
   return run measureCenterline(path, sourceToStroke, tolerance, true)
 }
 
-struct LengthEstimate {
-  value: f64,
-  error: f64,
+/// Certified absolute uncertainty, including accumulation and finite precision.
+/// A zero value is only an exactly empty centerline when error is also zero.
+pub struct LengthEstimate {
+  pub value: f64,
+  pub error: f64,
 }
 
 impl Copy for LengthEstimate {}
@@ -373,7 +379,12 @@ effect fn lengthInterval(
   return result
 }
 
-effect fn measureCenterline(path: &Path, mapping: &Homography, tolerance: f64, mapped: bool) -> f64
+effect fn measureCenterline(
+  path: &Path,
+  mapping: &Homography,
+  tolerance: f64,
+  mapped: bool,
+) -> LengthEstimate
   ! GeometryError {
   if !(tolerance > 0.0) || !f64.isFinite(tolerance) || !mapping.isFinite() {
     fail GeometryError { code: INVALID_INPUT }
@@ -388,7 +399,7 @@ effect fn measureCenterline(path: &Path, mapping: &Homography, tolerance: f64, m
     p = p + 1
   }
   if verbs.length == 0 {
-    return 0.0
+    return LengthEstimate { value: 0.0, error: 0.0 }
   }
 
   // At most one analytic segment per verb, including CLOSE. Half the total
@@ -476,7 +487,7 @@ effect fn measureCenterline(path: &Path, mapping: &Homography, tolerance: f64, m
     }
     i = i + 1
   }
-  return total.value
+  return total
 }
 
 /// Reusable storage; neither bounds nor repeated strokes need a second stroker allocation.

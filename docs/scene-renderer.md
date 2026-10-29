@@ -169,10 +169,10 @@ without Dawn.
    not successful-return clamps. `stroke_space_tests.silk` derives expected offsets,
    caps, joins, host dash endpoints and projective limits independently of these APIs.
 
-   `stroke.measureLength(path: &Path, tolerance: f64) -> f64 ! GeometryError`
+   `stroke.measureLength(path: &Path, tolerance: f64) -> LengthEstimate ! GeometryError`
    measures the total analytic centerline in source coordinates.
    `stroke.measureLengthInSpace(path: &Path, sourceToStroke: &Homography,
-   tolerance: f64) -> f64 ! GeometryError` measures it in an independent host.
+   tolerance: f64) -> LengthEstimate ! GeometryError` measures it in an independent host.
    These stateless module functions require no allocator, `Stroker`, style, device
    transform or clip. They sum every contour and closing segment; moves and
    geometrically constant segments contribute zero. Calling them between reusable
@@ -184,6 +184,12 @@ without Dawn.
    deficits using the existing curve `lengthError` machinery; no pixel-flattened
    geometry substitutes for length. A per-verb budget, conservative endpoint/anchor
    arithmetic bounds and accumulated summation bounds account for the total error.
+   The returned `LengthEstimate { value, error }` exposes that already-computed
+   absolute uncertainty. Callers needing relative accuracy can refine their
+   requested tolerance against the reported bound without unnecessary refinement
+   of already-accurate results. A zero value with nonzero error is not proof of an
+   empty curve: a coarse interval can have equal endpoints and positive length.
+   Exact source-degenerate geometry reports both fields as zero.
    The implementation uses only bounded recursion, with 40 subdivision levels and
    1,048,576 interval visits across the whole path. Very small tolerances, large
    coordinate cancellation or near-eye projective precision can exhaust those
