@@ -53,11 +53,11 @@ WEBGPU_HOME=$(scripts/install-webgpu)
 "$SILK_BIN/silkc" --version
 ```
 
-- `install-silk` pins **0.1.0-dev.27+323ceb59e7ee**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
+- `install-silk` pins **0.1.0-dev.29+94cf9559bf47**, verifies the release archive and `native-seed.json`, then checks the extracted `bin/silkc` checksum against the corresponding native seed on every invocation. It prints the compiler's **bin directory**.
 - `install-webgpu` pins Dawn's Release archives and prints the **installation root**. macOS has `lib/libwebgpu_dawn.a`; Linux has `lib64/libwebgpu_dawn.a`; Windows has `lib/webgpu_dawn.lib`.
 - `install-llvm` accepts a working absolute `SILK_CLANG` pointing to LLVM 22, or discovers Homebrew LLVM / `clang-22`; otherwise it downloads checksum-pinned **LLVM 22.1.8**. It prints the **absolute clang executable path**. Published LLVM archives are large (Linux x86_64: 1,938,859,476 bytes); preinstall LLVM 22 for a short cold gate. The full downloaded distribution includes resource headers and `wasm-ld`; a supplied system toolchain must also provide `wasm-ld` for browser builds.
 
-| Native host | Silk dev.27 release | Dawn release | Current prerequisite |
+| Native host | Silk dev.29 release | Dawn release | Current prerequisite |
 | --- | --- | --- | --- |
 | macOS arm64 | Available | Available | macOS 26+, LLVM 22 and Apple SDK |
 | macOS x86_64 | Not published | Available | Published native Silk compiler required |

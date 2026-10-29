@@ -10,7 +10,7 @@
 import webgpu_sys.generated_webgpu as sys
 import resources as resource
 import silk.mem.pointer { Pointer }
-import silk.option { Option }
+import silk.core.option { Option }
 import silk.core.ownership { Copy }
 import webgpu_sys.generated_webgpu {
   WGPUBindGroupDescriptor,
@@ -70,7 +70,7 @@ import webgpu_sys.generated_webgpu {
   WGPUVertexBufferLayout,
   WGPUVertexState,
 }
-import silk.layout { Layout }
+import silk.mem.layout { Layout }
 
 const EMPTY_FEATURES: [u32; 0] = []
 

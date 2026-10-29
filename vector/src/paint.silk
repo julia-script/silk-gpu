@@ -16,7 +16,7 @@ import silk.num.u64
 import silk.num.usize
 import silk.num.i64
 import silk.num.i32
-import silk.option { Option }
+import silk.core.option { Option }
 import strips { Coverage, BAND, minU32 }
 import geometry { Affine, Point }
 import projective { Homography }
@@ -34,9 +34,6 @@ import pixmap {
   unpack,
   scalePacked,
   storePacked,
-  floorF64,
-  truncateToI64,
-  truncateF64ToU8
 }
 import silk.simd.u8x16
 import silk.simd.u16x16
@@ -716,10 +713,10 @@ fn lerpByte(a: u8, b: u8, wa: u32, wb: u32) -> u8 with Intrinsic.inlineAlways() 
 
 fn spreadParameter(t: f64, spread: u8) -> f64 with Intrinsic.inlineAlways() {
   if spread == SPREAD_REPEAT {
-    return t - floorF64(t)
+    return t - f64.floor(t)
   }
   if spread == SPREAD_REFLECT {
-    let m = t - 2.0 * floorF64(t * 0.5)
+    let m = t - 2.0 * f64.floor(t * 0.5)
     return if m > 1.0 {
       2.0 - m
     } else {
@@ -979,7 +976,7 @@ impl<'a> ImagePattern<'a> {
   fn wrap(self: &Self, v: f32, size: f32) -> usize with Intrinsic.inlineAlways() {
     // Rounding can land exactly on the size; keep the index inside the image.
     let t = if self.extend == EXTEND_REPEAT {
-      minF32(v - size * floorF32(v / size), size - 1.0)
+      minF32(v - size * f32.floor(v / size), size - 1.0)
     } else {
       minF32(maxF32(v, 0.0), size - 1.0)
     }
@@ -1032,10 +1029,10 @@ impl<'a> ImagePattern<'a> {
     let w = u32.toF32(self.image.width())
     let h = u32.toF32(self.image.height())
     if self.sampling == SAMPLE_NEAREST {
-      return self.word(self.wrap(floorF32(x), w), self.wrap(floorF32(y), h))
+      return self.word(self.wrap(f32.floor(x), w), self.wrap(f32.floor(y), h))
     }
-    let x0 = floorF32(x - 0.5)
-    let y0 = floorF32(y - 0.5)
+    let x0 = f32.floor(x - 0.5)
+    let y0 = f32.floor(y - 0.5)
     let wx = x - 0.5 - x0
     let wy = y - 0.5 - y0
 
@@ -1224,8 +1221,7 @@ fn channels(word: u32) -> simd<f32, 4> with Intrinsic.inlineAlways() {
   return i32x4.toF32x4(u8x16.bitcastToI32x4(wide))
 }
 
-// LIMITATION-6/7 (silk-lang/silk#2561, #2566): plain selects and a conversion-based floor, exact
-// for every f32 (magnitudes from 2^23 up are already integers; NaN never reaches them here).
+// LIMITATION-7 (silk-lang/silk#2566): plain selects; NaN never reaches them here.
 fn minF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() {
   return if a < b {
     a
@@ -1242,18 +1238,6 @@ fn maxF32(a: f32, b: f32) -> f32 with Intrinsic.inlineAlways() {
   }
 }
 
-fn floorF32(v: f32) -> f32 with Intrinsic.inlineAlways() {
-  if v > -8388608.0 && v < 8388608.0 {
-    let t = i32.toF32(Intrinsic.f32ToI32(v))
-    return if t > v {
-      t - 1.0
-    } else {
-      t
-    }
-  }
-  return v
-}
-
 fn minLanes(a: simd<f32, 4>, b: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
   return f32x4.select(f32x4.lanesLess(a, b), a, b)
 }
@@ -1266,7 +1250,7 @@ fn absLanes(v: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
   return f32x4.select(f32x4.lanesLess(v, f32x4.splat(0.0)), f32x4.splat(0.0) - v, v)
 }
 
-/// [`floorF32`] per lane.
+/// `f32.floor` per lane.
 fn floorLanes(v: simd<f32, 4>) -> simd<f32, 4> with Intrinsic.inlineAlways() {
   let small = f32x4.lanesLess(absLanes(v), f32x4.splat(8388608.0))
   let t = i32x4.toF32x4(f32x4.toI32x4(f32x4.select(small, v, f32x4.splat(0.0))))

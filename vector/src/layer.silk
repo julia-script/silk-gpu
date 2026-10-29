@@ -14,7 +14,7 @@ import silk.num.u8
 import silk.num.u32
 import silk.num.usize
 import strips { Coverage, BAND, minU32 }
-import pixmap { Pixmap, Rgba8, div255, over, truncateToU8 }
+import pixmap { Pixmap, Rgba8, div255, over }
 import paint { Shader }
 import color_space as colorSpace
 
@@ -402,7 +402,7 @@ fn blendPixel(d: &mut [u8], i: usize, s: Rgba8, mode: u8) -> () {
 }
 
 fn toByte(value: f32) -> u8 {
-  return truncateToU8(f32.min(f32.max(value, 0.0), 1.0) * 255.0 + 0.5)
+  return f32.toU8(f32.min(f32.max(value, 0.0), 1.0) * 255.0 + 0.5)
 }
 
 fn separable(cb: f32, cs: f32, mode: u8) -> f32 {

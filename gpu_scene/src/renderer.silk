@@ -5,7 +5,7 @@
 //! composites the two in `shaders/compose.wgsl`, and the root is copied to the target at the end.
 import webgpu.resources as gpu
 import webgpu.resources { Buffer, RenderPipeline, Texture, TextureView, Queue, CommandEncoder }
-import webgpu.runtime { Device, GpuError }
+import webgpu.runtime { Adapter, Device, GpuError }
 import webgpu.descriptors {
   BufferDescriptor, Color, RenderPassColorAttachment, RenderPassDescriptor, VertexState, FragmentState,
   ColorTargetState, BlendComponent, BlendState, PrimitiveState, MultisampleState, RenderPipelineDescriptor,
@@ -28,12 +28,18 @@ const NATIVE_FEATURES: [u32; 1] = [gpu.SHADER_MODULE_COMPILATION_OPTIONS]
 
 const WEB_FEATURES: [u32; 0] = []
 
+/// Strict math where the device has Dawn's compilation options (Metal needs it for exact image
+/// sampling); the ordinary module elsewhere. Vulkan and D3D compile WGSL without fast-math
+/// contraction, so lavapipe matches the CPU without it.
 effect fn sceneShader(device: &Device) -> gpu.ShaderModule
   ! GpuError {
   static if Intrinsic.targetArchitecture() == "wasm32" {
     return run gpu.createShaderModule(device, b"vector scene", shaders.scene())
   } else {
-    return run gpu.createShaderModuleStrict(device, b"vector scene", shaders.scene())
+    if device.hasFeature(gpu.SHADER_MODULE_COMPILATION_OPTIONS) {
+      return run gpu.createShaderModuleStrict(device, b"vector scene", shaders.scene())
+    }
+    return run gpu.createShaderModule(device, b"vector scene", shaders.scene())
   }
 }
 
@@ -136,7 +142,7 @@ pub effect fn storage(device: &Device, queue: &Queue, label: &[u8], bytes: &[u8]
 /// Writes `bytes` into buffer `index` of `slots`, replacing it with a bigger one (or appending
 /// it, when `index` is `slots.length()`) if it is too small. Shaders bound to these buffers
 /// read only the lengths the scene header gives, so a larger buffer is harmless.
-effect fn upload(device: &Device, queue: &Queue, slots: &mut List<Buffer>, index: usize, label: &[u8], bytes: &[u8], usage: u64)
+pub effect fn upload(device: &Device, queue: &Queue, slots: &mut List<Buffer>, index: usize, label: &[u8], bytes: &[u8], usage: u64)
   -> () ! GpuError | OutOfMemoryError ? &mut Allocator {
   if index < slots.length() {
     let size = if bytes.length < 16 { 16 } else { (bytes.length + 3) / 4 * 4 }
@@ -167,18 +173,18 @@ pub fn textureEntry<'a>(binding: u32, view: &'a TextureView) -> BindGroupEntry<'
 }
 
 impl SceneRenderer {
-  /// Pass these features to `DeviceDescriptor.withRequiredFeatures` when creating the device.
-  /// Native scene sampling requires Dawn's strict-math module option. Browser WGSL has no
-  /// equivalent feature: this list is empty there and exact CPU image parity is not promised.
-  pub fn requiredFeatures() -> &'static [u32] {
+  /// Pass these features to `DeviceDescriptor.withRequiredFeatures` when creating the device:
+  /// Dawn's strict-math module option where `adapter` offers it (Metal), nothing elsewhere.
+  /// Browser WGSL has no equivalent feature, so exact CPU image parity is not promised there.
+  pub fn requiredFeatures(adapter: &Adapter) -> &'static [u32] {
     static if Intrinsic.targetArchitecture() == "wasm32" {
       return &WEB_FEATURES
     } else {
-      return &NATIVE_FEATURES
+      if adapter.hasFeature(gpu.SHADER_MODULE_COMPILATION_OPTIONS) { return &NATIVE_FEATURES }
+      return &WEB_FEATURES
     }
   }
 
-  /// Native devices missing [`requiredFeatures`] fail with `gpu.STRICT_MATH_UNAVAILABLE`.
   pub effect fn make(device: &Device) -> SceneRenderer
     ! GpuError {
     let shader = run sceneShader(device)
