@@ -39,6 +39,14 @@ if args.browser:
     chromium = shutil.which("chromium") or shutil.which("chromium-browser")
     if not chromium:
         fail("Runner prerequisite missing: preinstalled Chromium; browser downloads are prohibited")
+    # Canvas presentation needs the headed compositor, even on a GPU-less runner.
+    display_tools = ("xvfb-run", "Xvfb", "xauth")
+    if any(shutil.which(name) is None for name in display_tools):
+        subprocess.run(["sudo", "apt-get", "update", "-qq"], check=True)
+        subprocess.run(["sudo", "apt-get", "install", "--yes", "--no-install-recommends", "xvfb", "xauth"], check=True)
+    missing = [name for name in display_tools if shutil.which(name) is None]
+    if missing:
+        fail(f"Headed Chromium prerequisites missing after installation: {', '.join(missing)}")
     home = CACHE / "playwright" / lock["playwright"]["version"] / "node_modules"
     for name, asset in lock["playwright"]["packages"].items():
         destination = home / name

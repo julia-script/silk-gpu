@@ -93,7 +93,7 @@ let browser;
 try {
   // A supplied executable is authoritative: Playwright fails if it is missing;
   // it must not silently switch to a bundled or downloaded browser.
-  browser = await chromium.launch({ headless: true,
+  browser = await chromium.launch({ headless: process.platform !== 'linux',
     executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined, args: [
     // Preserve Playwright's screenshot surface feature when enabling Vulkan.
     '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan,CDPScreenshotNewSurface',
