@@ -3,7 +3,9 @@
 Native Dawn and browser `navigator.gpu` bindings for Silk. `webgpu_sys` is the
 generated unsafe C layer; `webgpu` owns resources and supplies borrowed descriptors,
 typed failures, asynchronous requests, and host-owned surfaces. Samples, GLFW,
-and benchmarks are separate development packages. No scene renderer is included.
+and benchmarks are separate development packages. `vector` is the pure-Silk 2D core
+(paths, flattening, sparse-strip coverage, CPU reference pixmap) for the planned scene
+renderer; see [docs/scene-renderer.md](docs/scene-renderer.md).
 
 ## Implementation selection
 

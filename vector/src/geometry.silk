@@ -1,0 +1,62 @@
+//! Points, rectangles and 2D affine transforms in user space (f64).
+import silk.core.ownership { Copy }
+import silk.num.f64
+
+pub struct Point {
+  pub x: f64,
+  pub y: f64,
+}
+impl Copy for Point {}
+impl Point {
+  pub fn make(x: f64, y: f64) -> Point { return Point { x: x, y: y } }
+  pub fn isFinite(self: &Self) -> bool { return f64.isFinite(self.x) && f64.isFinite(self.y) }
+}
+
+pub struct Rect {
+  pub x0: f64,
+  pub y0: f64,
+  pub x1: f64,
+  pub y1: f64,
+}
+impl Copy for Rect {}
+impl Rect {
+  pub fn make(x: f64, y: f64, width: f64, height: f64) -> Rect {
+    return Rect { x0: x, y0: y, x1: x + width, y1: y + height }
+  }
+}
+
+/// The SVG matrix `[a c e; b d f; 0 0 1]`: `x' = a x + c y + e`, `y' = b x + d y + f`.
+pub struct Affine {
+  pub a: f64,
+  pub b: f64,
+  pub c: f64,
+  pub d: f64,
+  pub e: f64,
+  pub f: f64,
+}
+impl Copy for Affine {}
+impl Affine {
+  pub fn identity() -> Affine { return Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 } }
+  pub fn translate(x: f64, y: f64) -> Affine { return Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y } }
+  pub fn scale(x: f64, y: f64) -> Affine { return Affine { a: x, b: 0.0, c: 0.0, d: y, e: 0.0, f: 0.0 } }
+  /// Rotation by `radians`, clockwise on a y-down canvas (SVG `rotate`).
+  pub fn rotate(radians: f64) -> Affine {
+    let s = f64.sin(radians)
+    let c = f64.cos(radians)
+    return Affine { a: c, b: s, c: 0.0 - s, d: c, e: 0.0, f: 0.0 }
+  }
+  /// `self * other`: applies `other` first, then `self` (SVG transform-list order).
+  pub fn then(self: &Self, other: &Affine) -> Affine {
+    return Affine {
+      a: self.a * other.a + self.c * other.b,
+      b: self.b * other.a + self.d * other.b,
+      c: self.a * other.c + self.c * other.d,
+      d: self.b * other.c + self.d * other.d,
+      e: self.a * other.e + self.c * other.f + self.e,
+      f: self.b * other.e + self.d * other.f + self.f,
+    }
+  }
+  pub fn apply(self: &Self, point: Point) -> Point {
+    return Point { x: self.a * point.x + self.c * point.y + self.e, y: self.b * point.x + self.d * point.y + self.f }
+  }
+}

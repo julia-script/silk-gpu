@@ -1,0 +1,129 @@
+//! Flattens a path into device-space line segments for filling.
+//!
+//! Control points are transformed first (affine maps preserve Béziers), then each curve is split
+//! uniformly into the segment count from Wang's formula, which bounds the distance between the
+//! curve and its polyline by `tolerance` device pixels. Every subpath is closed implicitly, as
+//! filling requires. Segments with a non-finite endpoint or no vertical extent are dropped: they
+//! add no area.
+import silk.core.ownership { Copy }
+import silk.collections.list { List }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f32
+import silk.num.f64
+import silk.num.u32
+import geometry { Point, Affine }
+import path { Path, MOVE, LINE, QUAD, CUBIC, CLOSE }
+
+/// The default fill tolerance in device pixels, as in tiny-skia and vello.
+pub const TOLERANCE: f64 = 0.25
+const MAX_SEGMENTS: f64 = 1024.0
+
+pub struct Line {
+  pub x0: f32,
+  pub y0: f32,
+  pub x1: f32,
+  pub y1: f32,
+}
+impl Copy for Line {}
+
+fn length(x: f64, y: f64) -> f64 { return f64.sqrt(x * x + y * y) }
+
+/// Wang's formula: `n = ceil(sqrt(degree * (degree - 1) / 8 * M / tolerance))`, where `M` is the
+/// largest second difference of the control points. `factor` is `degree * (degree - 1) / 8`.
+fn segments(m: f64, factor: f64, tolerance: f64) -> u32 {
+  let n = f64.ceil(f64.sqrt(factor * m / tolerance))
+  if !(n >= 1.0) { return 1 }
+  if n > MAX_SEGMENTS { return 1024 }
+  return f64.toU32(n)
+}
+
+struct Emitter {
+  start: Point,
+  current: Point,
+}
+
+effect fn emit(lines: &mut List<Line>, from: Point, to: Point) -> () ! OutOfMemoryError ? &mut Allocator {
+  if !from.isFinite() || !to.isFinite() { return }
+  let line = Line { x0: f64.toF32(from.x), y0: f64.toF32(from.y), x1: f64.toF32(to.x), y1: f64.toF32(to.y) }
+  if line.y0 == line.y1 { return }
+  if !f32.isFinite(line.x0) || !f32.isFinite(line.y0) || !f32.isFinite(line.x1) || !f32.isFinite(line.y1) { return }
+  run lines.append(line)
+}
+
+/// Appends the closed polyline of every subpath of `path`, transformed by `transform`, to `lines`.
+pub effect fn fill(path: &Path, transform: &Affine, tolerance: f64, lines: &mut List<Line>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+  let verbs = path.verbList()
+  let points = path.pointList()
+  let origin = transform.apply(Point.make(0.0, 0.0))
+  let mut state = Emitter { start: origin, current: origin }
+  let mut p: usize = 0
+  let mut i: usize = 0
+  while i < verbs.length {
+    let verb = verbs[i]
+    if verb == MOVE {
+      run emit(&mut lines, state.current, state.start)
+      let to = transform.apply(points[p])
+      state.start = to
+      state.current = to
+      p = p + 1
+    } else if verb == LINE {
+      let to = transform.apply(points[p])
+      run emit(&mut lines, state.current, to)
+      state.current = to
+      p = p + 1
+    } else if verb == QUAD {
+      let p0 = state.current
+      let p1 = transform.apply(points[p])
+      let p2 = transform.apply(points[p + 1])
+      let m = length(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y)
+      let n = segments(m, 0.25, tolerance)
+      let step = 1.0 / u32.toF64(n)
+      let mut previous = p0
+      let mut k: u32 = 1
+      while k < n {
+        let t = u32.toF64(k) * step
+        let u = 1.0 - t
+        let next = Point.make(u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x, u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y)
+        run emit(&mut lines, previous, next)
+        previous = next
+        k = k + 1
+      }
+      run emit(&mut lines, previous, p2)
+      state.current = p2
+      p = p + 2
+    } else if verb == CUBIC {
+      let p0 = state.current
+      let p1 = transform.apply(points[p])
+      let p2 = transform.apply(points[p + 1])
+      let p3 = transform.apply(points[p + 2])
+      let m = f64.max(
+        length(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y),
+        length(p1.x - 2.0 * p2.x + p3.x, p1.y - 2.0 * p2.y + p3.y))
+      let n = segments(m, 0.75, tolerance)
+      let step = 1.0 / u32.toF64(n)
+      let mut previous = p0
+      let mut k: u32 = 1
+      while k < n {
+        let t = u32.toF64(k) * step
+        let u = 1.0 - t
+        let a = u * u * u
+        let b = 3.0 * u * u * t
+        let c = 3.0 * u * t * t
+        let d = t * t * t
+        let next = Point.make(a * p0.x + b * p1.x + c * p2.x + d * p3.x, a * p0.y + b * p1.y + c * p2.y + d * p3.y)
+        run emit(&mut lines, previous, next)
+        previous = next
+        k = k + 1
+      }
+      run emit(&mut lines, previous, p3)
+      state.current = p3
+      p = p + 3
+    } else if verb == CLOSE {
+      run emit(&mut lines, state.current, state.start)
+      state.current = state.start
+    }
+    i = i + 1
+  }
+  run emit(&mut lines, state.current, state.start)
+}
