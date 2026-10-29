@@ -1,5 +1,6 @@
 __pycache__/
 results/*
 !results/baseline.json
+!results/linux-callgrind.json
 *.callgrind
 *.calls.txt

@@ -3,8 +3,10 @@
 
 Both binaries must be built with BENCH_CALLGRIND=1. Run on native Linux with
 Valgrind and the real Dawn/Vulkan software adapter installed. Startup, warmup,
-GPU waits and output checks are excluded. Full measured call trees, including
-allocator call sites, are saved locally for attribution to wrappers vs Dawn.
+GPU waits and output checks are excluded. Collection toggles on the calling
+thread; worker-thread GPU execution is not the metric. Annotated call counts
+also include uncollected startup/warmup: use scoped Ir for attribution, not
+those call counts as an allocation census. Full measured call trees are saved.
 """
 import argparse
 import json
@@ -35,7 +37,9 @@ def main():
     report = metadata(binaries)
     report["valgrind_version"] = subprocess.check_output(["valgrind", "--version"], text=True).strip()
     report["metric"] = "Ir"
-    report["scope"] = "marked CPU encode/write and submit regions; GPU waits excluded"
+    report["scope"] = "calling-thread marked CPU encode/write and submit regions; setup, warmup, GPU waits and worker-thread execution excluded"
+    report["callgrind_options"] = ["--collect-atstart=no", "--instr-atstart=yes"]
+    report["call_count_scope"] = "annotated call counts include uncollected startup/warmup; only Ir is region-scoped"
     report["results"] = []
     ratios = []
     for case, name in enumerate(WORKLOADS):

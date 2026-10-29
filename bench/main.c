@@ -52,7 +52,10 @@ int main(void) {
             for (uint32_t i=0;i<n;++i) wgpuQueueWriteBuffer(queue,buffer,0,bytes,sizeof(bytes));
             wgpuQueueSubmit(queue,0,NULL);
         } else {
-            WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device,NULL);
+            // Match Silk's explicit empty label, not Dawn's distinct absent-label path.
+            WGPUCommandEncoderDescriptor encoder_desc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
+            encoder_desc.label = (WGPUStringView){"", 0};
+            WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device,&encoder_desc);
             WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder,&pass_desc);
             wgpuRenderPassEncoderSetPipeline(pass,pipeline);
             wgpuRenderPassEncoderSetBindGroup(pass,0,groups[0],0,NULL);
@@ -63,7 +66,9 @@ int main(void) {
                 }
             } else wgpuRenderPassEncoderDraw(pass,6,kind == 3 ? 10000 : 100000,0,0);
             wgpuRenderPassEncoderEnd(pass); wgpuRenderPassEncoderRelease(pass);
-            WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder,NULL); wgpuCommandEncoderRelease(encoder);
+            WGPUCommandBufferDescriptor command_desc = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
+            command_desc.label = (WGPUStringView){"", 0};
+            WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder,&command_desc); wgpuCommandEncoderRelease(encoder);
             wgpuQueueSubmit(queue,1,&command); wgpuCommandBufferRelease(command);
         }
         if (frame >= 2) bench_end();

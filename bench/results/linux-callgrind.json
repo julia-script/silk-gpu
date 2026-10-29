@@ -1,0 +1,272 @@
+{
+  "schema": 1,
+  "metric": "Ir",
+  "timestamp_utc": "2026-10-29T00:41:40Z",
+  "source_commit": "4dff91ae05641fc09cdec053eb8aaf7236790524",
+  "run_url": "https://github.com/julia-script/silk-gpu/actions/runs/40795501390",
+  "artifact": {
+    "name": "linux-callgrind-40795501390-1",
+    "url": "https://github.com/julia-script/silk-gpu/actions/runs/40795501390/artifacts/12864505263",
+    "sha256": "bdbfa7d8bb3da8a711a67b3b7bd3bd720f891f400a0ba243b51bf30f27487536",
+    "expires_at": "2026-11-28T00:50:43Z",
+    "contents": "comparison.json and all 30 raw Callgrind profiles with annotated caller/callee trees"
+  },
+  "host": {
+    "system": "Linux",
+    "machine": "x86_64",
+    "platform": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.43"
+  },
+  "versions": {
+    "runner": "ubuntu-26.04",
+    "silk": "0.1.0-dev.27+323ceb59e7ee",
+    "clang": "22.1.2",
+    "mesa": "26.0.8-1ubuntu0.3",
+    "dawn": "v20261027.184652",
+    "dawn_commit": "106704a9ac3fc21b1580ea85aea302ac17d416f1",
+    "valgrind": "valgrind-3.26.0",
+    "g++": "4:15.2.0-5ubuntu1"
+  },
+  "binary_sha256": {
+    "c": "a4dee120dbb23ad43675910c9ef19179c2c93ba51d4f9cec2300c81177caabf1",
+    "silk": "b57f534f265d492419536cf437bf5ddf7683cc461e29a0eb352af402687bcb97"
+  },
+  "shader_sha256": "98b3f60f7eb3fe7b046764a0fdc434ba76879d40935127e89f93e82f94e0e9c7",
+  "command": "scripts/ab .cache/bench/c .cache/bench/silk --n 10000 --frames 3 --repeats 3",
+  "method": {
+    "build": "BENCH_CALLGRIND=1 scripts/bench --build-only; C -O3 -g, Silk release, Rust release built successfully",
+    "options": [
+      "--tool=callgrind",
+      "--collect-atstart=no",
+      "--instr-atstart=yes",
+      "--error-exitcode=99"
+    ],
+    "frames_per_run": 3,
+    "repeats": 3,
+    "warmup_frames_per_run": 2,
+    "scope": "Calling-thread CPU encode/write and submit; excludes setup, warmup, GPU waits, checked readback and worker-thread execution. Both binaries use real Dawn Vulkan on lavapipe.",
+    "call_counts": "Annotation x-call counts include uncollected startup/warmup and are not a measured-region allocation census. Ir alone is scoped.",
+    "thread_scope_source": "https://sourceware.org/git/?p=valgrind.git;a=blob_plain;f=callgrind/main.c;hb=VALGRIND_3_26_0 (VG_USERREQ__TOGGLE_COLLECT changes thread-specific current_state.collect)"
+  },
+  "results": [
+    {
+      "workload": "draws",
+      "n": 10000,
+      "checked": true,
+      "checksum": 15506621279517942565,
+      "total_Ir_samples": {
+        "c": [
+          25800015,
+          25787929,
+          25787929
+        ],
+        "silk": [
+          26061212,
+          26061212,
+          26061212
+        ]
+      },
+      "median_Ir_per_frame": {
+        "c": 8595976.333333334,
+        "silk": 8687070.666666666
+      },
+      "silk_over_c": 1.0105973224914648,
+      "overhead_percent": 1.0597322491464833
+    },
+    {
+      "workload": "writes",
+      "n": 10000,
+      "checked": true,
+      "checksum": 16712008635831575701,
+      "total_Ir_samples": {
+        "c": [
+          29749845,
+          29749845,
+          29749845
+        ],
+        "silk": [
+          30019911,
+          30019911,
+          30019911
+        ]
+      },
+      "median_Ir_per_frame": {
+        "c": 9916615.0,
+        "silk": 10006637.0
+      },
+      "silk_over_c": 1.009077896036097,
+      "overhead_percent": 0.90778960360971
+    },
+    {
+      "workload": "binds",
+      "n": 10000,
+      "checked": true,
+      "checksum": 15506621279517942565,
+      "total_Ir_samples": {
+        "c": [
+          78796688,
+          78796688,
+          78796688
+        ],
+        "silk": [
+          79418025,
+          79418025,
+          79418025
+        ]
+      },
+      "median_Ir_per_frame": {
+        "c": 26265562.666666668,
+        "silk": 26472675.0
+      },
+      "silk_over_c": 1.0078853187331933,
+      "overhead_percent": 0.7885318733193314
+    },
+    {
+      "workload": "rects10k",
+      "n": 10000,
+      "checked": true,
+      "checksum": 15506621279517942565,
+      "total_Ir_samples": {
+        "c": [
+          85872,
+          85872,
+          85872
+        ],
+        "silk": [
+          88638,
+          88638,
+          88638
+        ]
+      },
+      "median_Ir_per_frame": {
+        "c": 28624.0,
+        "silk": 29546.0
+      },
+      "silk_over_c": 1.032210732252655,
+      "overhead_percent": 3.2210732252655028
+    },
+    {
+      "workload": "rects100k",
+      "n": 100000,
+      "checked": true,
+      "checksum": 15506621279517942565,
+      "total_Ir_samples": {
+        "c": [
+          85872,
+          85872,
+          85872
+        ],
+        "silk": [
+          88638,
+          88638,
+          88638
+        ]
+      },
+      "median_Ir_per_frame": {
+        "c": 28624.0,
+        "silk": 29546.0
+      },
+      "silk_over_c": 1.032210732252655,
+      "overhead_percent": 3.2210732252655028
+    }
+  ],
+  "geomean_silk_over_c": 1.0183337538300974,
+  "allocation_attribution": {
+    "profiles_reviewed": 15,
+    "wrapper_outbound_symbols": [
+      "bench/support.c:bench_begin",
+      "wgpuCommandBufferRelease",
+      "wgpuCommandEncoderBeginRenderPass",
+      "wgpuCommandEncoderFinish",
+      "wgpuCommandEncoderRelease",
+      "wgpuDeviceCreateCommandEncoder",
+      "wgpuQueueSubmit",
+      "wgpuQueueWriteBuffer",
+      "wgpuRenderPassEncoderDraw",
+      "wgpuRenderPassEncoderEnd",
+      "wgpuRenderPassEncoderRelease",
+      "wgpuRenderPassEncoderSetBindGroup",
+      "wgpuRenderPassEncoderSetPipeline"
+    ],
+    "wrapper_allocator_edges_observed": 0,
+    "finding": "Across all 15 Silk profiles, every positive-Ir edge leaving Silk code reaches wgpu* or bench_begin. No Silk allocator path is observed in these hot-loop regions; this is not a claim about setup or all API methods.",
+    "backend_examples": [
+      "draws/binds: wgpuQueueSubmit -> Dawn Vulkan command submission -> libvulkan_lvp.so -> allocator trampoline -> libc malloc",
+      "render workloads: Dawn CommandAllocator::AppendNewBlock -> C++ operator new -> libc malloc",
+      "all workloads: Dawn ExecutionQueueBase::TrackSerialTask -> C++ operator new -> libc malloc"
+    ],
+    "label_difference": "Silk render profiles additionally contain Dawn ApiObjectBase::ApiObjectBase -> SetLabel -> operator new: 288 inclusive Ir per three measured frames (96/frame) at the operator-new edge, versus no positive-Ir SetLabel entry in C. This is backend label handling for per-frame resource creation, not a wrapper allocator call or per-draw/write/bind allocation.",
+    "representative_profiles": [
+      {
+        "workload": "draws",
+        "repeat": 0,
+        "total_Ir_in_three_frames": {
+          "c": {
+            "malloc": 5632011,
+            "operator_new_inclusive": 4272
+          },
+          "silk": {
+            "malloc": 5620649,
+            "operator_new_inclusive": 4560
+          }
+        }
+      },
+      {
+        "workload": "writes",
+        "repeat": 0,
+        "total_Ir_in_three_frames": {
+          "c": {
+            "operator_new_inclusive": 696,
+            "malloc": 516
+          },
+          "silk": {
+            "operator_new_inclusive": 696,
+            "malloc": 516
+          }
+        }
+      },
+      {
+        "workload": "binds",
+        "repeat": 0,
+        "total_Ir_in_three_frames": {
+          "c": {
+            "malloc": 22093043,
+            "operator_new_inclusive": 5502
+          },
+          "silk": {
+            "malloc": 22096821,
+            "operator_new_inclusive": 5790
+          }
+        }
+      },
+      {
+        "workload": "rects10k",
+        "repeat": 0,
+        "total_Ir_in_three_frames": {
+          "c": {
+            "malloc": 4416,
+            "operator_new_inclusive": 3696
+          },
+          "silk": {
+            "malloc": 4596,
+            "operator_new_inclusive": 3984
+          }
+        }
+      },
+      {
+        "workload": "rects100k",
+        "repeat": 0,
+        "total_Ir_in_three_frames": {
+          "c": {
+            "malloc": 4416,
+            "operator_new_inclusive": 3696
+          },
+          "silk": {
+            "malloc": 4596,
+            "operator_new_inclusive": 3984
+          }
+        }
+      }
+    ]
+  },
+  "interpretation": "Measured aggregate overhead ranges from 0.789% to 3.221% (geomean 1.833%), within a few percent of C. These are whole marked-region totals, not isolated descriptor-layout conversion costs. Identical rects10k/100k CPU counts reflect one instanced draw each; worker GPU rasterization is excluded."
+}

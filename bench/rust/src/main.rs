@@ -64,7 +64,7 @@ async fn run() {
             for _ in 0..n { queue.write_buffer(&writes,0,&bytes); }
             queue.submit([]);
         } else {
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("") });
             {
                 let mut pass = encoder.begin_render_pass(&pass_desc);
                 pass.set_pipeline(&pipeline); pass.set_bind_group(0,&groups[0],&[]);
