@@ -1,22 +1,21 @@
-//! Flattens a path into device-space line segments for filling.
-//!
-//! Control points are transformed first (affine maps preserve Béziers), then each curve is split
-//! uniformly into the segment count from Wang's formula, which bounds the distance between the
-//! curve and its polyline by `tolerance` device pixels. Every subpath is closed implicitly, as
-//! filling requires. Segments with a non-finite endpoint or no vertical extent are dropped: they
-//! add no area.
+//! Bounded device-space polylines for affine paths, including exact ellipses.
+//! Half the tolerance covers geometric subdivision; half covers f32 storage.
+//! Invalid geometry or an unattainable tolerance fails explicitly. On failure,
+//! appended output may be partial and must not be rasterized.
 import silk.core.ownership { Copy }
 import silk.collections.list { List }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.f32
 import silk.num.f64
 import silk.num.u32
-import geometry { Point, Affine }
-import path { Path, MOVE, LINE, QUAD, CUBIC, CLOSE }
+import geometry { Point, Affine, Rect }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import path { Path, MOVE, LINE, QUAD, CUBIC, CLOSE, ARC }
+import silk.option { Option }
 
-/// The default fill tolerance in device pixels, as in tiny-skia and vello.
 pub const TOLERANCE: f64 = 0.25
-const MAX_SEGMENTS: f64 = 1024.0
+
+const MAX_SEGMENTS: f64 = 1048576.0
 
 pub struct Line {
   pub x0: f32,
@@ -24,35 +23,264 @@ pub struct Line {
   pub x1: f32,
   pub y1: f32,
 }
+
 impl Copy for Line {}
 
-fn length(x: f64, y: f64) -> f64 { return f64.sqrt(x * x + y * y) }
+fn length(x: f64, y: f64) -> f64 {
+  let scale = f64.max(f64.abs(x), f64.abs(y))
+  if scale == 0.0 {
+    return 0.0
+  }
+  let a = x / scale
+  let b = y / scale
+  return scale * f64.sqrt(a * a + b * b)
+}
 
-/// Wang's formula: `n = ceil(sqrt(degree * (degree - 1) / 8 * M / tolerance))`, where `M` is the
-/// largest second difference of the control points. `factor` is `degree * (degree - 1) / 8`.
-pub fn segments(m: f64, factor: f64, tolerance: f64) -> u32 {
-  let n = f64.ceil(f64.sqrt(factor * m / tolerance))
-  if !(n >= 1.0) { return 1 }
-  if n > MAX_SEGMENTS { return 1024 }
-  return f64.toU32(n)
+effect fn count(n: f64) -> u32
+  ! GeometryError {
+  if !f64.isFinite(n) || n > MAX_SEGMENTS {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  return if n < 1.0 {
+    1
+  } else {
+    f64.toU32(f64.ceil(n))
+  }
+}
+
+/// Wang's formula, with a typed failure rather than silently capping refinement.
+pub effect fn segments(m: f64, factor: f64, tolerance: f64) -> u32
+  ! GeometryError {
+  if !f64.isFinite(tolerance) || tolerance <= 0.0 || !f64.isFinite(factor) || factor <= 0.0
+    || m < 0.0 {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  if !f64.isFinite(m) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  return run count(f64.sqrt(m) * f64.sqrt(factor) / f64.sqrt(tolerance))
 }
 
 struct Emitter {
   start: Point,
-  current: Point,
+  current: Point
 }
 
-effect fn emit(lines: &mut List<Line>, from: Point, to: Point) -> () ! OutOfMemoryError ? &mut Allocator {
-  if !from.isFinite() || !to.isFinite() { return }
-  let line = Line { x0: f64.toF32(from.x), y0: f64.toF32(from.y), x1: f64.toF32(to.x), y1: f64.toF32(to.y) }
-  if line.y0 == line.y1 { return }
-  if !f32.isFinite(line.x0) || !f32.isFinite(line.y0) || !f32.isFinite(line.x1) || !f32.isFinite(line.y1) { return }
-  run lines.append(line)
+effect fn store(lines: &mut List<Line>, from: Point, to: Point, rounding: f64) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if !from.isFinite() || !to.isFinite() {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if from.y == to.y {
+    return
+  }
+  let line = Line {
+    x0: f64.toF32(from.x),
+    y0: f64.toF32(from.y),
+    x1: f64.toF32(to.x),
+    y1: f64.toF32(to.y),
+  }
+  if !f32.isFinite(line.x0) || !f32.isFinite(line.y0) || !f32.isFinite(line.x1)
+    || !f32.isFinite(line.y1) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if length(from.x - f32.toF64(line.x0), from.y - f32.toF64(line.y0)) > rounding
+    || length(to.x - f32.toF64(line.x1), to.y - f32.toF64(line.y1)) > rounding {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  if line.y0 != line.y1 {
+    run lines.append(line)
+  }
 }
 
-/// Appends the closed polyline of every subpath of `path`, transformed by `transform`, to `lines`.
+// Intersections are evaluated from the original edge, not successively rounded
+// clipped edges. Scale the independent coordinate before forming its difference.
+// Constant dependent coordinates are exact; otherwise certify cancellation and
+// interpolation error instead of manufacturing precision near enormous endpoints.
+effect fn crossing(from: Point, to: Point, edge: f64, vertical: bool, budget: f64) -> Point
+  ! GeometryError {
+  let a = if vertical {
+    from.x
+  } else {
+    from.y
+  }
+  let b = if vertical {
+    to.x
+  } else {
+    to.y
+  }
+  let u = if vertical {
+    from.y
+  } else {
+    from.x
+  }
+  let v = if vertical {
+    to.y
+  } else {
+    to.x
+  }
+  let mut value = u
+  if u != v {
+    let scale = f64.max(f64.abs(a), f64.abs(b))
+    let denominator = b / scale - a / scale
+    if denominator == 0.0 {
+      fail GeometryError { code: ACCURACY_LIMIT }
+    }
+    let error = f64.max(f64.abs(u), f64.abs(v)) * 2.220446049250313e-16
+      * (16.0 / f64.abs(denominator) + 8.0)
+    if !f64.isFinite(error) || error > budget {
+      fail GeometryError { code: ACCURACY_LIMIT }
+    }
+    let t = f64.max(0.0, f64.min(1.0, (edge / scale - a / scale) / denominator))
+    value = u * (1.0 - t) + v * t
+    if !f64.isFinite(value) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+  }
+  return if vertical {
+    Point.make(edge, value)
+  } else {
+    Point.make(value, edge)
+  }
+}
+
+fn clamped(point: Point, clip: &Rect) -> Point {
+  return Point.make(
+    f64.max(clip.x0, f64.min(clip.x1, point.x)),
+    f64.max(clip.y0, f64.min(clip.y1, point.y)),
+  )
+}
+
+effect fn emit(
+  lines: &mut List<Line>,
+  from: Point,
+  to: Point,
+  rounding: f64,
+  clip: &Option<Rect>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if !from.isFinite() || !to.isFinite() {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if from.y == to.y {
+    return
+  }
+  let box = match &clip.* {
+    Option<Rect>.Some { value } => value
+    _ => {
+      run store(&mut lines.*, from, to, rounding)
+      return
+    }
+  }
+  if from.x >= box.x0 && from.x <= box.x1 && to.x >= box.x0 && to.x <= box.x1 && from.y >= box.y0
+    && from.y <= box.y1
+    && to.y >= box.y0
+    && to.y <= box.y1 {
+    run store(&mut lines.*, from, to, rounding)
+    return
+  }
+
+  // Horizontal closure edges have zero signed coverage. Vertical closure edges
+  // must remain: dropping wholly left/right edges would change fill winding.
+  if (from.y <= box.y0 && to.y <= box.y0) || (from.y >= box.y1 && to.y >= box.y1) {
+    return
+  }
+  let mut first = from
+  let mut last = to
+  if first.y < box.y0 {
+    first = run crossing(from, to, box.y0, false, rounding * 0.25)
+  } else if first.y > box.y1 {
+    first = run crossing(from, to, box.y1, false, rounding * 0.25)
+  }
+  if last.y < box.y0 {
+    last = run crossing(from, to, box.y0, false, rounding * 0.25)
+  } else if last.y > box.y1 {
+    last = run crossing(from, to, box.y1, false, rounding * 0.25)
+  }
+  let increasing = first.x < last.x
+  let mut previous = clamped(first, &box)
+  let boundaries = if increasing {
+    [box.x0, box.x1]
+  } else {
+    [box.x1, box.x0]
+  }
+  let mut i: usize = 0
+  while i < 2 {
+    let edge = boundaries[i]
+    if (first.x < edge && edge < last.x) || (last.x < edge && edge < first.x) {
+      let next = clamped(run crossing(from, to, edge, true, rounding * 0.25), &box)
+      run store(&mut lines.*, previous, next, rounding * 0.5)
+      previous = next
+    }
+    i = i + 1
+  }
+  run store(&mut lines.*, previous, clamped(last, &box), rounding * 0.5)
+}
+
+fn axis(transform: &Affine, value: Point) -> Point {
+  return Point.make(
+    transform.a * value.x + transform.c * value.y,
+    transform.b * value.x + transform.d * value.y,
+  )
+}
+
+fn ellipse(center: Point, x: Point, y: Point, angle: f64) -> Point {
+  let c = f64.cos(angle)
+  let s = f64.sin(angle)
+  return Point.make(center.x + x.x * c + y.x * s, center.y + x.y * c + y.y * s)
+}
+
+/// Appends implicitly closed fill subpaths. Tolerance is in device pixels and
+/// includes the conversion to the f32 line storage consumed by coverage.
 pub effect fn fill(path: &Path, transform: &Affine, tolerance: f64, lines: &mut List<Line>) -> ()
-  ! OutOfMemoryError ? &mut Allocator {
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  run fillImpl(path, transform, tolerance, &Option<Rect>.None, &mut lines.*)
+}
+
+/// Clips fill boundaries in f64 before narrowing, preserving winding at the
+/// viewport edges. Offscreen coordinates need not be representable as f32.
+pub effect fn fillClipped(
+  path: &Path,
+  transform: &Affine,
+  clip: &Rect,
+  tolerance: f64,
+  lines: &mut List<Line>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if !f64.isFinite(clip.x0) || !f64.isFinite(clip.y0) || !f64.isFinite(clip.x1)
+    || !f64.isFinite(clip.y1)
+    || clip.x0 > clip.x1
+    || clip.y0 > clip.y1 {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  run fillImpl(path, transform, tolerance, &Option<Rect>.Some { value: clip.* }, &mut lines.*)
+}
+
+effect fn fillImpl(
+  path: &Path,
+  transform: &Affine,
+  tolerance: f64,
+  clip: &Option<Rect>,
+  lines: &mut List<Line>,
+) -> ()
+  ! GeometryError | OutOfMemoryError
+  ? &mut Allocator {
+  if !f64.isFinite(tolerance) || tolerance <= 0.0 || !f64.isFinite(transform.a)
+    || !f64.isFinite(transform.b)
+    || !f64.isFinite(transform.c)
+    || !f64.isFinite(transform.d)
+    || !f64.isFinite(transform.e)
+    || !f64.isFinite(transform.f) {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let budget = tolerance * 0.5
+  if budget == 0.0 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
   let verbs = path.verbList()
   let points = path.pointList()
   let origin = transform.apply(Point.make(0.0, 0.0))
@@ -62,34 +290,36 @@ pub effect fn fill(path: &Path, transform: &Affine, tolerance: f64, lines: &mut 
   while i < verbs.length {
     let verb = verbs[i]
     if verb == MOVE {
-      run emit(&mut lines, state.current, state.start)
+      run emit(&mut lines, state.current, state.start, budget, clip)
       let to = transform.apply(points[p])
       state.start = to
       state.current = to
       p = p + 1
     } else if verb == LINE {
       let to = transform.apply(points[p])
-      run emit(&mut lines, state.current, to)
+      run emit(&mut lines, state.current, to, budget, clip)
       state.current = to
       p = p + 1
     } else if verb == QUAD {
       let p0 = state.current
       let p1 = transform.apply(points[p])
       let p2 = transform.apply(points[p + 1])
-      let m = length(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y)
-      let n = segments(m, 0.25, tolerance)
+      let m = length((p0.x * 0.5 - p1.x + p2.x * 0.5) * 2.0, (p0.y * 0.5 - p1.y + p2.y * 0.5) * 2.0)
+      let n = run segments(m, 0.25, budget)
       let step = 1.0 / u32.toF64(n)
       let mut previous = p0
       let mut k: u32 = 1
       while k < n {
         let t = u32.toF64(k) * step
         let u = 1.0 - t
-        let next = Point.make(u * u * p0.x + 2.0 * u * t * p1.x + t * t * p2.x, u * u * p0.y + 2.0 * u * t * p1.y + t * t * p2.y)
-        run emit(&mut lines, previous, next)
+        let a = Point.make(u * p0.x + t * p1.x, u * p0.y + t * p1.y)
+        let b = Point.make(u * p1.x + t * p2.x, u * p1.y + t * p2.y)
+        let next = Point.make(u * a.x + t * b.x, u * a.y + t * b.y)
+        run emit(&mut lines, previous, next, budget, clip)
         previous = next
         k = k + 1
       }
-      run emit(&mut lines, previous, p2)
+      run emit(&mut lines, previous, p2, budget, clip)
       state.current = p2
       p = p + 2
     } else if verb == CUBIC {
@@ -98,32 +328,90 @@ pub effect fn fill(path: &Path, transform: &Affine, tolerance: f64, lines: &mut 
       let p2 = transform.apply(points[p + 1])
       let p3 = transform.apply(points[p + 2])
       let m = f64.max(
-        length(p0.x - 2.0 * p1.x + p2.x, p0.y - 2.0 * p1.y + p2.y),
-        length(p1.x - 2.0 * p2.x + p3.x, p1.y - 2.0 * p2.y + p3.y))
-      let n = segments(m, 0.75, tolerance)
+        length((p0.x * 0.5 - p1.x + p2.x * 0.5) * 2.0, (p0.y * 0.5 - p1.y + p2.y * 0.5) * 2.0),
+        length((p1.x * 0.5 - p2.x + p3.x * 0.5) * 2.0, (p1.y * 0.5 - p2.y + p3.y * 0.5) * 2.0),
+      )
+      let n = run segments(m, 0.75, budget)
       let step = 1.0 / u32.toF64(n)
       let mut previous = p0
       let mut k: u32 = 1
       while k < n {
         let t = u32.toF64(k) * step
         let u = 1.0 - t
-        let a = u * u * u
-        let b = 3.0 * u * u * t
-        let c = 3.0 * u * t * t
-        let d = t * t * t
-        let next = Point.make(a * p0.x + b * p1.x + c * p2.x + d * p3.x, a * p0.y + b * p1.y + c * p2.y + d * p3.y)
-        run emit(&mut lines, previous, next)
+        let a = Point.make(u * p0.x + t * p1.x, u * p0.y + t * p1.y)
+        let b = Point.make(u * p1.x + t * p2.x, u * p1.y + t * p2.y)
+        let c = Point.make(u * p2.x + t * p3.x, u * p2.y + t * p3.y)
+        let d = Point.make(u * a.x + t * b.x, u * a.y + t * b.y)
+        let e = Point.make(u * b.x + t * c.x, u * b.y + t * c.y)
+        let next = Point.make(u * d.x + t * e.x, u * d.y + t * e.y)
+        run emit(&mut lines, previous, next, budget, clip)
         previous = next
         k = k + 1
       }
-      run emit(&mut lines, previous, p3)
+      run emit(&mut lines, previous, p3, budget, clip)
       state.current = p3
       p = p + 3
+    } else if verb == ARC {
+      let center = transform.apply(points[p])
+      let basisX = axis(transform, points[p + 1])
+      let basisY = axis(transform, points[p + 2])
+      let angles = points[p + 3]
+      let end = transform.apply(points[p + 4])
+      if !angles.isFinite() {
+        fail GeometryError { code: INVALID_INPUT }
+      }
+
+      // Rotate the basis once instead of adding a small sweep to a huge start
+      // angle at each sample, which could round every sample to the same angle.
+      let c = f64.cos(angles.x)
+      let s = f64.sin(angles.x)
+      let x = Point.make(basisX.x * c + basisY.x * s, basisX.y * c + basisY.y * s)
+      let y = Point.make(-basisX.x * s + basisY.x * c, -basisX.y * s + basisY.y * c)
+      if !center.isFinite() || !x.isFinite() || !y.isFinite() || !end.isFinite() {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      let radius = length(length(x.x, x.y), length(y.x, y.y))
+      if !f64.isFinite(radius) {
+        fail GeometryError { code: NUMERIC_LIMIT }
+      }
+      let analyticStart = Point.make(center.x + x.x, center.y + x.y)
+      let analyticEnd = ellipse(center, x, y, angles.y)
+      let anchorError = f64.max(
+        length(state.current.x - analyticStart.x, state.current.y - analyticStart.y),
+        length(end.x - analyticEnd.x, end.y - analyticEnd.y),
+      )
+      let available = budget - anchorError
+      if !(available > 0.0) {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+
+      // max |P''(theta)| <= Frobenius norm of the ellipse basis. Linear
+      // interpolation error <= max |P''| * deltaTheta^2 / 8.
+      let n = run count(
+        f64.abs(angles.y) * (f64.sqrt(radius) / f64.sqrt(available)) * 0.3535533905932738,
+      )
+      let mut previous = state.current
+      let mut k: u32 = 1
+      while k <= n {
+        let angle = angles.y * (u32.toF64(k) / u32.toF64(n))
+        let next = if k == n {
+          end
+        } else {
+          ellipse(center, x, y, angle)
+        }
+        run emit(&mut lines, previous, next, budget, clip)
+        previous = next
+        k = k + 1
+      }
+      state.current = previous
+      p = p + 5
     } else if verb == CLOSE {
-      run emit(&mut lines, state.current, state.start)
+      run emit(&mut lines, state.current, state.start, budget, clip)
       state.current = state.start
+    } else {
+      fail GeometryError { code: INVALID_INPUT }
     }
     i = i + 1
   }
-  run emit(&mut lines, state.current, state.start)
+  run emit(&mut lines, state.current, state.start, budget, clip)
 }

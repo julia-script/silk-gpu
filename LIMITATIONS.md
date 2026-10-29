@@ -55,6 +55,13 @@ All reproductions below use the published **0.1.0-dev.27+323ceb59e7ee** compiler
 - Workaround: `vector/src/strips.silk` uses select-based `minF32`/`maxF32`; its lines are always finite, so the values are the same. Measured with the faster float-to-u32 conversions in the same change: on the icons benchmark `Rasterizer.fill` went from 1.42 G to 1.25 G Ir and `pushClipped` from 131 M to 68 M, with byte-identical output.
 - Site: `vector/src/strips.silk`.
 
+## LIMITATION-8 — Portable inverse tangent missing
+
+- Report: [silk-lang/silk#2539](https://github.com/silk-lang/silk/issues/2539).
+- Observed: `f64.atan2(y, x)` fails with SEM0014 on dev.27. Curvature-based circular-bisector stroke clipping requires its signed angle.
+- Workaround: a range-reduced alternating series with 24 terms, private to `vector/src/stroke_arcs.silk`; no libc dependency or compiler/stdlib patch.
+- Verification: all curvature-join regression cases pass, including asymmetric circles, mixed line/circle joins and circular-bisector arclength clipping. Instruction cost has not yet been measured.
+
 ## Browser callback ABI
 
 The browser backend uses explicit callback tokens and exported completion functions rather than assuming access to an exported wasm function table. This is an ABI design, **not** a demonstrated compiler limitation: a minimal native-function-pointer invocation compiled successfully to wasm32 on dev.27.

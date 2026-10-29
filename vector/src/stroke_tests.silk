@@ -1,21 +1,38 @@
 import silk.testing.testing { AssertionError, Testing }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
+import silk.core.result { Result }
 import silk.num.f64
 import silk.num.u8
 import silk.num.u32
-import geometry { Affine, Rect }
+import silk.num.usize
+import geometry { Affine, Point, Rect }
 import path { Path }
 import strips { Rasterizer, Coverage, NONZERO }
-import stroke { Stroke, Stroker, JOIN_MITER, JOIN_MITER_CLIP, JOIN_ROUND, JOIN_BEVEL, JOIN_ARCS, CAP_BUTT, CAP_ROUND, CAP_SQUARE }
+import stroke {
+  Stroke,
+  Stroker,
+  JOIN_MITER,
+  JOIN_MITER_CLIP,
+  JOIN_ROUND,
+  JOIN_BEVEL,
+  JOIN_ARCS,
+  CAP_BUTT,
+  CAP_ROUND,
+  CAP_SQUARE
+}
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import flatten { TOLERANCE }
 
 const PI: f64 = 3.141592653589793
 
 /// Strokes `path` and returns the covered area in device pixels on a 64 x 64 canvas.
-pub effect fn strokedArea(path: &Path, style: &Stroke, transform: &Affine) -> f64 ! OutOfMemoryError ? &mut Allocator {
+pub effect fn strokedArea(path: &Path, style: &Stroke, transform: &Affine) -> f64
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut stroker = Stroker.make()
   let mut outline = Path.make()
-  run stroker.stroke(path, style, transform, &mut outline)
+  run stroker.stroke(path, style, transform, TOLERANCE, &mut outline)
   let mut raster = Rasterizer.make()
   let mut coverage = Coverage.make(64, 64)
   run raster.fill(&outline, transform, NONZERO, &mut coverage)
@@ -47,7 +64,8 @@ pub effect fn square() -> Path ! OutOfMemoryError ? &mut Allocator {
   return move p
 }
 
-test effect fn capsExtendOpenLines() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn capsExtendOpenLines() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run line() |> Effect.provideMut<Allocator>(&mut allocator)
   let mut style = Stroke.make(4.0)
@@ -61,7 +79,8 @@ test effect fn capsExtendOpenLines() -> () ! AssertionError<'static> | OutOfMemo
   run Testing.expect(near(round, 80.0 + 4.0 * PI, 0.05), "round: 20 x 4 + circle")
 }
 
-test effect fn joinsShapeClosedCorners() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn joinsShapeClosedCorners() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run square() |> Effect.provideMut<Allocator>(&mut allocator)
   let mut style = Stroke.make(2.0)
@@ -75,7 +94,8 @@ test effect fn joinsShapeClosedCorners() -> () ! AssertionError<'static> | OutOf
   run Testing.expect(near(round, 160.0 - 4.0 + PI, 0.02), "round corners")
 }
 
-test effect fn miterLimitFallsBack() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn miterLimitFallsBack() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run square() |> Effect.provideMut<Allocator>(&mut allocator)
   let mut style = Stroke.make(2.0)
@@ -94,7 +114,8 @@ test effect fn miterLimitFallsBack() -> () ! AssertionError<'static> | OutOfMemo
   run Testing.expect(near(arcs, clipped, 0.0001), "arcs on straight segments match miter-clip")
 }
 
-test effect fn dashesCutTheCenterline() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn dashesCutTheCenterline() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run line() |> Effect.provideMut<Allocator>(&mut allocator)
   let mut style = Stroke.make(2.0)
@@ -116,7 +137,8 @@ test effect fn dashesCutTheCenterline() -> () ! AssertionError<'static> | OutOfM
   run Testing.expect(near(solid, 40.0, 0.01), "all-zero list is solid")
 }
 
-test effect fn zeroLengthSubpathsDrawDots() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn zeroLengthSubpathsDrawDots() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.moveTo(20.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -132,7 +154,8 @@ test effect fn zeroLengthSubpathsDrawDots() -> () ! AssertionError<'static> | Ou
   run Testing.expect(near(round, 9.0 * PI, 0.05), "round dot")
 }
 
-test effect fn curvesAndTransformsStayAccurate() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn curvesAndTransformsStayAccurate() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.circle(16.0, 16.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -144,7 +167,8 @@ test effect fn curvesAndTransformsStayAccurate() -> () ! AssertionError<'static>
   run Testing.expect(f64.abs(scaled - 4.0 * expected) / (4.0 * expected) < 0.01, "scaled ring area")
 }
 
-test effect fn sharpTurnsKeepInnerJoinsFilled() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn sharpTurnsKeepInnerJoinsFilled() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   // A path that doubles back on itself covers one stroke's area, not zero.
   let mut p = Path.make()
@@ -157,7 +181,8 @@ test effect fn sharpTurnsKeepInnerJoinsFilled() -> () ! AssertionError<'static> 
   run Testing.expect(near(area, 40.0, 0.01), "doubled-back line")
 }
 
-test effect fn innerJoinsOfPolygonsAreExact() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn innerJoinsOfPolygonsAreExact() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   // A regular 16-gon: the miter ring's exact area is 2 * perimeter * half-width.
   let mut p = Path.make()
@@ -171,4 +196,318 @@ test effect fn innerJoinsOfPolygonsAreExact() -> () ! AssertionError<'static> | 
   run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
   let area = run strokedArea(&p, &Stroke.make(2.0), &Affine.identity()) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(near(area, 2.0 * 2.0 * 16.0 * 10.0 * f64.sin(PI / 16.0), 0.1), "16-gon ring")
+}
+
+fn hasPoint(path: &Path, x: f64, y: f64) -> bool {
+  let points = path.pointList()
+  let mut i: usize = 0
+  while i < points.length {
+    if near(points[i].x, x, 0.000000001) && near(points[i].y, y, 0.000000001) {
+      return true
+    }
+    i = i + 1
+  }
+  return false
+}
+
+// These probes use a single closed, polygonal outline, including its closing edge.
+fn distanceToOutline(path: &Path, x: f64, y: f64) -> f64 {
+  let points = path.pointList()
+  let mut distance: f64 = 1000000000.0
+  let mut i: usize = 0
+  while i < points.length {
+    let a = points[i]
+    let b = points[(i + 1) % points.length]
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let length2 = dx * dx + dy * dy
+    let t = if length2 > 0.0 {
+      f64.max(0.0, f64.min(1.0, ((x - a.x) * dx + (y - a.y) * dy) / length2))
+    } else {
+      0.0
+    }
+    let ex = x - a.x - t * dx
+    let ey = y - a.y - t * dy
+    distance = f64.min(distance, f64.sqrt(ex * ex + ey * ey))
+    i = i + 1
+  }
+  return distance
+}
+
+effect fn expectGeometryError<T>(
+  result: &Result<T, OutOfMemoryError | GeometryError>,
+  code: u8,
+) -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  match &result.* {
+    Result<T, OutOfMemoryError | GeometryError>.Success { value } => {
+      run Testing.expect(false, "geometry request must fail explicitly")
+    }
+    Result<T, OutOfMemoryError | GeometryError>.Failure { error } => {
+      match &error {
+        GeometryError rejected => {
+          run Testing.expect(rejected.code == code, "geometry error category")
+        }
+        OutOfMemoryError allocation => {
+          fail OutOfMemoryError {}
+        }
+      }
+    }
+  }
+}
+
+// SVG 2 painting #LineCaps: cap orientation follows the source endpoint tangent,
+// not the first/last flattening chord. See docs/scene-renderer.md, Stroke.
+test effect fn wideCurveCapsUseExactSourceTangents() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.cubicTo(0.0, 30.0, 40.0, 30.0, 40.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(20.0)
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  run stroker.stroke(&p, &style, &Affine.identity(), 0.1, &mut outline)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    hasPoint(&outline, -10.0, 0.0) && hasPoint(&outline, 10.0, 0.0),
+    "start butt cap uses vertical source tangent",
+  )
+  run Testing.expect(
+    hasPoint(&outline, 30.0, 0.0) && hasPoint(&outline, 50.0, 0.0),
+    "end butt cap uses vertical source tangent",
+  )
+  style.cap = CAP_SQUARE
+  run stroker.stroke(&p, &style, &Affine.identity(), 0.1, &mut outline)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    hasPoint(&outline, -10.0, -10.0) && hasPoint(&outline, 10.0, -10.0),
+    "start square cap extends against source tangent",
+  )
+  run Testing.expect(
+    hasPoint(&outline, 30.0, -10.0) && hasPoint(&outline, 50.0, -10.0),
+    "end square cap extends along source tangent",
+  )
+}
+
+// SVG 2 coords #BoundingBoxes: stroke bounds are measured after transforming
+// the stroke, without dashes when requested; mapping its source AABB is not tight.
+test effect fn undashedBoundsTransformOutlineRatherThanRectangle() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(10.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(2.0)
+  run style.setDashes(&[2.0, 100.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let transform = Affine.rotate(0.0 - PI / 4.0)
+  let mut stroker = Stroker.make()
+  let full = run stroker.bounds(&p, &style, &transform, 0.01, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let dashed = run stroker.bounds(&p, &style, &transform, 0.01, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(!full.empty && !dashed.empty, "both stroke bounds are nonempty")
+  run Testing.expect(
+    near(full.bounds.x0, 0.0, 0.01) && near(full.bounds.x1, 10.0 * f64.sqrt(2.0), 0.01),
+    "undashed source endpoints survive transform",
+  )
+  run Testing.expect(
+    near(full.bounds.y0, -1.0, 0.01) && near(full.bounds.y1, 1.0, 0.01),
+    "rotated stroke is two units high, not its mapped source box",
+  )
+  run Testing.expect(near(dashed.bounds.x1, 2.0, 0.01), "ignoreDashes false retains dash cuts")
+}
+
+// docs/scene-renderer.md, Stroke: tolerance bounds the expanded outline in target
+// coordinates. A 0.05-high centerline is not flat enough for a 20000-wide pen.
+test effect fn lowCurvatureWideStrokeResolvesOffsetError() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(5.0, 0.1, 10.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  run stroker.stroke(&p, &Stroke.make(20000.0), &Affine.identity(), 0.1, &mut outline)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut i: u32 = 0
+  while i <= 16 {
+    let t = u32.toF64(i) / 16.0
+    let dy = 0.2 * (1.0 - 2.0 * t)
+    let length = f64.sqrt(100.0 + dy * dy)
+    let x = 10.0 * t - 10000.0 * dy / length
+    let y = 0.2 * t * (1.0 - t) + 100000.0 / length
+    run Testing.expect(
+      distanceToOutline(&outline, x, y) <= 0.1,
+      "analytic outer offset stays within target tolerance",
+    )
+    i = i + 1
+  }
+}
+
+// docs/scene-renderer.md, Stroke: positive finite target tolerance is mandatory,
+// even when the input path is empty. Bounds and stroke share this validation.
+test effect fn strokeToleranceMustBePositiveAndFinite() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = Path.make()
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  let tolerances = [0.0, -0.1, 1.0 / 0.0, 0.0 / 0.0]
+  let mut i: usize = 0
+  while i < tolerances.length {
+    let stroked = run Effect.result(
+      stroker.stroke(&p, &Stroke.make(2.0), &Affine.identity(), tolerances[i], &mut outline),
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run expectGeometryError(&stroked, INVALID_INPUT)
+    let bounded = run Effect.result(
+      stroker.bounds(&p, &Stroke.make(2.0), &Affine.identity(), tolerances[i], true),
+    )
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    run expectGeometryError(&bounded, INVALID_INPUT)
+    i = i + 1
+  }
+}
+
+// docs/scene-renderer.md, Stroke: scaling the singular-value calculation avoids
+// squaring huge finite matrix entries; actual transformed overflow is distinct.
+test effect fn normalizedTransformScaleDoesNotInventNumericOverflow() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  let huge: f64 = 1.0e200
+  let finite = Affine { a: huge, b: huge, c: huge, d: 0.0 - huge, e: 0.0, f: 0.0 }
+  run stroker.stroke(&p, &Stroke.make(2.0), &finite, 1.0e190, &mut outline)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let bounds = run stroker.bounds(&p, &Stroke.make(2.0), &finite, 1.0e190, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !outline.isEmpty() && !bounds.empty,
+    "finite enormous transformed line remains representable",
+  )
+  run Testing.expect(
+    f64.isFinite(bounds.bounds.x0) && f64.isFinite(bounds.bounds.x1)
+      && f64.isFinite(bounds.bounds.y0)
+      && f64.isFinite(bounds.bounds.y1),
+    "normalized singular value retains finite bounds",
+  )
+  let overflow = run Effect.result(
+    stroker.stroke(&p, &Stroke.make(4.0), &Affine.scale(1.0e308, 1.0e308), 1.0e300, &mut outline),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectGeometryError(&overflow, NUMERIC_LIMIT)
+  let overflowBounds = run Effect.result(
+    stroker.bounds(&p, &Stroke.make(4.0), &Affine.scale(1.0e308, 1.0e308), 1.0e300, true),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectGeometryError(&overflowBounds, NUMERIC_LIMIT)
+
+  // Normalization cannot recover precision below one target-coordinate ULP.
+  let precision = run Effect.result(
+    stroker.stroke(&p, &Stroke.make(2.0), &finite, 0.1, &mut outline),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectGeometryError(&precision, ACCURACY_LIMIT)
+  let precisionBounds = run Effect.result(stroker.bounds(&p, &Stroke.make(2.0), &finite, 0.1, true))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectGeometryError(&precisionBounds, ACCURACY_LIMIT)
+}
+
+// docs/scene-renderer.md, Stroke: never silently clamp subdivision to a budget.
+test effect fn unachievableStrokeToleranceReportsAccuracyLimit() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(0.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.quadTo(10.0, 20.0, 20.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let mut outline = Path.make()
+  let result = run Effect.result(
+    stroker.stroke(&p, &Stroke.make(4.0), &Affine.identity(), 1.0e-30, &mut outline),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run expectGeometryError(&result, ACCURACY_LIMIT)
+}
+
+// SVG 2 painting #LineCaps: zero-length curves retain subpath cap semantics.
+test effect fn zeroLengthCurvesHaveCapBounds() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(20.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.cubicTo(20.0, 20.0, 20.0, 20.0, 20.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(6.0)
+  let mut stroker = Stroker.make()
+  let butt = run stroker.bounds(&p, &style, &Affine.identity(), 0.01, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(butt.empty, "zero-length butt curve has no stroke bounds")
+  style.cap = CAP_SQUARE
+  let square = run stroker.bounds(&p, &style, &Affine.identity(), 0.01, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !square.empty && near(square.bounds.x0, 17.0, 0.01) && near(square.bounds.x1, 23.0, 0.01)
+      && near(square.bounds.y0, 17.0, 0.01)
+      && near(square.bounds.y1, 23.0, 0.01),
+    "zero-length square cap bounds",
+  )
+  style.cap = CAP_ROUND
+  let round = run stroker.bounds(&p, &style, &Affine.identity(), 0.01, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !round.empty && near(round.bounds.x0, 17.0, 0.01) && near(round.bounds.x1, 23.0, 0.01)
+      && near(round.bounds.y0, 17.0, 0.01)
+      && near(round.bounds.y1, 23.0, 0.01),
+    "zero-length round cap bounds",
+  )
+}
+
+// SVG 2 #StrokeDashing: zero-length on intervals retain their cap geometry.
+test effect fn zeroDashAtSubpathStartIsNotDiscarded() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let p = run line() |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut style = Stroke.make(4.0)
+  run style.setDashes(&[0.0, 100.0]) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let butt = run stroker.bounds(&p, &style, &Affine.identity(), 0.01, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(butt.empty, "zero-length butt dash is empty")
+  style.cap = CAP_ROUND
+  let round = run stroker.bounds(&p, &style, &Affine.identity(), 0.01, false)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !round.empty && near(round.bounds.x0, 8.0, 0.01) && near(round.bounds.x1, 12.0, 0.01),
+    "initial zero-length round dash is a dot",
+  )
+}
+
+// SVG 2 paths #PathDataClosePathCommand: subsequent drawing resumes at the closed start.
+test effect fn ellipseAfterCloseStartsANewSubpath() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut p = Path.make()
+  run p.moveTo(1.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.lineTo(9.0, 0.0) |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.close() |> Effect.provideMut<Allocator>(&mut allocator)
+  run p.ellipseArcTo(
+    Point.make(0.0, 0.0),
+    Point.make(1.0, 0.0),
+    Point.make(0.0, 1.0),
+    0.0,
+    PI * 0.5,
+    Point.make(0.0, 1.0),
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut stroker = Stroker.make()
+  let box = run stroker.bounds(&p, &Stroke.make(0.2), &Affine.identity(), 1.0e-6, true)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    !box.empty && near(box.bounds.y1, 1.1, 2.0e-6),
+    "actual quarter ellipse survives close restart",
+  )
 }

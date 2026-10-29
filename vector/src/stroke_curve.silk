@@ -1,0 +1,334 @@
+//! Source-curve derivatives and interpolation bounds for the stroker.
+import silk.core.ownership { Copy }
+import silk.num.f64
+import geometry { Point }
+import path { LINE, QUAD, CUBIC, ARC }
+
+pub fn norm(x: f64, y: f64) -> f64 {
+  let scale = f64.max(f64.abs(x), f64.abs(y))
+  if scale == 0.0 {
+    return 0.0
+  }
+  return scale * f64.sqrt((x / scale) * (x / scale) + (y / scale) * (y / scale))
+}
+
+fn sub(a: Point, b: Point) -> Point {
+  return Point.make(a.x - b.x, a.y - b.y)
+}
+
+fn mul(a: Point, k: f64) -> Point {
+  return Point.make(a.x * k, a.y * k)
+}
+
+fn lerp(a: Point, b: Point, t: f64) -> Point {
+  return Point.make(a.x * (1.0 - t) + b.x * t, a.y * (1.0 - t) + b.y * t)
+}
+
+fn length(a: Point) -> f64 {
+  return norm(a.x, a.y)
+}
+
+fn same(a: Point, b: Point) -> bool {
+  return a.x == b.x && a.y == b.y
+}
+
+fn normalized(a: Point) -> Point {
+  let n = length(a)
+  if n == 0.0 {
+    return Point.make(1.0, 0.0)
+  }
+  return Point.make(a.x / n, a.y / n)
+}
+
+pub struct Curve {
+  pub kind: u8,
+  pub p0: Point,
+  pub p1: Point,
+  pub p2: Point,
+  pub p3: Point,
+  anchorDiscrepancy: f64,
+  pub sweep: f64,
+  pub anchorStart: Point,
+  pub anchorEnd: Point,
+}
+
+impl Copy for Curve {}
+
+impl Curve {
+  pub fn line(a: Point, b: Point) -> Curve {
+    return Curve {
+      kind: LINE,
+      p0: a,
+      p1: b,
+      p2: b,
+      p3: b,
+      anchorDiscrepancy: 0.0,
+      sweep: 0.0,
+      anchorStart: a,
+      anchorEnd: b,
+    }
+  }
+
+  pub fn quad(a: Point, b: Point, c: Point) -> Curve {
+    return Curve {
+      kind: QUAD,
+      p0: a,
+      p1: b,
+      p2: c,
+      p3: c,
+      anchorDiscrepancy: 0.0,
+      sweep: 0.0,
+      anchorStart: a,
+      anchorEnd: c,
+    }
+  }
+
+  pub fn cubic(a: Point, b: Point, c: Point, d: Point) -> Curve {
+    return Curve {
+      kind: CUBIC,
+      p0: a,
+      p1: b,
+      p2: c,
+      p3: d,
+      anchorDiscrepancy: 0.0,
+      sweep: 0.0,
+      anchorStart: a,
+      anchorEnd: d,
+    }
+  }
+
+  pub fn ellipse(
+    center: Point,
+    x: Point,
+    y: Point,
+    angle: f64,
+    sweep: f64,
+    start: Point,
+    end: Point,
+  ) -> Curve {
+    let c = f64.cos(angle)
+    let s = f64.sin(angle)
+    let axisX = Point.make(x.x * c + y.x * s, x.y * c + y.y * s)
+    let axisY = Point.make(y.x * c - x.x * s, y.y * c - x.y * s)
+    let analyticStart = Point.make(center.x + axisX.x, center.y + axisX.y)
+    let endCos = f64.cos(sweep)
+    let endSin = f64.sin(sweep)
+    let analyticEnd = Point.make(
+      center.x + axisX.x * endCos + axisY.x * endSin,
+      center.y + axisX.y * endCos + axisY.y * endSin,
+    )
+    let discrepancy = f64.max(length(sub(analyticStart, start)), length(sub(analyticEnd, end)))
+    return Curve {
+      kind: ARC,
+      p0: center,
+      p1: axisX,
+      p2: axisY,
+      p3: center,
+      anchorDiscrepancy: discrepancy,
+      sweep: sweep,
+      anchorStart: start,
+      anchorEnd: end,
+    }
+  }
+
+  pub fn anchorError(self: &Self) -> f64 {
+    return self.anchorDiscrepancy
+  }
+
+  pub fn point(self: &Self, t: f64) -> Point {
+    if self.kind == ARC {
+      if t == 0.0 {
+        return self.anchorStart
+      }
+      if t == 1.0 {
+        return self.anchorEnd
+      }
+      let angle = self.sweep * t
+      let c = f64.cos(angle)
+      let s = f64.sin(angle)
+      return Point.make(
+        self.p0.x + self.p1.x * c + self.p2.x * s,
+        self.p0.y + self.p1.y * c + self.p2.y * s,
+      )
+    }
+    if self.kind == LINE {
+      return lerp(self.p0, self.p1, t)
+    }
+    let a = lerp(self.p0, self.p1, t)
+    let b = lerp(self.p1, self.p2, t)
+    if self.kind == QUAD {
+      return lerp(a, b, t)
+    }
+    return lerp(lerp(a, b, t), lerp(b, lerp(self.p2, self.p3, t), t), t)
+  }
+
+  pub fn derivative(self: &Self, t: f64) -> Point {
+    if self.kind == ARC {
+      let angle = self.sweep * t
+      let c = f64.cos(angle)
+      let s = f64.sin(angle)
+      return Point.make(
+        (-self.p1.x * s + self.p2.x * c) * self.sweep,
+        (-self.p1.y * s + self.p2.y * c) * self.sweep,
+      )
+    }
+    let a = sub(self.p1, self.p0)
+    if self.kind == LINE {
+      return a
+    }
+    let b = sub(self.p2, self.p1)
+    if self.kind == QUAD {
+      return mul(lerp(a, b, t), 2.0)
+    }
+    return mul(lerp(lerp(a, b, t), lerp(b, sub(self.p3, self.p2), t), t), 3.0)
+  }
+
+  fn second(self: &Self, t: f64) -> Point {
+    if self.kind == ARC {
+      let angle = self.sweep * t
+      let c = f64.cos(angle)
+      let s = f64.sin(angle)
+      return Point.make(
+        (-self.p1.x * c - self.p2.x * s) * self.sweep * self.sweep,
+        (-self.p1.y * c - self.p2.y * s) * self.sweep * self.sweep,
+      )
+    }
+    if self.kind == LINE {
+      return Point.make(0.0, 0.0)
+    }
+    let a = sub(sub(self.p2, self.p1), sub(self.p1, self.p0))
+    if self.kind == QUAD {
+      return mul(a, 2.0)
+    }
+    let b = sub(sub(self.p3, self.p2), sub(self.p2, self.p1))
+    return mul(lerp(a, b, t), 6.0)
+  }
+
+  fn secondBound(self: &Self) -> f64 {
+    if self.kind == ARC {
+      return (length(self.p1) + length(self.p2)) * f64.abs(self.sweep) * f64.abs(self.sweep)
+    }
+    return f64.max(length(self.second(0.0)), length(self.second(1.0)))
+  }
+
+  fn thirdBound(self: &Self) -> f64 {
+    if self.kind == ARC {
+      return self.secondBound() * f64.abs(self.sweep)
+    }
+    return length(sub(self.second(1.0), self.second(0.0)))
+  }
+
+  // Remove endpoint scalar zeros before normalizing the derivative. This preserves limiting
+  // directions and avoids an artificial singular offset at repeated endpoint controls.
+  fn normalDerivative(self: &Self, t: f64) -> Point {
+    if self.kind == QUAD {
+      if same(self.p0, self.p1) {
+        return sub(self.p2, self.p1)
+      }
+      if same(self.p1, self.p2) {
+        return sub(self.p1, self.p0)
+      }
+    }
+    if self.kind == CUBIC {
+      if same(self.p0, self.p1) && same(self.p2, self.p3) {
+        return sub(self.p2, self.p1)
+      }
+      if same(self.p0, self.p1) {
+        if same(self.p1, self.p2) {
+          return sub(self.p3, self.p2)
+        }
+        return lerp(mul(sub(self.p2, self.p1), 2.0), sub(self.p3, self.p2), t)
+      }
+      if same(self.p2, self.p3) {
+        if same(self.p1, self.p2) {
+          return sub(self.p1, self.p0)
+        }
+        return lerp(sub(self.p1, self.p0), mul(sub(self.p2, self.p1), 2.0), t)
+      }
+    }
+    return self.derivative(t)
+  }
+
+  fn normalFirstBound(self: &Self) -> f64 {
+    if (self.kind == QUAD && (same(self.p0, self.p1) || same(self.p1, self.p2)))
+      || (self.kind == CUBIC && (same(self.p0, self.p1) || same(self.p2, self.p3))) {
+      return length(sub(self.normalDerivative(1.0), self.normalDerivative(0.0)))
+    }
+    return self.secondBound()
+  }
+
+  fn normalSecondBound(self: &Self) -> f64 {
+    if (self.kind == QUAD && (same(self.p0, self.p1) || same(self.p1, self.p2)))
+      || (self.kind == CUBIC && (same(self.p0, self.p1) || same(self.p2, self.p3))) {
+      return 0.0
+    }
+    return self.thirdBound()
+  }
+
+  pub fn tangent(self: &Self, t: f64) -> Point {
+    return normalized(self.normalDerivative(t))
+  }
+
+  pub fn curvature(self: &Self, t: f64) -> f64 {
+    let d = self.derivative(t)
+    let speed = length(d)
+
+    // SVG 2 §13.5.8 explicitly uses a line for degenerate Bézier endpoint curvature.
+    if speed == 0.0 {
+      return 0.0
+    }
+    let dd = self.second(t)
+    return ((d.x / speed) * (dd.y / speed) - (d.y / speed) * (dd.x / speed)) / speed
+  }
+
+  /// Bound on linear interpolation of both offsets over [a,b]. For N = normal(P'/|P'|),
+  /// |N''| <= |P'''|/v + 3|P''|²/v². A Lipschitz lower bound supplies v over the entire
+  /// interval, never just samples. Infinity means subdivide, not accept underresolution.
+  pub fn offsetError(self: &Self, a: f64, b: f64, half: f64) -> f64 {
+    let dt = b - a
+    let m = self.normalFirstBound()
+    let v = length(self.normalDerivative((a + b) * 0.5)) - m * dt * 0.5
+    if !(v > 0.0) {
+      if m == 0.0 {
+        return 0.0
+      }
+      return 1.0 / 0.0
+    }
+    let ratio = m / v
+    return dt * dt * 0.125
+      * (self.secondBound() + half * (self.normalSecondBound() / v + 3.0 * ratio * ratio))
+  }
+
+  /// Chord length underestimates arc length. Projecting the velocity onto the chord gives
+  /// an excess bounded by maxSpeed * (unit-tangent variation)^2 / 2 over the interval.
+  pub fn lengthError(self: &Self, a: f64, b: f64) -> f64 {
+    if self.kind == LINE {
+      return 0.0
+    }
+    let dt = b - a
+    let m = self.secondBound()
+    let speed = length(self.derivative((a + b) * 0.5))
+    let low = speed - m * dt * 0.5
+    if !(low > 0.0) {
+      return m * dt * dt
+    }
+    let variation = f64.min(2.0, 2.0 * m * dt / low)
+    return (speed + m * dt * 0.5) * dt * variation * variation * 0.5
+  }
+
+  /// Upper bound on motion of either offset per unit source arclength. It controls accumulated
+  /// dash length uncertainty as well as positional uncertainty; width cannot be omitted here.
+  pub fn offsetMetric(self: &Self, a: f64, b: f64, half: f64) -> f64 {
+    let m = self.normalFirstBound()
+    if m == 0.0 {
+      return 1.0
+    }
+    let dt = b - a
+    let normalLow = length(self.normalDerivative((a + b) * 0.5)) - m * dt * 0.5
+    let speedLow = length(self.derivative((a + b) * 0.5)) - self.secondBound() * dt * 0.5
+    if !(normalLow > 0.0) || !(speedLow > 0.0) {
+      return 1.0 / 0.0
+    }
+    return 1.0 + half * (m / normalLow) / speedLow
+  }
+}

@@ -1,3 +1,4 @@
+import ellipse_tests
 import silk.testing.testing { AssertionError, Testing }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.core.effect { Effect }
@@ -13,6 +14,7 @@ import flatten { Line }
 import flatten as flattening
 import strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import pixmap { Pixmap, Rgba8, div255 }
+import geometry_error { GeometryError }
 
 test effect fn affineThenAppliesRightFirst() -> () ! AssertionError<'static> {
   let m = Affine.translate(10.0, 0.0).then(&Affine.scale(2.0, 3.0))
@@ -38,7 +40,8 @@ test effect fn div255IsExactRounding() -> () ! AssertionError<'static> {
 }
 
 effect fn cover(path: &Path, transform: &Affine, rule: u8, width: u32, height: u32) -> Coverage
-  ! OutOfMemoryError ? &mut Allocator {
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut raster = Rasterizer.make()
   let mut coverage = Coverage.make(width, height)
   run raster.fill(path, transform, rule, &mut coverage)
@@ -65,7 +68,8 @@ effect fn rectangle(x: f64, y: f64, w: f64, h: f64) -> Path ! OutOfMemoryError ?
   return move p
 }
 
-test effect fn integerRectIsSolid() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn integerRectIsSolid() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(2.0, 1.0, 9.0, 10.0) |> Effect.provideMut<Allocator>(&mut allocator)
   let c = run cover(&p, &Affine.identity(), NONZERO, 16, 12) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -76,14 +80,16 @@ test effect fn integerRectIsSolid() -> () ! AssertionError<'static> | OutOfMemor
   run Testing.expect(totalArea(&c) == 90.0, "area 90")
 }
 
-test effect fn halfPixelEdgesAreHalfCovered() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn halfPixelEdgesAreHalfCovered() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.5, 0.0, 2.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
   let c = run cover(&p, &Affine.identity(), NONZERO, 4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(c.alphaAt(0, 0) == 128 && c.alphaAt(1, 2) == 255 && c.alphaAt(2, 3) == 128 && c.alphaAt(3, 0) == 0, "half, full, half, none")
 }
 
-test effect fn triangleAreaIsExact() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn triangleAreaIsExact() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.moveTo(1.3, 0.7) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -96,7 +102,8 @@ test effect fn triangleAreaIsExact() -> () ! AssertionError<'static> | OutOfMemo
   run Testing.expect(f64.abs(totalArea(&c) - expected) < 0.1, "triangle area")
 }
 
-test effect fn circleAreaMatchesPiRSquared() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn circleAreaMatchesPiRSquared() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.circle(32.0, 32.0, 20.0) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -113,7 +120,8 @@ test effect fn circleAreaMatchesPiRSquared() -> () ! AssertionError<'static> | O
   run Testing.expect(f64.abs(totalArea(&precise) - expected) / expected < 0.001, "finely flattened circle within 0.1%")
 }
 
-test effect fn flatteningStaysWithinTolerance() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn flatteningStaysWithinTolerance() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.circle(0.0, 0.0, 100.0) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -132,7 +140,8 @@ test effect fn flatteningStaysWithinTolerance() -> () ! AssertionError<'static> 
   run Testing.expect(ok, "chord midpoints within tolerance")
 }
 
-test effect fn evenOddCancelsOverlap() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn evenOddCancelsOverlap() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.rect(Rect.make(0.0, 0.0, 8.0, 8.0)) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -142,7 +151,8 @@ test effect fn evenOddCancelsOverlap() -> () ! AssertionError<'static> | OutOfMe
   run Testing.expect(nonzero.alphaAt(4, 4) == 255 && evenodd.alphaAt(4, 4) == 0 && evenodd.alphaAt(0, 0) == 255, "hole only under even-odd")
 }
 
-test effect fn offCanvasGeometryKeepsWinding() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn offCanvasGeometryKeepsWinding() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   // A diagonal edge that starts left of and above the canvas and ends right of it.
   let mut p = Path.make()
@@ -164,7 +174,8 @@ test effect fn offCanvasGeometryKeepsWinding() -> () ! AssertionError<'static> |
   run Testing.expect(c.alphaAt(0, 0) == 255 && c.alphaAt(9, 0) == 255, "left and right columns covered")
 }
 
-test effect fn partialLastBandClipsToHeight() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn partialLastBandClipsToHeight() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.0, 0.0, 6.0, 6.0) |> Effect.provideMut<Allocator>(&mut allocator)
   let c = run cover(&p, &Affine.identity(), NONZERO, 6, 6) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -175,14 +186,16 @@ test effect fn partialLastBandClipsToHeight() -> () ! AssertionError<'static> | 
   run Testing.expect(corner.r == 255 && corner.a == 255, "last row painted")
 }
 
-test effect fn transformScalesGeometry() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn transformScalesGeometry() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(1.0, 1.0, 2.0, 2.0) |> Effect.provideMut<Allocator>(&mut allocator)
   let c = run cover(&p, &Affine.scale(2.0, 2.0), NONZERO, 8, 8) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(totalArea(&c) == 16.0 && c.alphaAt(2, 2) == 255 && c.alphaAt(1, 2) == 0, "scaled rect")
 }
 
-test effect fn pixmapCompositesSourceOver() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn pixmapCompositesSourceOver() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let p = run rectangle(0.5, 0.0, 2.0, 4.0) |> Effect.provideMut<Allocator>(&mut allocator)
   let c = run cover(&p, &Affine.identity(), NONZERO, 4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -196,6 +209,8 @@ test effect fn pixmapCompositesSourceOver() -> () ! AssertionError<'static> | Ou
   run Testing.expect(inside.r == 255 && inside.b == 0 && outside.b == 255 && outside.r == 0, "full and none")
 }
 import stroke_tests
+import stroke_curve_tests
+import stroke_arcs_tests
 import paint_tests
 import layer_tests
 import filter_tests

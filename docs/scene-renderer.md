@@ -20,26 +20,68 @@ without Dawn.
 
 ## Pipeline
 
-1. **Path** (`vector.path`): verbs and points in user space. Arcs and shapes are converted to
-   cubics by callers (the SVG layer owns SVG arc conversion).
+1. **Path** (`vector.path`): verbs and points in user space, including generic affine ellipse
+   arcs. Callers own format-specific conversion (for example, SVG endpoint arcs to an ellipse
+   center, basis vectors, start angle, and sweep); the vector package has no SVG-specific types.
+   `Path.ellipseArcTo(center, axisX, axisY, startAngle, sweepAngle, end)` preserves an exact end
+   anchor; its start anchor is the current point. The basis need not be orthogonal. The generic
+   `ellipseArc` convenience method computes the end anchor. Neither method inserts a connector.
+   Anchor reconstruction error is charged to the accuracy budget, never hidden by an epsilon.
 2. **Flatten** (`vector.flatten`): control points are transformed to device space first, then each
    quadratic or cubic is split uniformly into `n` segments from Wang's formula,
    `n = ceil(sqrt(d(d-1)/8 * M / tolerance))`, where `M` is the largest second difference of the
-   control points. The default tolerance is 0.25 device pixels. Subpaths close implicitly for fills.
-   Non-finite points and horizontal segments are dropped; they add no area.
-3. **Stroke** (`vector.stroke`): strokes are expanded in user space into closed outlines that are
-   filled with nonzero, so the CTM (including skew and non-uniform scale) applies to the pen as SVG
-   requires. The centerline is flattened at the device tolerance divided by the transform's
-   largest singular value. Joins: miter (falls back to bevel past `stroke-miterlimit`),
-   miter-clip, round, bevel, and arcs (on flattened segments arcs have zero curvature, so they
-   behave as miter-clip; using source curvature is future work). Caps: butt, round, square,
-   including the dots SVG 2 requires for zero-length subpaths. Vertices inside a flattened curve
-   always get a round join. Inner joins end at the intersection of the two offset lines when both
-   segments are long enough, and otherwise pass through the vertex: such overlaps reach the inner
-   edge, where clamping per-pixel area would overstate coverage, so they are only the fallback.
-   Round arcs place interior vertices on a radius that keeps the arc's area. Dashes are cut from
-   the flattened centerline (odd lists repeat, negative or all-zero lists disable dashing, the
-   pattern restarts per subpath).
+   control points. Ellipse arcs are sampled directly under the transform rather than approximated
+   by cubics first. The default tolerance is 0.25 device pixels. Subpaths close implicitly for fills;
+   horizontal segments add no area. Invalid input, unrepresentable numeric results, and unsupported
+   accuracy requests propagate `geometry_error.GeometryError` through `Rasterizer.fill`.
+   `Rasterizer.fill` uses `flatten.fillClipped`: viewport clipping happens in f64 before
+   narrowing to f32, retaining vertical boundary edges so offscreen geometry preserves winding.
+   Thus a finite enclosing rectangle at `±1e20` can cover a small viewport without requiring
+   those irrelevant coordinates to meet the on-screen f32 error budget. Uncertifiable clipping
+   interpolation fails explicitly; coordinates are never silently saturated before clipping.
+3. **Stroke** (`vector.stroke`): `Stroker.stroke(path, style, transform, tolerance, out)`
+   expands a path into a user-space outline for nonzero filling. The caller applies the transform
+   when filling, so skew and non-uniform scale transform the pen too. Tolerance is explicit,
+   positive, finite, and measured in target coordinates, not user coordinates. Resolution accounts
+   for both centerline error and the width-dependent offset error; cap and join directions come
+   from source-segment endpoint tangents, not flattened chords. The transform's largest singular
+   value is calculated with normalization so large finite entries do not spuriously overflow.
+   Joins are miter (bevel beyond the miter limit), miter-clip, round, bevel, and arcs; arcs joins use
+   source endpoint curvature to extend the two offset curves. Straight-segment arcs joins reduce
+   to miter-clip. Caps are butt, round, and square, including round/square dots on zero-length
+   subpaths. Dashes repeat odd lists and restart per subpath; negative or all-zero lists disable
+   dashing.
+   Curve subdivision bounds both offsets directly: for unit normal `N` and speed lower bound
+   `v`, `|N''| <= |P'''|/v + 3|P''|²/v²`, and linear interpolation error is at most the
+   second-derivative bound times `dt²/8`. Endpoint scalar zeros are removed before normalizing
+   Bézier derivatives, preserving limiting cap directions. Ellipse derivatives and curvature
+   remain analytic; circles are not first converted to cubics. Arcs joins adjust nonintersecting
+   osculating circles and clip against the circular-bisector arclength miter limit defined by
+   [SVG 2 stroke joins](https://svgwg.org/svg2-draft/painting.html#LineJoinShape).
+   Dashes use a separate arc-length error budget scaled by the width-dependent offset motion.
+   An unresolved transition across a genuine source corner is an accuracy failure, not a guessed
+   cap or join. Zero-length on-dashes retain their cap shape.
+
+   `Stroker.bounds(path, style, transform, tolerance, ignoreDashes)` returns
+   `StrokeBounds { empty, bounds }` in target coordinates, from transformed stroke geometry rather
+   than a mapped user-space bounding rectangle. Set `ignoreDashes` for undashed stroke bounds.
+   The stroker retains its outline scratch between bounds calls. Bounds pad the transformed
+   polygon extrema by half the requested tolerance: the internal approximation budget is smaller
+   than that padding, and each returned face is at most one tolerance outside the mathematical
+   stroke box. This is a bounded conservative result, not a claim of analytic exact extrema.
+   Both operations propagate allocation failure and `geometry_error.GeometryError`, whose `code`
+   distinguishes `INVALID_INPUT` (including invalid tolerance), `NUMERIC_LIMIT` (unrepresentable
+   arithmetic or coordinates), and `ACCURACY_LIMIT` (the requested resolution exceeds available
+   floating-point precision or the supported subdivision budget). They must not silently return
+   coarse geometry when either accuracy limit is reached.
+   The current refusal limits are 40 subdivision levels and 1,048,576 curve samples or circular
+   arc segments; none is a successful-return clamp. Roundoff guards also reject absolute
+   tolerances below available coordinate precision (for example, `0.1` at scale `1e200`).
+   Any partially appended outline after an error must be discarded. `bounds` returns no box on
+   error. Width zero returns empty geometry; negative widths and invalid style values are errors.
+   Contract tests in `vector/src/stroke_tests.silk` also reference
+   [SVG 2 line caps](https://www.w3.org/TR/SVG2/painting.html#LineCaps) and
+   [stroke bounding boxes](https://www.w3.org/TR/SVG2/coords.html#BoundingBoxes).
 4. **Coverage** (`vector.strips`): exact signed area per pixel cell, accumulated and prefix-summed
    along each row (the font-rs method). Nonzero coverage is `min(|a|, 1)`; even-odd is
    `|a - 2 round(a / 2)|`. Lines are split at x = 0 and x = width and then clamped, so geometry

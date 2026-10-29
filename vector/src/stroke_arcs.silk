@@ -1,0 +1,692 @@
+//! Osculating-circle joins, independent of path parsing and stroke traversal.
+//! Construction and radius adjustment: https://svgwg.org/svg2-draft/painting.html#LineJoinShape
+//! §§13.5.7–13.5.9; circular-bisector clipping: §13.5.5.
+import silk.core.ownership { Copy }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.num.f64
+import silk.num.u32
+import geometry { Point }
+import geometry_error { GeometryError, INVALID_INPUT, NUMERIC_LIMIT, ACCURACY_LIMIT }
+import path { Path }
+
+const TAU: f64 = 6.283185307179586
+
+// A refusal threshold, never a tessellation clamp. The caller receives an error.
+const MAX_ARC_SEGMENTS: f64 = 1048576.0
+
+const ROUNDING: f64 = 1.4210854715202004e-14
+
+// LIMITATION-8: dev.27 has no f64.atan2 (silk-lang/silk#2539).
+// Reduce to |z| <= tan(pi/8); 24 alternating-series terms reach binary64
+// precision without a native-library dependency, including on wasm.
+fn atanUnit(value: f64) -> f64 {
+  let reduced = value > 0.4142135623730950
+  let z = if reduced {
+    (value - 1.0) / (value + 1.0)
+  } else {
+    value
+  }
+  let square = -z * z
+  let mut term = z
+  let mut sum = z
+  let mut denominator = 3.0
+  let mut i: u32 = 0
+  while i < 24 {
+    term = term * square
+    sum = sum + term / denominator
+    denominator = denominator + 2.0
+    i = i + 1
+  }
+  return if reduced {
+    TAU * 0.125 + sum
+  } else {
+    sum
+  }
+}
+
+fn atan2(y: f64, x: f64) -> f64 {
+  let ax = f64.abs(x)
+  let ay = f64.abs(y)
+  if ax == 0.0 && ay == 0.0 {
+    return 0.0
+  }
+  let mut result = if ax >= ay {
+    atanUnit(ay / ax)
+  } else {
+    TAU * 0.25 - atanUnit(ax / ay)
+  }
+  if x < 0.0 {
+    result = TAU * 0.5 - result
+  }
+  if y < 0.0 {
+    result = -result
+  }
+  return result
+}
+
+fn add(a: Point, b: Point) -> Point {
+  return Point.make(a.x + b.x, a.y + b.y)
+}
+
+fn sub(a: Point, b: Point) -> Point {
+  return Point.make(a.x - b.x, a.y - b.y)
+}
+
+fn mul(a: Point, s: f64) -> Point {
+  return Point.make(a.x * s, a.y * s)
+}
+
+fn normal(a: Point) -> Point {
+  return Point.make(0.0 - a.y, a.x)
+}
+
+fn dot(a: Point, b: Point) -> f64 {
+  return a.x * b.x + a.y * b.y
+}
+
+fn cross(a: Point, b: Point) -> f64 {
+  return a.x * b.y - a.y * b.x
+}
+
+fn length(a: Point) -> f64 {
+  return f64.sqrt(dot(a, a))
+}
+
+fn max(a: f64, b: f64) -> f64 {
+  return if a > b {
+    a
+  } else {
+    b
+  }
+}
+
+fn sign(a: f64) -> f64 {
+  return if a < 0.0 {
+    -1.0
+  } else {
+    1.0
+  }
+}
+
+// All construction is relative to the vertex, in units of half-width. A zero
+// signed radius denotes a LINE, not a point circle. Infinite source curvature
+// denotes a degenerate source endpoint and becomes a line (§13.5.8).
+struct Edge {
+  p: Point,
+  t: Point,
+  r: f64
+}
+
+impl Copy for Edge {}
+
+fn center(e: &Edge) -> Point {
+  return add(e.p, mul(normal(e.t), e.r))
+}
+
+fn reverse(e: Edge) -> Edge {
+  return Edge { p: e.p, t: mul(e.t, -1.0), r: 0.0 - e.r }
+}
+
+fn radius(k: f64, half: f64) -> f64 {
+  if k == 0.0 || !f64.isFinite(k) {
+    return 0.0
+  }
+  return (1.0 / k) / half - 1.0
+}
+
+struct Plane {
+  enabled: bool,
+  n: Point,
+  d: f64
+}
+
+impl Copy for Plane {}
+
+fn noClip() -> Plane {
+  return Plane { enabled: false, n: Point.make(0.0, 0.0), d: 0.0 }
+}
+
+fn side(p: Point, clip: Plane) -> f64 {
+  return dot(p, clip.n) - clip.d
+}
+
+struct Output {
+  vertex: Point,
+  half: f64,
+  tolerance: f64,
+  absoluteTolerance: f64
+}
+
+impl Copy for Output {}
+
+effect fn point(out: &mut Path, p: Point, output: Output) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let q = add(output.vertex, mul(p, output.half))
+  if !q.isFinite() {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if ROUNDING * max(f64.abs(q.x), f64.abs(q.y)) > output.absoluteTolerance * 0.125 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  run out.lineTo(q.x, q.y)
+}
+
+// The quadratic is the touching-circle equation
+// |D + delta*V|² = (target + delta*rate)². Stable roots avoid cancellation
+// when circles are almost touching. No iterative, tolerance-dependent fallback.
+effect fn positiveRoot(a: f64, b: f64, c: f64) -> f64
+  ! GeometryError {
+  if !f64.isFinite(a) || !f64.isFinite(b) || !f64.isFinite(c) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if a == 0.0 {
+    if b == 0.0 {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    let root = (0.0 - c) / b
+    if root < 0.0 || !f64.isFinite(root) {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    return root
+  }
+
+  // Scale coefficients before forming the discriminant.
+  let scale = max(f64.abs(a), max(f64.abs(b), f64.abs(c)))
+  let aa = a / scale
+  let bb = b / scale
+  let cc = c / scale
+  let discriminant = bb * bb - 4.0 * aa * cc
+  if discriminant < 0.0 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let q = -0.5 * (bb + sign(bb) * f64.sqrt(discriminant))
+  if q == 0.0 {
+    return 0.0
+  }
+  let x = q / aa
+  let y = cc / q
+  if x >= 0.0 && f64.isFinite(x) && (!(y >= 0.0) || x <= y) {
+    return x
+  }
+  if y >= 0.0 && f64.isFinite(y) {
+    return y
+  }
+  fail GeometryError { code: NUMERIC_LIMIT }
+}
+
+effect fn checkRadius(r: f64, tolerance: f64) -> ()
+  ! GeometryError {
+  // These bounds protect the squared-distance construction and reserve half
+  // the tolerance for f64 construction/trigonometric/translation roundoff.
+  if !f64.isFinite(r) || f64.abs(r) > 1.0e140 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if ROUNDING * max(1.0, f64.abs(r)) > tolerance * 0.5 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+}
+
+// Adjust only the finite circle in a line/circle join. Tangency satisfies
+// |d0 + dn*R| = R; choose the first nonnegative growth from the original R.
+effect fn adjustLineCircle(line: Edge, circle: &mut Edge, tolerance: f64) -> bool
+  ! GeometryError {
+  let r = f64.abs(circle.r)
+  let c = center(&circle)
+  let gap = cross(line.t, sub(c, line.p))
+  if f64.abs(gap) <= r {
+    return false
+  }
+  let d0 = cross(line.t, sub(circle.p, line.p))
+  let dn = cross(line.t, mul(normal(circle.t), sign(circle.r)))
+  let mut best: f64 = -1.0
+  if 1.0 - dn != 0.0 {
+    let candidate = d0 / (1.0 - dn)
+    if candidate >= r {
+      best = candidate
+    }
+  }
+  if 1.0 + dn != 0.0 {
+    let candidate = (0.0 - d0) / (1.0 + dn)
+    if candidate >= r && (best < 0.0 || candidate < best) {
+      best = candidate
+    }
+  }
+  if best < 0.0 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  run checkRadius(best, tolerance)
+  circle.r = sign(circle.r) * best
+  return true
+}
+
+// Returns whether the resulting pair is tangent due to radius adjustment.
+effect fn adjustCircles(a: &mut Edge, b: &mut Edge, tolerance: f64) -> bool
+  ! GeometryError {
+  let ra = f64.abs(a.r)
+  let rb = f64.abs(b.r)
+  let d = sub(center(&b), center(&a))
+  let distance = length(d)
+  if distance <= ra + rb && distance >= f64.abs(ra - rb) {
+    return false
+  }
+  let mut sa: f64 = 1.0
+  let mut sb: f64 = 1.0
+  let mut target = ra + rb
+  let mut rate: f64 = 2.0
+  if distance < f64.abs(ra - rb) {
+    target = f64.abs(ra - rb)
+    rate = -2.0
+    if ra > rb {
+      sa = -1.0
+    } else {
+      sb = -1.0
+    }
+  }
+  let v = sub(mul(normal(b.t), sign(b.r) * sb), mul(normal(a.t), sign(a.r) * sa))
+  let delta = run positiveRoot(
+    dot(v, v) - rate * rate,
+    2.0 * (dot(d, v) - target * rate),
+    dot(d, d) - target * target,
+  )
+  let newA = ra + sa * delta
+  let newB = rb + sb * delta
+  if newA <= 0.0 || newB <= 0.0 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  run checkRadius(newA, tolerance)
+  run checkRadius(newB, tolerance)
+  a.r = sign(a.r) * newA
+  b.r = sign(b.r) * newB
+  return true
+}
+
+fn closer(a: Point, b: Point) -> Point {
+  return if dot(a, a) <= dot(b, b) {
+    a
+  } else {
+    b
+  }
+}
+
+// Circle intersection coordinates are ill-conditioned at tangency. Reserving
+// only O(epsilon*radius) would silently violate the requested error there.
+effect fn checkIntersection(h: f64, scale: f64, tolerance: f64) -> ()
+  ! GeometryError {
+  let squareError = ROUNDING * scale * scale
+  let error = squareError / max(h, f64.sqrt(squareError))
+  if error > tolerance * 0.125 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+}
+
+effect fn lineCircleIntersection(line: Edge, circle: Edge, touching: bool, tolerance: f64) -> Point
+  ! GeometryError {
+  let c = center(&circle)
+  let delta = sub(c, line.p)
+  let along = dot(delta, line.t)
+  let gap = cross(line.t, delta)
+  let r = f64.abs(circle.r)
+  let mut h2 = (r - f64.abs(gap)) * (r + f64.abs(gap))
+  if touching {
+    h2 = 0.0
+  }
+  if h2 < 0.0 {
+    if h2 < 0.0 - ROUNDING * r * r {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    h2 = 0.0
+  }
+  let h = f64.sqrt(h2)
+  if !touching {
+    run checkIntersection(h, r, tolerance)
+  }
+  return closer(add(line.p, mul(line.t, along - h)), add(line.p, mul(line.t, along + h)))
+}
+
+effect fn circleIntersection(a: Edge, b: Edge, touching: bool, tolerance: f64) -> Point
+  ! GeometryError {
+  let ca = center(&a)
+  let d = sub(center(&b), ca)
+  let distance = length(d)
+  if distance == 0.0 {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let ra = f64.abs(a.r)
+  let rb = f64.abs(b.r)
+  let along = 0.5 * (distance + (ra - rb) * (ra + rb) / distance)
+  let mut h2 = (ra - along) * (ra + along)
+  if touching {
+    h2 = 0.0
+  }
+  if h2 < 0.0 {
+    if h2 < 0.0 - ROUNDING * ra * ra {
+      fail GeometryError { code: NUMERIC_LIMIT }
+    }
+    h2 = 0.0
+  }
+  if !touching {
+    run checkIntersection(f64.sqrt(h2), max(ra, max(rb, distance)), tolerance)
+  }
+  let unit = mul(d, 1.0 / distance)
+  let base = add(ca, mul(unit, along))
+  let offset = mul(normal(unit), f64.sqrt(h2))
+  return closer(add(base, offset), sub(base, offset))
+}
+
+// Circle through the vertex and tip, initially tangent to the angular
+// bisector. Its signed curvature is 2*cross(bisector,tip)/|tip|².
+// Limiting by this circle's ARCLENGTH also rotates the clipping plane.
+effect fn clipPlane(incoming: Point, outgoing: Point, tip: Point, limit: f64) -> Plane
+  ! GeometryError {
+  let sum = add(normal(incoming), normal(outgoing))
+  let size = length(sum)
+  let b = if size == 0.0 {
+    incoming
+  } else {
+    mul(sum, 1.0 / size)
+  }
+  let x = dot(b, tip)
+  let y = cross(b, tip)
+  let square = dot(tip, tip)
+  if square == 0.0 || !f64.isFinite(square) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let k = 2.0 * y / square
+  if k == 0.0 {
+    if x <= limit {
+      return noClip()
+    }
+    return Plane { enabled: true, n: b, d: limit }
+  }
+  let sweep = 2.0 * atan2(y, x)
+  let arcLength = f64.abs(sweep / k)
+  if !f64.isFinite(arcLength) {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  if arcLength <= limit {
+    return noClip()
+  }
+  let angle = k * limit
+  let s = f64.sin(angle)
+  let c = f64.cos(angle)
+  let sh = f64.sin(0.5 * angle)
+  let p = add(mul(b, s / k), mul(normal(b), 2.0 * sh * sh / k))
+  let n = add(mul(b, c), mul(normal(b), s))
+  return Plane { enabled: true, n: n, d: dot(p, n) }
+}
+
+// Parameterization about the endpoint avoids subtracting almost equal center
+// coordinates for shallow arcs. The endpoint itself is always emitted exactly.
+fn at(e: Edge, angle: f64) -> Point {
+  let sh = f64.sin(0.5 * angle)
+  return add(e.p, add(mul(e.t, e.r * f64.sin(angle)), mul(normal(e.t), e.r * 2.0 * sh * sh)))
+}
+
+fn angleTo(e: Edge, p: Point) -> f64 {
+  let d = sub(p, e.p)
+  let mut angle = atan2(dot(d, e.t) / e.r, 1.0 - dot(d, normal(e.t)) / e.r)
+  if e.r > 0.0 && angle < 0.0 {
+    angle = angle + TAU
+  }
+  if e.r < 0.0 && angle > 0.0 {
+    angle = angle - TAU
+  }
+  return angle
+}
+
+effect fn line(out: &mut Path, a: Point, b: Point, clip: Plane, output: Output) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  if !clip.enabled {
+    run point(&mut out, b, output)
+    return
+  }
+  let sa = side(a, clip)
+  let sb = side(b, clip)
+  if sa > 0.0 && sb > 0.0 {
+    return
+  }
+  if (sa > 0.0) != (sb > 0.0) {
+    let p = add(a, mul(sub(b, a), sa / (sa - sb)))
+    run point(&mut out, p, output)
+  }
+  if sb <= 0.0 {
+    run point(&mut out, b, output)
+  }
+}
+
+// Analytic circle/plane intersections partition the arc before flattening.
+// Thus the clip boundary is exact, rather than an intersection with a chord
+// whose error can be amplified arbitrarily at a near-tangency.
+effect fn arc(
+  out: &mut Path,
+  e: Edge,
+  tip: Point,
+  backwards: bool,
+  clip: Plane,
+  output: Output,
+) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  let sweep = angleTo(e, tip)
+  let start = if backwards {
+    sweep
+  } else {
+    0.0
+  }
+  let finish = if backwards {
+    0.0
+  } else {
+    sweep
+  }
+  if sweep == 0.0 {
+    let end = if backwards {
+      e.p
+    } else {
+      tip
+    }
+    if !clip.enabled || side(end, clip) <= 0.0 {
+      run point(&mut out, end, output)
+    }
+    return
+  }
+  let mut cuts: [f64; 4] = [0.0, 1.0, 1.0, 1.0]
+  let mut count: usize = 2
+  if clip.enabled {
+    let c = center(&e)
+    let gap = side(c, clip)
+    let r = f64.abs(e.r)
+    let h = f64.sqrt(f64.abs((r - f64.abs(gap)) * (r + f64.abs(gap))))
+    run checkIntersection(h, max(r, f64.abs(gap)), output.tolerance)
+    if f64.abs(gap) < r {
+      let base = sub(c, mul(clip.n, gap))
+      let offset = mul(normal(clip.n), h)
+      let p0 = add(base, offset)
+      let p1 = sub(base, offset)
+      let u0 = (angleTo(e, p0) - start) / (finish - start)
+      let u1 = (angleTo(e, p1) - start) / (finish - start)
+      if u0 > 0.0 && u0 < 1.0 {
+        cuts[count] = u0
+        count = count + 1
+      }
+      if u1 > 0.0 && u1 < 1.0 && u1 != u0 {
+        cuts[count] = u1
+        count = count + 1
+      }
+    }
+  }
+  let mut i: usize = 1
+  while i < count {
+    let value = cuts[i]
+    let mut j = i
+    while j > 0 && cuts[j - 1] > value {
+      cuts[j] = cuts[j - 1]
+      j = j - 1
+    }
+    cuts[j] = value
+    i = i + 1
+  }
+  i = 1
+  while i < count {
+    let a = start + (finish - start) * cuts[i - 1]
+    let b = start + (finish - start) * cuts[i]
+    if !clip.enabled || side(at(e, 0.5 * (a + b)), clip) <= 0.0 {
+      if cuts[i - 1] > 0.0 {
+        run point(&mut out, at(e, a), output)
+      }
+
+      // 1-cos(theta/2) <= theta²/8, valid without a small-angle assumption.
+      // Half of the tolerance is reserved for construction roundoff.
+      let required = f64.ceil(f64.abs(b - a) * f64.sqrt(f64.abs(e.r) / (4.0 * output.tolerance)))
+      if !f64.isFinite(required) || required > MAX_ARC_SEGMENTS {
+        fail GeometryError { code: ACCURACY_LIMIT }
+      }
+      let n = if required < 1.0 {
+        1
+      } else {
+        f64.toU32(required)
+      }
+      let mut step: u32 = 1
+      while step <= n {
+        let angle = a + (b - a) * (u32.toF64(step) / u32.toF64(n))
+        let mut p = at(e, angle)
+        if step == n && cuts[i] == 1.0 {
+          p = if backwards {
+            e.p
+          } else {
+            tip
+          }
+        }
+        run point(&mut out, p, output)
+        step = step + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+effect fn rectangle(out: &mut Path, a: Edge, b: Edge, limit: f64, output: Output) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  run point(&mut out, add(a.p, mul(a.t, limit)), output)
+  run point(&mut out, sub(b.p, mul(b.t, limit)), output)
+  run point(&mut out, b.p, output)
+}
+
+/// Appends an outer join after the caller's initial offset point. Tangents must
+/// be unit forward vectors of the oriented side walk; its outer normal is +90°
+/// and cross(incoming,outgoing) <= 0. Curvatures are SIGNED SOURCE curvatures,
+/// not flattened-edge or offset curvatures; reversing traversal negates them.
+/// `half` and `tolerance` are positive finite lengths in the SAME coordinate
+/// system as `vertex`; `miterLimit` is finite and at least one. Apply affine
+/// transforms after constructing the join, reducing tolerance by a conservative
+/// transform norm first. No SVG types or transform-dependent curvature appear
+/// in this API. Errors may leave an appended prefix; the owning stroker must
+/// discard the incomplete output. Infinity curvature denotes a degenerate
+/// endpoint (straight construction); NaN is invalid.
+pub effect fn append(
+  out: &mut Path,
+  vertex: Point,
+  incoming: Point,
+  outgoing: Point,
+  curvatureIn: f64,
+  curvatureOut: f64,
+  half: f64,
+  miterLimit: f64,
+  tolerance: f64,
+) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
+  if !vertex.isFinite() || !incoming.isFinite() || !outgoing.isFinite() || !f64.isFinite(half)
+    || half <= 0.0
+    || !f64.isFinite(tolerance)
+    || tolerance <= 0.0
+    || !f64.isFinite(miterLimit)
+    || miterLimit < 1.0
+    || curvatureIn != curvatureIn
+    || curvatureOut != curvatureOut {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let turn = cross(incoming, outgoing)
+  if turn > 0.0 || f64.abs(dot(incoming, incoming) - 1.0) > ROUNDING
+    || f64.abs(dot(outgoing, outgoing) - 1.0) > ROUNDING {
+    fail GeometryError { code: INVALID_INPUT }
+  }
+  let localTolerance = tolerance / half
+  let magnitude = max(f64.abs(vertex.x), f64.abs(vertex.y)) / half
+  if ROUNDING * max(1.0, magnitude) > localTolerance * 0.5 || localTolerance == 0.0 {
+    fail GeometryError { code: ACCURACY_LIMIT }
+  }
+  let output = Output {
+    vertex: vertex,
+    half: half,
+    tolerance: localTolerance,
+    absoluteTolerance: tolerance,
+  }
+  let mut a = Edge { p: normal(incoming), t: incoming, r: 0.0 }
+  let mut b = Edge { p: normal(outgoing), t: outgoing, r: 0.0 }
+  if turn == 0.0 && dot(incoming, outgoing) > 0.0 {
+    run point(&mut out, b.p, output)
+    return
+  }
+
+  // Positive source curvature reaches/passes the outer offset cusp at k*half=1.
+  // SVG's round fallback is taken before attempting a zero-radius circle.
+  if (f64.isFinite(curvatureIn) && curvatureIn * half >= 1.0)
+    || (f64.isFinite(curvatureOut) && curvatureOut * half >= 1.0) {
+    a.r = -1.0
+    run arc(&mut out, a, b.p, false, noClip(), output)
+    return
+  }
+  a.r = radius(curvatureIn, half)
+  b.r = radius(curvatureOut, half)
+  run checkRadius(a.r, localTolerance)
+  run checkRadius(b.r, localTolerance)
+  if a.r == 0.0 && b.r == 0.0 {
+    if turn == 0.0 {
+      run rectangle(&mut out, a, b, miterLimit, output)
+      return
+    }
+    let tip = add(a.p, mul(a.t, cross(sub(b.p, a.p), b.t) / turn))
+    let clip = run clipPlane(incoming, outgoing, tip, miterLimit)
+    run line(&mut out, a.p, tip, clip, output)
+    run line(&mut out, tip, b.p, clip, output)
+    return
+  }
+
+  // Exactly parallel, disjoint offset circles never meet as radii grow.
+  // §13.5.9 explicitly specifies this rectangle, not a bevel or round join.
+  if turn == 0.0 {
+    if a.r == 0.0 || b.r == 0.0
+      || length(sub(center(&b), center(&a))) > f64.abs(a.r) + f64.abs(b.r) {
+      run rectangle(&mut out, a, b, miterLimit, output)
+      return
+    }
+  }
+  let mut tip = Point.make(0.0, 0.0)
+  if a.r == 0.0 {
+    let touching = run adjustLineCircle(a, &mut b, localTolerance)
+    tip = run lineCircleIntersection(a, b, touching, localTolerance)
+  } else if b.r == 0.0 {
+    let touching = run adjustLineCircle(b, &mut a, localTolerance)
+    tip = run lineCircleIntersection(b, a, touching, localTolerance)
+  } else {
+    let touching = run adjustCircles(&mut a, &mut b, localTolerance)
+    tip = run circleIntersection(a, b, touching, localTolerance)
+  }
+  if !tip.isFinite() {
+    fail GeometryError { code: NUMERIC_LIMIT }
+  }
+  let clip = run clipPlane(incoming, outgoing, tip, miterLimit)
+  if a.r == 0.0 {
+    run line(&mut out, a.p, tip, clip, output)
+  } else {
+    run arc(&mut out, a, tip, false, clip, output)
+  }
+  if b.r == 0.0 {
+    run line(&mut out, tip, b.p, clip, output)
+  } else {
+    run arc(&mut out, reverse(b), tip, true, clip, output)
+  }
+}

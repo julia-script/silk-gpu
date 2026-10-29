@@ -24,6 +24,8 @@ import vector.geometry { Affine, Rect }
 import vector.path { Path }
 import vector.strips { Rasterizer, Coverage, NONZERO, EVENODD }
 import vector.stroke { Stroke, Stroker, JOIN_ROUND, JOIN_MITER_CLIP, CAP_ROUND, CAP_SQUARE }
+import vector.geometry_error { GeometryError }
+import vector.flatten { TOLERANCE }
 import vector.pixmap { Pixmap, Rgba8 }
 import vector.paint { Gradient, Stop, Solid, ImagePattern, SPREAD_PAD, SPREAD_REFLECT, SPREAD_REPEAT, SAMPLE_NEAREST, SAMPLE_BILINEAR, EXTEND_CLAMP, EXTEND_REPEAT }
 import vector.paint as painting
@@ -56,17 +58,46 @@ impl Canvas {
     cpu.clear(background())
     return Canvas { cpu: move cpu, scene: Scene.make(WIDTH, HEIGHT), raster: Rasterizer.make(), stroker: Stroker.make(), coverage: Coverage.make(WIDTH, HEIGHT) }
   }
-  effect fn fill(self: &mut Self, path: &Path, transform: &Affine, rule: u8, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+
+  effect fn fill(
+    self: &mut Self,
+    path: &Path,
+    transform: &Affine,
+    rule: u8,
+    color: Rgba8,
+    opacity: u8,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
     run self.raster.fill(path, transform, rule, &mut self.coverage)
     painting.fill(&mut self.cpu, &self.coverage, &Solid.make(color), opacity)
     run self.scene.fill(&self.coverage, color, opacity)
   }
-  effect fn stroke(self: &mut Self, path: &Path, style: &Stroke, transform: &Affine, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+
+  effect fn stroke(
+    self: &mut Self,
+    path: &Path,
+    style: &Stroke,
+    transform: &Affine,
+    color: Rgba8,
+    opacity: u8,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
     let mut outline = Path.make()
-    run self.stroker.stroke(path, style, transform, &mut outline)
+    run self.stroker.stroke(path, style, transform, TOLERANCE, &mut outline)
     run self.fill(&outline, transform, NONZERO, color, opacity)
   }
-  effect fn fillGradient(self: &mut Self, path: &Path, transform: &Affine, gradient: &Gradient, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+
+  effect fn fillGradient(
+    self: &mut Self,
+    path: &Path,
+    transform: &Affine,
+    gradient: &Gradient,
+    opacity: u8,
+  ) -> ()
+    ! OutOfMemoryError | GeometryError
+    ? &mut Allocator {
     run self.raster.fill(path, transform, NONZERO, &mut self.coverage)
     painting.fill(&mut self.cpu, &self.coverage, gradient, opacity)
     run self.scene.fillGradient(&self.coverage, gradient, opacity)
@@ -90,7 +121,9 @@ effect fn star(cx: f64, cy: f64, outer: f64, inner: f64) -> Path ! OutOfMemoryEr
   return move p
 }
 
-effect fn solids() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+effect fn solids() -> Canvas
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut c = run Canvas.make()
   let id = Affine.identity()
   let mut rect = Path.make()
@@ -123,7 +156,9 @@ effect fn solids() -> Canvas ! OutOfMemoryError ? &mut Allocator {
   return move c
 }
 
-effect fn gradients() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+effect fn gradients() -> Canvas
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut c = run Canvas.make()
   let id = Affine.identity()
   let stops = [
@@ -150,7 +185,15 @@ effect fn gradients() -> Canvas ! OutOfMemoryError ? &mut Allocator {
 }
 
 /// Fills `path` with `color` into the CPU `target` and records the same fill in the scene.
-effect fn fillBoth(c: &mut Canvas, target: &mut Pixmap, path: &Path, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+effect fn fillBoth(
+  c: &mut Canvas,
+  target: &mut Pixmap,
+  path: &Path,
+  color: Rgba8,
+  opacity: u8,
+) -> ()
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   run c.raster.fill(path, &Affine.identity(), NONZERO, &mut c.coverage)
   painting.fill(&mut target, &c.coverage, &Solid.make(color), opacity)
   run c.scene.fill(&c.coverage, color, opacity)
@@ -158,7 +201,9 @@ effect fn fillBoth(c: &mut Canvas, target: &mut Pixmap, path: &Path, color: Rgba
 
 /// Groups in all 16 blend modes over a striped backdrop, then a group through a luminance mask
 /// intersected with a clip path.
-effect fn layers() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+effect fn layers() -> Canvas
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut c = run Canvas.make()
   let id = Affine.identity()
   let mut base = run Pixmap.make(WIDTH, HEIGHT)
@@ -238,7 +283,9 @@ effect fn sampleImage() -> Pixmap ! OutOfMemoryError ? &mut Allocator {
 }
 
 /// Image patterns: nearest and clamped, bilinear and repeated, under scale and rotation.
-effect fn images() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+effect fn images() -> Canvas
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut c = run Canvas.make()
   let id = Affine.identity()
   let image = run sampleImage()
@@ -338,7 +385,9 @@ fn painted(name: string<'static>, cpu: &[u8], minimum: u32) -> bool {
 }
 
 /// A transparent canvas with overlapping translucent shapes, the source graphic for filters.
-effect fn filterSource(dx: f64, color: Rgba8) -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+effect fn filterSource(dx: f64, color: Rgba8) -> Pixmap
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut p = run Pixmap.make(WIDTH, HEIGHT)
   p.clear(Rgba8.make(0, 0, 0, 0))
   let mut raster = Rasterizer.make()
@@ -383,7 +432,9 @@ effect fn submit(queue: &Queue, encoder: CommandEncoder) -> () ! GpuError {
 }
 
 /// Compares every primitive of vector.filter with gpu_scene.filter on the same inputs.
-effect fn filters(device: &Device, queue: &Queue) -> bool ! GpuError | OutOfMemoryError ? &mut Allocator {
+effect fn filters(device: &Device, queue: &Queue) -> bool
+  ! GpuError | OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let f = run FilterRenderer.make(device, queue)
   let a = run filterSource(0.0, Rgba8.make(220, 60, 30, 255))
   let b = run filterSource(10.0, Rgba8.make(90, 20, 160, 255))
@@ -606,7 +657,8 @@ effect fn filters(device: &Device, queue: &Queue) -> bool ! GpuError | OutOfMemo
   return ok
 }
 
-effect fn program() -> i32 ! GpuError | OutOfMemoryError {
+effect fn program() -> i32
+  ! GpuError | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let instance = run Instance.create()
   let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
@@ -651,7 +703,7 @@ effect fn program() -> i32 ! GpuError | OutOfMemoryError {
 
 effect fn failed<E>(error: E) -> i32 {
   drop error
-  StderrWriter.print("scene test failed with a GPU or allocation error\n", &())
+  StderrWriter.print("scene test failed with a GPU, allocation, or geometry error\n", &())
   return 2
 }
 

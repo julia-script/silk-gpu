@@ -18,13 +18,16 @@ import paint as painting
 import paint { Shader }
 import pixmap { pack }
 import silk.num.usize
+import geometry_error { GeometryError }
 
 fn close(a: u8, b: u8, tolerance: i32) -> bool {
   let d = u8.toI32(a) - u8.toI32(b)
   return d <= tolerance && 0 - d <= tolerance
 }
 
-effect fn canvas(width: u32, height: u32) -> Coverage ! OutOfMemoryError ? &mut Allocator {
+effect fn canvas(width: u32, height: u32) -> Coverage
+  ! OutOfMemoryError | GeometryError
+  ? &mut Allocator {
   let mut p = Path.make()
   run p.rect(Rect.make(0.0, 0.0, u32.toF64(width), u32.toF64(height)))
   let mut raster = Rasterizer.make()
@@ -37,7 +40,8 @@ effect fn blackToWhite(g: &mut Gradient) -> () ! OutOfMemoryError ? &mut Allocat
   run g.setStops(&[Stop { offset: 0.0, color: Rgba8.make(0, 0, 0, 255) }, Stop { offset: 1.0, color: Rgba8.make(255, 255, 255, 255) }])
 }
 
-test effect fn linearGradientInterpolates() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn linearGradientInterpolates() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(64, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut g = Gradient.linear(0.0, 0.0, 64.0, 0.0, SPREAD_PAD, &Affine.identity())
@@ -54,7 +58,8 @@ test effect fn linearGradientInterpolates() -> () ! AssertionError<'static> | Ou
   run Testing.expect(ok, "every column within 1 of the exact ramp")
 }
 
-test effect fn spreadModesExtendTheRamp() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn spreadModesExtendTheRamp() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(40, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   // The vector covers x 0..16; pixel 19 (center 19.5) is at t = 1.21875.
@@ -75,7 +80,8 @@ test effect fn spreadModesExtendTheRamp() -> () ! AssertionError<'static> | OutO
   run Testing.expect(close(d.pixel(19, 0).r, 56, 1), "repeat restarts: t 0.21875")
 }
 
-test effect fn radialGradientUsesFocalCircle() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn radialGradientUsesFocalCircle() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut centered = Gradient.radial(32.0, 32.0, 20.0, 32.0, 32.0, 0.0, SPREAD_PAD, &Affine.identity())
@@ -94,7 +100,8 @@ test effect fn radialGradientUsesFocalCircle() -> () ! AssertionError<'static> |
   run Testing.expect(b.pixel(21, 31).r < 20 && close(b.pixel(51, 31).r, 251, 6), "focal dark, far edge light")
 }
 
-test effect fn radialConeLeavesOutsideTransparent() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn radialConeLeavesOutsideTransparent() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(64, 64) |> Effect.provideMut<Allocator>(&mut allocator)
   // A focal circle wholly outside the end circle makes a cone opening to the right.
@@ -105,7 +112,8 @@ test effect fn radialConeLeavesOutsideTransparent() -> () ! AssertionError<'stat
   run Testing.expect(a.pixel(20, 2).a == 0 && a.pixel(20, 32).a == 255, "outside the cone stays transparent")
 }
 
-test effect fn stopsAreFixedUpAndDegenerateVectorsUseLastStop() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn stopsAreFixedUpAndDegenerateVectorsUseLastStop() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(32, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   // The second offset 0.2 is raised to 0.5: a hard edge from red to green at x = 16.
@@ -126,7 +134,8 @@ test effect fn stopsAreFixedUpAndDegenerateVectorsUseLastStop() -> () ! Assertio
   run Testing.expect(!empty.isPaintable(), "no stops paints nothing")
 }
 
-test effect fn interpolationSpaceIsSelectable() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn interpolationSpaceIsSelectable() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(2, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   // Opaque red to transparent blue, sampled at t = 0.5 by a vector from -1 to 3.
@@ -149,7 +158,8 @@ test effect fn interpolationSpaceIsSelectable() -> () ! AssertionError<'static> 
   run Testing.expect(close(pb.r, 96, 1) && pb.b == 0 && close(pb.a, 96, 1), "premultiplied interpolation")
 }
 
-test effect fn imagePatternsSampleAndTile() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn imagePatternsSampleAndTile() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut bytes = List<u8>.make()
   // 2 x 1 image: black, white.
@@ -169,7 +179,8 @@ test effect fn imagePatternsSampleAndTile() -> () ! AssertionError<'static> | Ou
   run Testing.expect(b.pixel(0, 0).r == 0 && close(b.pixel(2, 0).r, 191, 1) && b.pixel(7, 0).r == 255, "bilinear clamps at edges")
 }
 
-test effect fn opacityScalesCoverage() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn opacityScalesCoverage() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let c = run canvas(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
   let mut a = run Pixmap.make(4, 4) |> Effect.provideMut<Allocator>(&mut allocator)
@@ -187,7 +198,8 @@ impl Shader for Spanned {
   fn isUniform(self: &Self) -> bool { return false }
 }
 
-test effect fn uniformFillMatchesShadedSpans() -> () ! AssertionError<'static> | OutOfMemoryError {
+test effect fn uniformFillMatchesShadedSpans() -> ()
+  ! AssertionError<'static> | OutOfMemoryError | GeometryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut p = Path.make()
   run p.circle(20.3, 17.6, 13.2) |> Effect.provideMut<Allocator>(&mut allocator)
