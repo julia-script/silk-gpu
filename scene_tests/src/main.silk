@@ -426,16 +426,17 @@ effect fn readImage(device: &Device, queue: &Queue, image: &FilterImage) -> List
   return run runtime.mapRead(device, &readback, 0, size)
 }
 
-effect fn submit(queue: &Queue, encoder: CommandEncoder) -> () ! GpuError {
+effect fn submit(queue: &Queue, encoder: CommandEncoder, filters: &mut FilterRenderer) -> () ! GpuError {
   let commands = run encoder.finish(b"filter test")
   queue.submit(&[commands.reference()])
+  filters.reset()
 }
 
 /// Compares every primitive of vector.filter with gpu_scene.filter on the same inputs.
 effect fn filters(device: &Device, queue: &Queue) -> bool
   ! GpuError | OutOfMemoryError | GeometryError
   ? &mut Allocator {
-  let f = run FilterRenderer.make(device, queue)
+  let mut f = run FilterRenderer.make(device, queue)
   let a = run filterSource(0.0, Rgba8.make(220, 60, 30, 255))
   let b = run filterSource(10.0, Rgba8.make(90, 20, 160, 255))
   let gpuA = run FilterImage.make(device, WIDTH, HEIGHT)
@@ -452,14 +453,14 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
   filtering.flood(&mut out, Rgba8.make(30, 140, 220, 200), 180, region)
   let mut encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.flood(device, queue, &mut encoder, &gpuOut, Rgba8.make(30, 140, 220, 200), 180, region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let flooded = run readImage(device, queue, &gpuOut)
   ok = compare("feFlood", out.data(), flooded.asSlice(), 0) && ok
 
   filtering.offset(&mut out, &a, 5, -3, region)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.offset(device, queue, &mut encoder, &gpuOut, &gpuA, 5, -3, region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let moved = run readImage(device, queue, &gpuOut)
   ok = compare("feOffset", out.data(), moved.asSlice(), 0) && ok
 
@@ -468,7 +469,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.copy(device, queue, &mut encoder, &spare, &gpuB, region)
   run f.mergeOver(device, queue, &mut encoder, &gpuOut, &spare, &gpuA, region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let merged = run readImage(device, queue, &gpuOut)
   ok = compare("feMerge", out.data(), merged.asSlice(), 0) && ok
 
@@ -478,7 +479,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     filtering.composite(&mut out, &a, &b, operator, k, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.composite(device, queue, &mut encoder, &gpuOut, &gpuA, &gpuB, operator, k, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let composited = run readImage(device, queue, &gpuOut)
     // Arithmetic runs in f32 on both sides; allow one level.
     ok = compare("feComposite", out.data(), composited.asSlice(), if operator == filtering.COMPOSITE_ARITHMETIC { 1 } else { 0 }) && ok
@@ -490,7 +491,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     filtering.blend(&mut out, &a, &b, mode, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.blend(device, queue, &mut encoder, &gpuOut, &gpuA, &gpuB, mode, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let blended = run readImage(device, queue, &gpuOut)
     ok = compare("feBlend", out.data(), blended.asSlice(), if mode == 0 { 0 } else { 1 }) && ok
     mode = mode + 1
@@ -507,7 +508,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     filtering.colorMatrix(&mut out, &a, m, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.colorMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, m, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let matrixed = run readImage(device, queue, &gpuOut)
     ok = compare("feColorMatrix", out.data(), matrixed.asSlice(), 1) && ok
     kind = kind + 1
@@ -521,7 +522,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     run filtering.gaussianBlur(&mut out, &a, &horizontal, &vertical, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.gaussianBlur(device, queue, &mut encoder, &gpuOut, &gpuA, &scratch, &horizontal, &vertical, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let blurred = run readImage(device, queue, &gpuOut)
     ok = compare("feGaussianBlur", out.data(), blurred.asSlice(), 0) && ok
     s = s + 2
@@ -534,7 +535,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     run filtering.morphology(&mut out, &a, operator, radii[q], radii[q + 1], region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.morphology(device, queue, &mut encoder, &gpuOut, &gpuA, &scratch, operator, radii[q], radii[q + 1], region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let morphed = run readImage(device, queue, &gpuOut)
     ok = compare("feMorphology", out.data(), morphed.asSlice(), 0) && ok
     q = q + 2
@@ -549,14 +550,14 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
   filtering.componentTransfer(&mut out, &a, &transfer, region)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.componentTransfer(device, queue, &mut encoder, &gpuOut, &gpuA, &transfer, region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let transferred = run readImage(device, queue, &gpuOut)
   ok = compare("feComponentTransfer", out.data(), transferred.asSlice(), 0) && ok
 
   filtering.tile(&mut out, &a, Region.make(30, 20, 61, 47), region)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.tile(device, queue, &mut encoder, &gpuOut, &gpuA, Region.make(30, 20, 61, 47), region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let tiled = run readImage(device, queue, &gpuOut)
   ok = compare("feTile", out.data(), tiled.asSlice(), 0) && ok
 
@@ -568,14 +569,14 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     run filtering.convolveMatrix(&mut out, &a, &first, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.convolveMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, &first, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let sharpened = run readImage(device, queue, &gpuOut)
     ok = compare("feConvolveMatrix", out.data(), sharpened.asSlice(), 1) && ok
     let second = Convolution { kernel: &emboss, orderX: 3, orderY: 2, divisor: 0.7, bias: 0.25, targetX: 2, targetY: 0, edgeMode: e, preserveAlpha: e == EDGE_WRAP }
     run filtering.convolveMatrix(&mut out, &a, &second, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.convolveMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, &second, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let embossed = run readImage(device, queue, &gpuOut)
     ok = compare("feConvolveMatrix", out.data(), embossed.asSlice(), 1) && ok
     e = e + 1
@@ -585,13 +586,13 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
   filtering.displacementMap(&mut out, &a, &b, &displacement, CHANNEL_R, CHANNEL_G, region)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.displacementMap(device, queue, &mut encoder, &gpuOut, &gpuA, &gpuB, &displacement, CHANNEL_R, CHANNEL_G, region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let displaced = run readImage(device, queue, &gpuOut)
   ok = compare("feDisplacementMap", out.data(), displaced.asSlice(), 0) && ok
   filtering.displacementMap(&mut out, &b, &a, &displacement, CHANNEL_A, CHANNEL_R, region)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.displacementMap(device, queue, &mut encoder, &gpuOut, &gpuB, &gpuA, &displacement, CHANNEL_A, CHANNEL_R, region)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let displacedAlpha = run readImage(device, queue, &gpuOut)
   ok = compare("feDisplacementMap", out.data(), displacedAlpha.asSlice(), 0) && ok
 
@@ -609,7 +610,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     filtering.turbulence(&mut out, &noise, &settings, &toUser, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.turbulence(device, queue, &mut encoder, &gpuOut, &noise, &settings, &toUser, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let noisy = run readImage(device, queue, &gpuOut)
     // f32 on the GPU against the spec's f64 reference.
     ok = compare("feTurbulence", out.data(), noisy.asSlice(), 1) && ok
@@ -635,7 +636,7 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
     filtering.lighting(&mut out, &a, &lit, region)
     encoder = run gpu.createCommandEncoder(device, b"filter test")
     run f.lighting(device, queue, &mut encoder, &gpuOut, &gpuA, &lit, region)
-    run submit(queue, move encoder)
+    run submit(queue, move encoder, &mut f)
     let shaded = run readImage(device, queue, &gpuOut)
     ok = compare(if l >= 3 { "feSpecularLighting" } else { "feDiffuseLighting" }, out.data(), shaded.asSlice(), 1) && ok
     l = l + 1
@@ -645,13 +646,13 @@ effect fn filters(device: &Device, queue: &Queue) -> bool
   filtering.toLinear(&mut out)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.toLinear(device, queue, &mut encoder, &gpuOut, &gpuA)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let linear = run readImage(device, queue, &gpuOut)
   ok = compare("toLinear", out.data(), linear.asSlice(), 0) && ok
   filtering.toSrgb(&mut out)
   encoder = run gpu.createCommandEncoder(device, b"filter test")
   run f.toSrgb(device, queue, &mut encoder, &spare, &gpuOut)
-  run submit(queue, move encoder)
+  run submit(queue, move encoder, &mut f)
   let srgb = run readImage(device, queue, &spare)
   ok = compare("toSrgb", out.data(), srgb.asSlice(), 0) && ok
   return ok
@@ -663,7 +664,7 @@ effect fn program() -> i32
   let instance = run Instance.create()
   let adapter = run instance.requestAdapter(&RequestAdapterOptions.default())
   let device = run adapter.requestDevice(
-    &DeviceDescriptor.default().withRequiredFeatures(SceneRenderer.requiredFeatures()),
+    &DeviceDescriptor.default().withRequiredFeatures(SceneRenderer.requiredFeatures(&adapter)),
   )
   let queue = run gpu.getQueue(&device)
   let mut renderer = run SceneRenderer.make(&device)

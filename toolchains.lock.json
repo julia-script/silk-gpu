@@ -1,26 +1,26 @@
 {
   "silk": {
-    "version": "0.1.0-dev.27+323ceb59e7ee",
+    "version": "0.1.0-dev.29+94cf9559bf47",
     "native_seed": {
-      "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/native-seed.json",
-      "sha256": "ddf974798825a867c2eae7c82164d69f74044b081edd9e2fb69e5458e3529d0c",
+      "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.29%2B94cf9559bf47/native-seed.json",
+      "sha256": "0869b82b9757c299a665f4d24d0a9fec32e455cd472b9f6f24528bbaf3b85e69",
       "bytes": 1200
     },
     "platforms": {
       "aarch64-apple-darwin": {
-        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/silk-0.1.0-dev.27%2B323ceb59e7ee-aarch64-apple-darwin.tar.gz",
-        "sha256": "1e164ec44e69f416083f1d1da63030789142a6ac78764d8b1fc8cf3a1e37b02a",
-        "bytes": 6914850
+        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.29%2B94cf9559bf47/silk-0.1.0-dev.29%2B94cf9559bf47-aarch64-apple-darwin.tar.gz",
+        "sha256": "05ed380bc35a0f9cc7780806cdeab33bd6617f624131acde6448a3e07d78e8df",
+        "bytes": 6921894
       },
       "aarch64-unknown-linux-gnu": {
-        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/silk-0.1.0-dev.27%2B323ceb59e7ee-aarch64-unknown-linux-gnu.tar.gz",
-        "sha256": "295b9264acf54a9c6a534dfe8455533d667007beef3a87309dd15879db7e4291",
-        "bytes": 7056889
+        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.29%2B94cf9559bf47/silk-0.1.0-dev.29%2B94cf9559bf47-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "d5e17b3df89c0ead4c13550b9d964159eec2945fe81cc1f8ec1b7f7b689f33e4",
+        "bytes": 7044168
       },
       "x86_64-unknown-linux-gnu": {
-        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.27%2B323ceb59e7ee/silk-0.1.0-dev.27%2B323ceb59e7ee-x86_64-unknown-linux-gnu.tar.gz",
-        "sha256": "3b5160ed46dd482b09f4b8031275b1f8f50c7da7b6ca13f1278172936a0f8d0b",
-        "bytes": 7137447
+        "url": "https://github.com/silk-lang/silk/releases/download/v0.1.0-dev.29%2B94cf9559bf47/silk-0.1.0-dev.29%2B94cf9559bf47-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "dac075a43711daa419641c74bd1f543d542f4d52ab0514a23c63ae934c5470bf",
+        "bytes": 7110819
       }
     }
   },

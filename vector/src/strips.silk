@@ -17,6 +17,8 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import geometry_error { GeometryError }
 import silk.num.f32
 import silk.num.f64
+import silk.num.u8
+import silk.num.i32
 import silk.num.u32
 import silk.num.usize
 import silk.simd.f32x4
@@ -105,7 +107,16 @@ pub struct Rasterizer {
   columnKinds: List<u8>,
   /// Per column of the band: nonzero when a line put area in it.
   touched: List<u8>,
+  /// Scanline crossings of an aliased fill.
+  crossings: List<Crossing>,
 }
+
+/// Where a line crosses a scanline, and its winding direction.
+struct Crossing {
+  x: f32,
+  winding: i32,
+}
+impl Copy for Crossing {}
 
 struct Bounds {
   x0: f32,
@@ -133,7 +144,7 @@ impl Rasterizer {
     return Rasterizer {
       lines: List<Line>.make(), clipped: List<Line>.make(),
       area: List<f32>.make(), bandAlphas: List<u8>.make(), columnKinds: List<u8>.make(),
-      touched: List<u8>.make(),
+      touched: List<u8>.make(), crossings: List<Crossing>.make(),
     }
   }
 
@@ -152,6 +163,16 @@ impl Rasterizer {
     let clip = Rect.make(0.0, 0.0, u32.toF64(out.canvasWidth), u32.toF64(out.canvasHeight))
     run flattening.fillClipped(path, transform, &clip, TOLERANCE, &mut self.lines)
     run self.fillLines(rule, &mut out)
+  }
+
+  /// Replaces `out` with aliased coverage of `path`: a pixel is fully covered when its center is
+  /// inside the path under `rule`, and empty otherwise (SVG `shape-rendering: crispEdges`).
+  pub effect fn fillAliased(self: &mut Self, path: &Path, transform: &Affine, rule: u8, out: &mut Coverage) -> ()
+    ! OutOfMemoryError | GeometryError ? &mut Allocator {
+    out.clear()
+    self.lines.clear()
+    run flattening.fill(path, transform, TOLERANCE, &mut self.lines)
+    run self.fillLinesAliased(rule, &mut out)
   }
 
   /// Replaces `out` with the coverage of closed device-space `lines` (as [`flattening.fill`] makes).
@@ -195,12 +216,8 @@ impl Rasterizer {
     }
   }
 
-  effect fn fillLines(self: &mut Self, rule: u8, out: &mut Coverage) -> () ! OutOfMemoryError ? &mut Allocator {
-    let canvasWidth = out.canvasWidth
-    let canvasHeight = out.canvasHeight
-    if canvasWidth == 0 || canvasHeight == 0 { return }
-    let widthF = u32.toF32(canvasWidth)
-    let heightF = u32.toF32(canvasHeight)
+  /// Fills `clipped` with the visible parts of `lines` and returns their bounds.
+  effect fn clip(self: &mut Self, widthF: f32, heightF: f32) -> Bounds ! OutOfMemoryError ? &mut Allocator {
     self.clipped.clear()
     let mut bounds = Bounds { x0: widthF, y0: heightF, x1: 0.0, y1: 0.0 }
     let mut i: usize = 0
@@ -212,6 +229,16 @@ impl Rasterizer {
       }
       i = i + 1
     }
+    return move bounds
+  }
+
+  effect fn fillLines(self: &mut Self, rule: u8, out: &mut Coverage) -> () ! OutOfMemoryError ? &mut Allocator {
+    let canvasWidth = out.canvasWidth
+    let canvasHeight = out.canvasHeight
+    if canvasWidth == 0 || canvasHeight == 0 { return }
+    let widthF = u32.toF32(canvasWidth)
+    let heightF = u32.toF32(canvasHeight)
+    let bounds = run self.clip(widthF, heightF)
     if self.clipped.length() == 0 { return }
     let bx0 = f32.toU32(f32.floor(bounds.x0))
     let bx1 = minU32(f32.toU32(f32.ceil(bounds.x1)), canvasWidth)
@@ -255,6 +282,105 @@ impl Rasterizer {
         stride, localWidth, rows, rule, self.bandAlphas.asMutSlice(), self.columnKinds.asMutSlice())
       run emitBand(self.bandAlphas.asSlice(), self.columnKinds.asSlice(), localWidth, bx0, bandTop, &mut out)
       band = band + 1
+    }
+  }
+
+  /// Scanline fill at pixel centers. Each row tests every visible line, which is fine for the
+  /// occasional crisp-edged shape this serves.
+  effect fn fillLinesAliased(self: &mut Self, rule: u8, out: &mut Coverage) -> () ! OutOfMemoryError ? &mut Allocator {
+    let canvasWidth = out.canvasWidth
+    let canvasHeight = out.canvasHeight
+    if canvasWidth == 0 || canvasHeight == 0 { return }
+    let bounds = run self.clip(u32.toF32(canvasWidth), u32.toF32(canvasHeight))
+    if self.clipped.length() == 0 { return }
+    let bx0 = f32.toU32(f32.floor(bounds.x0))
+    let bx1 = minU32(f32.toU32(f32.ceil(bounds.x1)), canvasWidth)
+    let by0 = f32.toU32(f32.floor(maxF32(bounds.y0, 0.0)))
+    let by1 = minU32(f32.toU32(f32.ceil(minF32(bounds.y1, u32.toF32(canvasHeight)))), canvasHeight)
+    if bx0 >= bx1 || by0 >= by1 { return }
+    let localWidth = bx1 - bx0
+    let width = u32.toUsize(localWidth)
+    let haveAlphas = self.bandAlphas.length()
+    if haveAlphas < width * 4 { run self.bandAlphas.appendRepeated(0, width * 4 - haveAlphas) }
+    let haveKinds = self.columnKinds.length()
+    if haveKinds < width { run self.columnKinds.appendRepeated(0, width - haveKinds) }
+    let originX = u32.toF32(bx0)
+    let mut bandTop = by0 - by0 % BAND
+    while bandTop < by1 {
+      let rows = minU32(BAND, canvasHeight - bandTop)
+      let mut row: u32 = 0
+      while row < BAND {
+        let alphas = self.bandAlphas.asMutSlice()
+        let mut c: usize = 0
+        while c < width {
+          alphas[c * 4 + u32.toUsize(row)] = 0
+          c = c + 1
+        }
+        if row < rows { run self.scanRow(u32.toF32(bandTop + row) + 0.5, originX, localWidth, rule, row) }
+        row = row + 1
+      }
+      let full: u32 = if rows >= BAND { 0xffffffff } else { u32.shiftLeft(1, rows * 8) - 1 }
+      let alphas = self.bandAlphas.asSlice()
+      let kinds = self.columnKinds.asMutSlice()
+      let mut c: usize = 0
+      while c < width {
+        let word = u8.toU32(alphas[c * 4]) | u32.shiftLeft(u8.toU32(alphas[c * 4 + 1]), 8)
+          | u32.shiftLeft(u8.toU32(alphas[c * 4 + 2]), 16) | u32.shiftLeft(u8.toU32(alphas[c * 4 + 3]), 24)
+        kinds[c] = if word == 0 { EMPTY } else if word == full { SOLID } else { PARTIAL }
+        c = c + 1
+      }
+      run emitBand(self.bandAlphas.asSlice(), self.columnKinds.asSlice(), localWidth, bx0, bandTop, &mut out)
+      bandTop = bandTop + BAND
+    }
+  }
+
+  /// Sets byte `row` of every column whose center lies inside the path along scanline `y`.
+  effect fn scanRow(self: &mut Self, y: f32, originX: f32, localWidth: u32, rule: u8, row: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    self.crossings.clear()
+    let lines = self.clipped.asSlice()
+    let mut i: usize = 0
+    while i < lines.length {
+      let line = lines[i]
+      // Half-open in y, so a vertex shared by two lines counts once.
+      let winding: i32 = if line.y0 <= y && y < line.y1 { 1 } else if line.y1 <= y && y < line.y0 { -1 } else { 0 }
+      if winding != 0 {
+        let x = line.x0 + (y - line.y0) * (line.x1 - line.x0) / (line.y1 - line.y0) - originX
+        run self.crossings.append(Crossing { x: x, winding: winding })
+      }
+      i = i + 1
+    }
+    let crossings = self.crossings.asMutSlice()
+    // Insertion sort: rows of ordinary shapes cross a handful of lines.
+    let mut k: usize = 1
+    while k < crossings.length {
+      let item = crossings[k]
+      let mut j = k
+      while j > 0 && crossings[j - 1].x > item.x {
+        crossings[j] = crossings[j - 1]
+        j = j - 1
+      }
+      crossings[j] = item
+      k = k + 1
+    }
+    let alphas = self.bandAlphas.asMutSlice()
+    let widthF = u32.toF32(localWidth)
+    let mut winding: i32 = 0
+    let mut n: usize = 0
+    while n + 1 < crossings.length {
+      winding = winding + crossings[n].winding
+      let inside = if rule == EVENODD { winding % 2 != 0 } else { winding != 0 }
+      if inside {
+        // Columns whose center c + 0.5 lies in [xa, xb).
+        let first = f32.ceil(clampX(crossings[n].x - 0.5, 0.0, widthF))
+        let last = f32.ceil(clampX(crossings[n + 1].x - 0.5, 0.0, widthF))
+        let mut c = u32.toUsize(f32.toU32(first))
+        let end = u32.toUsize(f32.toU32(last))
+        while c < end {
+          alphas[c * 4 + u32.toUsize(row)] = 255
+          c = c + 1
+        }
+      }
+      n = n + 1
     }
   }
 }

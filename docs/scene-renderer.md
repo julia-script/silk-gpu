@@ -131,12 +131,12 @@ without Dawn.
    `s + div255(d (255 - as))`, so solid fills match the CPU pixmap byte for byte. Gradients use
    the same formulas in f32. Image paints (`Scene.fillImage`) append the image's texels to the
    ramp buffer and sample them like `ImagePattern` (nearest or bilinear, clamp or repeat). Buffers
-   are recreated per frame for now. Request `SceneRenderer.requiredFeatures()` through
-   `DeviceDescriptor.withRequiredFeatures` when creating the scene's device. On native Dawn this
-   enables `ShaderModuleCompilationOptions`; only the scene paint module is created with
-   `strictMath = true`. A native device without the enabled feature fails renderer creation with
-   `webgpu.resources.STRICT_MATH_UNAVAILABLE`, rather than silently rendering nonexact images.
-   Ordinary WebGPU shader modules, composition, and filters retain their existing math mode.
+   are recreated per frame for now. Request `SceneRenderer.requiredFeatures(&adapter)` through
+   `DeviceDescriptor.withRequiredFeatures` when creating the scene's device. Where the adapter
+   offers Dawn's `ShaderModuleCompilationOptions` (Metal), this enables it and only the scene
+   paint module is created with `strictMath = true`. Vulkan (lavapipe in CI) and D3D compile WGSL
+   without fast-math contraction and do not offer the feature, so they use the ordinary module
+   and still match the CPU exactly. Composition and filters keep their existing math mode.
 
    This is necessary on Metal: relaxed arithmetic changed the image fixture's device column
    `x = 21` from source texel 1 to texel 2 (242 differing channels, maximum delta 130). The
@@ -180,7 +180,9 @@ without Dawn.
    go through a 256 x 256 table of `(alpha, channel)` so the GPU applies exactly the CPU's
    result. On the GPU each primitive is a full-target pass of `shaders/filter.wgsl` (blur takes
    one pass per box or kernel and ping-pongs through a scratch image); `blend.wgsl` holds the
-   blend math shared with `compose.wgsl`, and `scripts/embed-shaders` prepends it. The scene test
+   blend math shared with `compose.wgsl`, and `scripts/embed-shaders` prepends it.
+   `FilterRenderer` keeps one uniform (and table) buffer per pass and reuses them after
+   `reset()`, which the caller makes once the encoders holding the passes are submitted. The scene test
    runs every primitive, operator, blend mode and several blur sizes on both sides and matches
    byte for byte on lavapipe. Scene integration (filter commands in `Scene`) comes with the SVG
    renderer, which decides the filter graph and region.
@@ -261,5 +263,6 @@ and a premultiplied displacement map); `bench/filters/WORKLOADS.md` has the deta
   emits fewer alpha bytes than tile-aligned strips for thin shapes and keeps solid runs exact.
 - **f32 coverage, f64 geometry.** User-space math is f64 so large transforms keep precision;
   device-space lines, area accumulation and image sampling are f32 like the GPU.
-- **Antialiasing only by area.** No MSAA. `shape-rendering: crispEdges` can be served later by
-  snapping coverage to 0 or 255.
+- **Antialiasing by area.** No MSAA. `shape-rendering: crispEdges` uses
+  `Rasterizer.fillAliased`, which covers a pixel fully when its center is inside the path and
+  emits the same strips and fills, so paints, layers and the GPU take it unchanged.
