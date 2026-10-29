@@ -4,6 +4,7 @@
 //! GPU renderer can be held to the same bytes.
 import silk.core.ownership { Copy }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u8
 import silk.num.u32
@@ -30,7 +31,8 @@ impl Rgba8 {
 }
 
 /// `round(x / 255)` for `x` in `0 ..= 255 * 255`.
-pub fn div255(x: u32) -> u32 {
+pub fn div255(x: u32) -> u32
+with Intrinsic.inlineAlways() {
   let t = x + 128
   return u32.shiftRight(t + u32.shiftRight(t, 8), 8)
 }
@@ -67,7 +69,15 @@ impl Pixmap {
     let p = color.premultiply()
     let d = self.bytes.asMutSlice()
     let mut i: usize = 0
-    while i < d.length {
+    if p.r == p.a && p.g == p.a && p.b == p.a {
+      // Transparent, opaque white and other gray-equal colors are one repeated byte (a memset).
+      while i < d.length {
+        d[i] = p.a
+        i = i + 1
+      }
+      return
+    }
+    while i + 3 < d.length {
       d[i] = p.r
       d[i + 1] = p.g
       d[i + 2] = p.b
@@ -126,10 +136,63 @@ impl Pixmap {
 }
 
 /// Premultiplied source-over of `source` onto the pixel at byte offset `i`.
-pub fn over(d: &mut [u8], i: usize, source: Rgba8) -> () {
-  let inverse = 255 - u8.toU32(source.a)
-  d[i] = u32.toU8(u8.toU32(source.r) + div255(u8.toU32(d[i]) * inverse))
-  d[i + 1] = u32.toU8(u8.toU32(source.g) + div255(u8.toU32(d[i + 1]) * inverse))
-  d[i + 2] = u32.toU8(u8.toU32(source.b) + div255(u8.toU32(d[i + 2]) * inverse))
-  d[i + 3] = u32.toU8(u8.toU32(source.a) + div255(u8.toU32(d[i + 3]) * inverse))
+pub fn over(d: &mut [u8], i: usize, source: Rgba8) -> () { overPacked(&mut d, i, pack(source)) }
+
+/// `color` as one word: `r | g << 8 | b << 16 | a << 24`.
+pub fn pack(color: Rgba8) -> u32
+with Intrinsic.inlineAlways() {
+  return u8.toU32(color.r) | u32.shiftLeft(u8.toU32(color.g), 8) | u32.shiftLeft(u8.toU32(color.b), 16) | u32.shiftLeft(u8.toU32(color.a), 24)
+}
+
+pub fn unpack(word: u32) -> Rgba8 {
+  return Rgba8 {
+    r: u32.toU8(word & 255), g: u32.toU8(u32.shiftRight(word, 8) & 255),
+    b: u32.toU8(u32.shiftRight(word, 16) & 255), a: u32.toU8(u32.shiftRight(word, 24)),
+  }
+}
+
+const LANES: u32 = 0x00ff00ff
+
+/// [`div255`] on the two 16-bit lanes of `x` (each at most `255 * 255`).
+fn div255Lanes(x: u32) -> u32
+with Intrinsic.inlineAlways() {
+  let t = x + 0x00800080
+  return u32.shiftRight(t + (u32.shiftRight(t, 8) & LANES), 8) & LANES
+}
+
+/// Every channel of the packed color `word` times `scale / 255`, rounded like [`div255`].
+pub fn scalePacked(word: u32, scale: u32) -> u32
+with Intrinsic.inlineAlways() {
+  let rb = div255Lanes((word & LANES) * scale)
+  let ag = div255Lanes((u32.shiftRight(word, 8) & LANES) * scale)
+  return rb | u32.shiftLeft(ag, 8)
+}
+
+/// [`over`] with a packed premultiplied source.
+pub fn overPacked(d: &mut [u8], i: usize, source: u32) -> ()
+with Intrinsic.inlineAlways() {
+  let alpha = u32.shiftRight(source, 24)
+  if alpha == 255 {
+    storePacked(&mut d, i, source)
+    return
+  }
+  if source == 0 { return }
+  // One range check for the pixel; the byte offsets below are then constant.
+  let pixel = Slice.viewMut(&mut d, i, 4)
+  let below = u8.toU32(pixel[0]) | u32.shiftLeft(u8.toU32(pixel[1]), 8) | u32.shiftLeft(u8.toU32(pixel[2]), 16) | u32.shiftLeft(u8.toU32(pixel[3]), 24)
+  // Premultiplied channels never exceed alpha, so no lane carries into the next.
+  let word = u32.wrappingAdd(source, scalePacked(below, 255 - alpha))
+  pixel[0] = u32.wrappingToU8(word)
+  pixel[1] = u32.wrappingToU8(u32.shiftRight(word, 8))
+  pixel[2] = u32.wrappingToU8(u32.shiftRight(word, 16))
+  pixel[3] = u32.wrappingToU8(u32.shiftRight(word, 24))
+}
+
+pub fn storePacked(d: &mut [u8], i: usize, word: u32) -> ()
+with Intrinsic.inlineAlways() {
+  let pixel = Slice.viewMut(&mut d, i, 4)
+  pixel[0] = u32.wrappingToU8(word)
+  pixel[1] = u32.wrappingToU8(u32.shiftRight(word, 8))
+  pixel[2] = u32.wrappingToU8(u32.shiftRight(word, 16))
+  pixel[3] = u32.wrappingToU8(u32.shiftRight(word, 24))
 }

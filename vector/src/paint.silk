@@ -6,21 +6,25 @@
 //! `(x + 0.5, y + 0.5)` mapped back through its inverse.
 import silk.core.ownership { Copy }
 import silk.collections.list { List }
+import silk.collections.slice { Slice }
 import silk.mem.allocator { Allocator, OutOfMemoryError }
-import silk.num.f32
 import silk.num.f64
 import silk.num.u8
 import silk.num.u32
+import silk.num.u64
 import silk.num.usize
 import silk.num.i64
 import silk.option { Option }
 import strips { Coverage, BAND, minU32 }
 import geometry { Affine, Point }
-import pixmap { Pixmap, Rgba8, div255, over }
+import pixmap { Pixmap, Rgba8, div255, over, overPacked, pack, scalePacked, storePacked }
 
 pub interface Shader {
   /// The premultiplied color at the center of device pixel `(x, y)`.
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8
+  /// Packed premultiplied colors (see [`pack`]) of pixels `x .. x + count` on row `y` into
+  /// `out[0 .. count]`.
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> ()
 }
 
 /// One premultiplied color everywhere.
@@ -34,6 +38,14 @@ impl Solid {
 }
 impl Shader for Solid {
   fn shade(self: &Self, x: u32, y: u32) -> Rgba8 { return self.color }
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    let word = pack(self.color)
+    let mut i: usize = 0
+    while i < count {
+      out[i] = word
+      i = i + 1
+    }
+  }
 }
 
 pub const SPREAD_PAD: u8 = 0
@@ -71,7 +83,6 @@ pub struct Gradient {
 }
 
 fn clamp01(value: f64) -> f64 { return f64.min(f64.max(value, 0.0), 1.0) }
-fn toByte(value: f64) -> u8 { return f64.toU8(f64.floor(clamp01(value) * 255.0 + 0.5)) }
 
 impl Gradient {
   fn make(kind: u8, x0: f64, y0: f64, r0: f64, x1: f64, y1: f64, r1: f64, spread: u8, transform: &Affine) -> Gradient {
@@ -127,36 +138,49 @@ impl Gradient {
     if stops.length == 0 { return }
     run self.ramp.appendRepeated(0, RAMP_SIZE * 4)
     let ramp = self.ramp.asMutSlice()
-    let mut i: usize = 0
+    let first = pack(stops[0].color.premultiply())
+    let last = pack(stops[stops.length - 1].color.premultiply())
+    let step = 1.0 / usize.toF64(RAMP_SIZE - 1)
+    // `segment` is the first stop whose fixed-up offset `hi` exceeds t; `lo` is the one before it.
     let mut segment: usize = 0
+    let mut lo = clamp01(stops[0].offset)
+    let mut hi = lo
+    let mut i: usize = 0
     while i < RAMP_SIZE {
-      let t = usize.toF64(i) / usize.toF64(RAMP_SIZE - 1)
-      // Advance to the first stop whose (fixed-up) offset exceeds t.
-      while segment < stops.length && fixedOffset(stops, segment) <= t { segment = segment + 1 }
-      let mut color = Rgba8.make(0, 0, 0, 0)
-      if segment == 0 {
-        color = stops[0].color.premultiply()
-      } else if segment == stops.length {
-        color = stops[stops.length - 1].color.premultiply()
-      } else {
-        let left = stops[segment - 1]
-        let right = stops[segment]
-        let lo = fixedOffset(stops, segment - 1)
-        let hi = fixedOffset(stops, segment)
-        let w = if hi > lo { (t - lo) / (hi - lo) } else { 1.0 }
-        color = mix(left.color, right.color, w, self.premultipliedInterpolation)
+      let t = usize.toF64(i) * step
+      while segment < stops.length && hi <= t {
+        segment = segment + 1
+        lo = hi
+        if segment < stops.length { hi = f64.max(hi, clamp01(stops[segment].offset)) }
       }
-      if self.single { color = stops[stops.length - 1].color.premultiply() }
-      ramp[i * 4] = color.r
-      ramp[i * 4 + 1] = color.g
-      ramp[i * 4 + 2] = color.b
-      ramp[i * 4 + 3] = color.a
-      i = i + 1
+      if self.single || segment == stops.length {
+        storePacked(&mut ramp, i * 4, last)
+        i = i + 1
+      } else if segment == 0 {
+        storePacked(&mut ramp, i * 4, first)
+        i = i + 1
+      } else {
+        // Entries up to `hi` interpolate this segment; step the weight in 32-bit fixed point.
+        // Here lo <= t < hi, so the span is positive.
+        let left = stops[segment - 1].color
+        let right = stops[segment].color
+        let span = hi - lo
+        let mut w = Intrinsic.f64ToU64((t - lo) / span * 4294967296.0)
+        let dw = Intrinsic.f64ToU64(step / span * 4294967296.0)
+        while i < RAMP_SIZE && usize.toF64(i) * step < hi {
+          let rounded = u64.shiftRight(w + 32768, 16)
+          let wb = if rounded < 65536 { u64.wrappingToU32(rounded) } else { 65536 }
+          storePacked(&mut ramp, i * 4, pack(mix(left, right, wb, self.premultipliedInterpolation)))
+          w = w + dw
+          i = i + 1
+        }
+      }
     }
   }
 
   /// The gradient parameter at gradient-space point `p`, or [`NOTHING`] where nothing is painted.
-  fn parameter(self: &Self, p: Point) -> f64 {
+  fn parameter(self: &Self, p: Point) -> f64
+  with Intrinsic.inlineAlways() {
     if self.kind == LINEAR {
       let dx = self.x1 - self.x0
       let dy = self.y1 - self.y0
@@ -191,39 +215,33 @@ impl Gradient {
 /// Encodes "nothing painted here" apart from every real parameter.
 const NOTHING: f64 = -1.0e300
 
-fn fixedOffset(stops: &[Stop], index: usize) -> f64 {
-  let mut offset = clamp01(stops[0].offset)
-  let mut i: usize = 1
-  while i <= index {
-    offset = f64.max(offset, clamp01(stops[i].offset))
-    i = i + 1
-  }
-  return offset
-}
-
-fn mix(a: Rgba8, b: Rgba8, w: f64, premultiplied: bool) -> Rgba8 {
-  let aa = u8.toF64(a.a) / 255.0
-  let ba = u8.toF64(b.a) / 255.0
-  let alpha = aa + (ba - aa) * w
+/// Interpolates stop colors `a` and `b` with weight `wb / 65536` on `b`, straight (then
+/// premultiplied) or premultiplied.
+fn mix(a: Rgba8, b: Rgba8, wb: u32, premultiplied: bool) -> Rgba8
+with Intrinsic.inlineAlways() {
+  let wa = 65536 - wb
   if premultiplied {
-    let r = u8.toF64(a.r) * aa + (u8.toF64(b.r) * ba - u8.toF64(a.r) * aa) * w
-    let g = u8.toF64(a.g) * aa + (u8.toF64(b.g) * ba - u8.toF64(a.g) * aa) * w
-    let bl = u8.toF64(a.b) * aa + (u8.toF64(b.b) * ba - u8.toF64(a.b) * aa) * w
-    return Rgba8 { r: toByte(r / 255.0), g: toByte(g / 255.0), b: toByte(bl / 255.0), a: toByte(alpha) }
+    let pa = a.premultiply()
+    let pb = b.premultiply()
+    return Rgba8 { r: lerpByte(pa.r, pb.r, wa, wb), g: lerpByte(pa.g, pb.g, wa, wb), b: lerpByte(pa.b, pb.b, wa, wb), a: lerpByte(pa.a, pb.a, wa, wb) }
   }
-  let r = u8.toF64(a.r) + (u8.toF64(b.r) - u8.toF64(a.r)) * w
-  let g = u8.toF64(a.g) + (u8.toF64(b.g) - u8.toF64(a.g)) * w
-  let bl = u8.toF64(a.b) + (u8.toF64(b.b) - u8.toF64(a.b)) * w
-  return Rgba8 { r: toByte(r * alpha / 255.0), g: toByte(g * alpha / 255.0), b: toByte(bl * alpha / 255.0), a: toByte(alpha) }
+  let alpha = lerpByte(a.a, b.a, wa, wb)
+  return Rgba8.make(lerpByte(a.r, b.r, wa, wb), lerpByte(a.g, b.g, wa, wb), lerpByte(a.b, b.b, wa, wb), alpha).premultiply()
 }
 
-fn spreadParameter(t: f64, spread: u8) -> f64 {
+fn lerpByte(a: u8, b: u8, wa: u32, wb: u32) -> u8
+with Intrinsic.inlineAlways() {
+  return u32.wrappingToU8(u32.shiftRight(u8.toU32(a) * wa + u8.toU32(b) * wb + 32768, 16))
+}
+
+fn spreadParameter(t: f64, spread: u8) -> f64
+with Intrinsic.inlineAlways() {
   if spread == SPREAD_REPEAT { return t - f64.floor(t) }
   if spread == SPREAD_REFLECT {
     let m = t - 2.0 * f64.floor(t * 0.5)
     return if m > 1.0 { 2.0 - m } else { m }
   }
-  return clamp01(t)
+  return if t < 0.0 { 0.0 } else if t > 1.0 { 1.0 } else { t }
 }
 
 impl Shader for Gradient {
@@ -240,6 +258,67 @@ impl Shader for Gradient {
     }
     return Rgba8 { r: ramp[index * 4], g: ramp[index * 4 + 1], b: ramp[index * 4 + 2], a: ramp[index * 4 + 3] }
   }
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    if !self.isPaintable() || self.single {
+      let word = pack(self.shade(x, y))
+      let mut i: usize = 0
+      while i < count {
+        out[i] = word
+        i = i + 1
+      }
+      return
+    }
+    let ramp = self.ramp.asSlice()
+    let scale = usize.toF64(RAMP_SIZE - 1)
+    // Gradient-space position of the first pixel center and the step to the next one.
+    let start = self.inverse.apply(Point.make(u32.toF64(x) + 0.5, u32.toF64(y) + 0.5))
+    let mut i: usize = 0
+    if self.kind == LINEAR {
+      // The linear parameter is affine in device space: step it along the row.
+      let t0 = self.parameter(start)
+      let dt = self.parameter(Point.make(start.x + self.inverse.a, start.y + self.inverse.b)) - t0
+      let finite = f64.isFinite(t0) && f64.isFinite(dt)
+      while i < count {
+        if finite {
+          let index = Intrinsic.f64ToUsize(spreadParameter(t0 + usize.toF64(i) * dt, self.spread) * scale + 0.5)
+          out[i] = rampWord(ramp, index)
+        } else {
+          out[i] = 0
+        }
+        i = i + 1
+      }
+      return
+    }
+    if self.r0 == 0.0 && self.x0 == self.x1 && self.y0 == self.y1 {
+      // Focal point at the center: t is the distance to it over the radius.
+      let inverseRadius = 1.0 / self.r1
+      while i < count {
+        let k = usize.toF64(i)
+        let dx = start.x + k * self.inverse.a - self.x1
+        let dy = start.y + k * self.inverse.b - self.y1
+        let t = f64.sqrt(dx * dx + dy * dy) * inverseRadius
+        out[i] = if f64.isFinite(t) { rampWord(ramp, Intrinsic.f64ToUsize(spreadParameter(t, self.spread) * scale + 0.5)) } else { 0 }
+        i = i + 1
+      }
+      return
+    }
+    while i < count {
+      let k = usize.toF64(i)
+      let t = self.parameter(Point.make(start.x + k * self.inverse.a, start.y + k * self.inverse.b))
+      if t == NOTHING || !f64.isFinite(t) {
+        out[i] = 0
+      } else {
+        out[i] = rampWord(ramp, Intrinsic.f64ToUsize(spreadParameter(t, self.spread) * scale + 0.5))
+      }
+      i = i + 1
+    }
+  }
+}
+
+fn rampWord(ramp: &[u8], index: usize) -> u32
+with Intrinsic.inlineAlways() {
+  let entry = Slice.view(ramp, index * 4, 4)
+  return u8.toU32(entry[0]) | u32.shiftLeft(u8.toU32(entry[1]), 8) | u32.shiftLeft(u8.toU32(entry[2]), 16) | u32.shiftLeft(u8.toU32(entry[3]), 24)
 }
 
 pub const SAMPLE_NEAREST: u8 = 0
@@ -303,6 +382,13 @@ impl<'a> Shader for ImagePattern<'a> {
       b: bilerp(a.b, b.b, c.b, d.b, wx, wy), a: bilerp(a.a, b.a, c.a, d.a, wx, wy),
     }
   }
+  fn shadeSpan(self: &Self, x: u32, y: u32, count: usize, out: &mut [u32]) -> () {
+    let mut i: usize = 0
+    while i < count {
+      out[i] = pack(self.shade(x + usize.toU32(i), y))
+      i = i + 1
+    }
+  }
 }
 
 fn bilerp(a: u8, b: u8, c: u8, d: u8, wx: f64, wy: f64) -> u8 {
@@ -320,45 +406,78 @@ pub fn fill<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opa
   let stride = u32.toUsize(target.width()) * 4
   let fullMask = u8.toU32(opacity)
   let d = target.dataMut()
+  let mut colors: [u32; SPAN] = [0; SPAN]
   let fills = coverage.fills()
   let mut f: usize = 0
   while f < fills.length {
     let span = fills[f]
+    let right = minU32(span.x + span.width, width)
     let mut y = span.y
     while y < span.y + BAND && y < height {
+      let row = u32.toUsize(y) * stride
       let mut x = span.x
-      while x < span.x + span.width && x < width {
-        let source = masked(shader.shade(x, y), fullMask)
-        over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, source)
-        x = x + 1
+      while x < right {
+        let count = u32.toUsize(minU32(right - x, SPAN_U32))
+        shader.shadeSpan(x, y, count, &mut colors)
+        let mut i: usize = 0
+        let mut at = row + u32.toUsize(x) * 4
+        if fullMask == 255 {
+          while i < count {
+            overPacked(&mut d, at, colors[i])
+            at = at + 4
+            i = i + 1
+          }
+        } else {
+          while i < count {
+            overPacked(&mut d, at, scalePacked(colors[i], fullMask))
+            at = at + 4
+            i = i + 1
+          }
+        }
+        x = x + usize.toU32(count)
       }
       y = y + 1
     }
     f = f + 1
   }
+  // Strips hold column-major alphas; shade each strip row as a span.
   let alphas = coverage.alphas()
   let strips = coverage.strips()
   let mut s: usize = 0
   while s < strips.length {
     let strip = strips[s]
-    let mut column: u32 = 0
-    while column < strip.width && strip.x + column < width {
-      let base = u32.toUsize(strip.alphaOffset + column * BAND)
-      let mut row: u32 = 0
-      while row < BAND && strip.y + row < height {
-        let mask = div255(u8.toU32(alphas[base + u32.toUsize(row)]) * fullMask)
-        if mask != 0 {
-          let x = strip.x + column
-          let y = strip.y + row
-          over(&mut d, u32.toUsize(y) * stride + u32.toUsize(x) * 4, masked(shader.shade(x, y), mask))
+    let right = minU32(strip.x + strip.width, width)
+    let mut row: u32 = 0
+    while row < BAND && strip.y + row < height {
+      let y = strip.y + row
+      let line = u32.toUsize(y) * stride
+      let mut x = strip.x
+      while x < right {
+        let count = u32.toUsize(minU32(right - x, SPAN_U32))
+        shader.shadeSpan(x, y, count, &mut colors)
+        let mut base = u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND + row)
+        let mut at = line + u32.toUsize(x) * 4
+        let mut i: usize = 0
+        while i < count {
+          let alpha = u8.toU32(alphas[base])
+          if alpha != 0 {
+            let mask = if fullMask == 255 { alpha } else { div255(alpha * fullMask) }
+            overPacked(&mut d, at, if mask == 255 { colors[i] } else { scalePacked(colors[i], mask) })
+          }
+          base = base + u32.toUsize(BAND)
+          at = at + 4
+          i = i + 1
         }
-        row = row + 1
+        x = x + usize.toU32(count)
       }
-      column = column + 1
+      row = row + 1
     }
     s = s + 1
   }
 }
+
+const SPAN: usize = 128
+const SPAN_U32: u32 = 128
 
 fn masked(color: Rgba8, mask: u32) -> Rgba8 {
   if mask == 255 { return color }

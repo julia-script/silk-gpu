@@ -102,15 +102,22 @@ without Dawn.
 
 `scripts/bench-vector` (scheduled weekly in the benchmarks workflow, not in PR CI) renders the
 four scenes of `bench/vector/WORKLOADS.md` with `vector` and with tiny-skia 0.11, prints the median
-frame time of each, and compares the two images. First run (2026-10-29, x86_64 container, release
+frame time of each, and compares the two images. Latest run (2026-10-29, x86_64 container, release
 builds, 512 x 512):
 
 | Scene | vector ms | tiny-skia ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| fills (300 translucent circles) | 21.9 | 10.0 | 2.20x | 2.3% |
-| strokes (150 round-joined stars) | 10.8 | 8.1 | 1.33x | 3.2% |
-| gradients (100 linear and radial rects) | 19.1 | 5.1 | 3.75x | 0.0% |
-| polygon (4000 edges, even-odd) | 12.6 | 23.6 | 0.54x | 30% |
+| fills (300 translucent circles) | 8.1 | 9.8 | 0.82x | 2.3% |
+| strokes (150 round-joined stars) | 4.8 | 8.6 | 0.56x | 3.2% |
+| gradients (100 linear and radial rects) | 3.1 | 4.9 | 0.63x | 0.0% |
+| polygon (4000 edges, even-odd) | 7.0 | 22.9 | 0.30x | 30% |
+
+The first run, before the coverage and compositing work, was 2.20x, 1.33x, 3.75x and 0.54x.
+What made the difference: coverage accumulates every line once into one buffer for the whole
+path and resolves only columns a line touched (an untouched column repeats the one before it);
+compositing works on packed pixels with a two-lane `div255`; shaders fill whole spans
+(`Shader.shadeSpan`), stepping the linear parameter along the row; gradient ramps interpolate in
+fixed point.
 
 The polygon difference is a known limit of area accumulation: the winding is clamped (nonzero)
 or folded (even-odd) per pixel after integrating, so pixels crossed by several edges of one path
