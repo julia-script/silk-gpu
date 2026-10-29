@@ -95,7 +95,8 @@ try {
   // it must not silently switch to a bundled or downloaded browser.
   browser = await chromium.launch({ headless: true,
     executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined, args: [
-    '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan',
+    // Preserve Playwright's screenshot surface feature when enabling Vulkan.
+    '--enable-unsafe-webgpu', '--use-angle=swiftshader', '--enable-features=Vulkan,CDPScreenshotNewSurface',
     '--disable-vulkan-surface', '--enable-unsafe-swiftshader',
     // Linux's system Vulkan loader may have no usable ICD even when ANGLE's
     // SwiftShader works. The compositor needs the same software Vulkan driver.
