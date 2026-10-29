@@ -105,7 +105,10 @@ without Dawn.
    transparent black elsewhere. Done so far: `feFlood`, `feOffset`, `feGaussianBlur` (the spec's
    three-box approximation for sigma >= 2 with the even-size offsets, a fixed-point kernel
    summing to 65536 below that), `feColorMatrix`, `feComposite` (Porter-Duff in integer
-   `div255`, arithmetic in f32), `feMerge`, `feBlend` and the linearRGB conversions. Conversions
+   `div255`, arithmetic in f32), `feMerge`, `feBlend`, `feMorphology` (separable min/max), `feComponentTransfer` (per-channel
+   256-byte tables built in f64, applied to integer-unpremultiplied bytes), `feTile`,
+   `feConvolveMatrix` (f32, all edge modes and `preserveAlpha`), `feDisplacementMap` (a per-byte
+   whole-pixel displacement table, nearest neighbor) and the linearRGB conversions. Conversions
    go through a 256 x 256 table of `(alpha, channel)` so the GPU applies exactly the CPU's
    result. On the GPU each primitive is a full-target pass of `shaders/filter.wgsl` (blur takes
    one pass per box or kernel and ping-pongs through a scratch image); `blend.wgsl` holds the
