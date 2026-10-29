@@ -143,15 +143,16 @@ builds, 512 x 512):
 
 | Scene | vector ms | tiny-skia ms | ratio | pixels differing by more than 8 |
 | --- | ---: | ---: | ---: | ---: |
-| fills (300 translucent circles) | 8.1 | 9.8 | 0.82x | 2.3% |
-| strokes (150 round-joined stars) | 4.8 | 8.6 | 0.56x | 3.2% |
-| gradients (100 linear and radial rects) | 3.1 | 4.9 | 0.63x | 0.0% |
-| polygon (4000 edges, even-odd) | 7.0 | 22.9 | 0.30x | 30% |
+| fills (300 translucent circles) | 6.0 | 10.0 | 0.60x | 2.3% |
+| strokes (150 round-joined stars) | 4.9 | 7.9 | 0.62x | 3.2% |
+| gradients (100 linear and radial rects) | 3.0 | 4.9 | 0.61x | 0.0% |
+| polygon (4000 edges, even-odd) | 6.0 | 22.3 | 0.27x | 30% |
 
 The first run, before the coverage and compositing work, was 2.20x, 1.33x, 3.75x and 0.54x.
 What made the difference: coverage accumulates every line once into one buffer for the whole
 path and resolves only columns a line touched (an untouched column repeats the one before it);
-compositing works on packed pixels with a two-lane `div255`; shaders fill whole spans
+compositing works on packed pixels with a two-lane `div255`, four pixels at a time with
+`silk.simd` for spans; shaders fill whole spans
 (`Shader.shadeSpan`), stepping the linear parameter along the row; gradient ramps interpolate in
 fixed point.
 

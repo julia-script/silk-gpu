@@ -9,6 +9,10 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+import silk.simd.simd
+import silk.simd.u8x16
+import silk.simd.u16x16
+import silk.simd.u32x4
 import strips { Coverage, BAND, minU32 }
 
 /// A straight (not premultiplied) 8-bit color.
@@ -166,6 +170,30 @@ with Intrinsic.inlineAlways() {
   let rb = div255Lanes((word & LANES) * scale)
   let ag = div255Lanes((u32.shiftRight(word, 8) & LANES) * scale)
   return rb | u32.shiftLeft(ag, 8)
+}
+
+/// [`overPacked`] for `count` packed premultiplied sources into consecutive pixels from byte
+/// `at`, four pixels per step with the same arithmetic.
+pub fn overSpan(d: &mut [u8], at: usize, colors: &[u32], count: usize) -> () {
+  let target = Slice.viewMut(&mut d, at, count * 4)
+  let full = u16x16.splat(255)
+  let half = u16x16.splat(128)
+  let eight = u16x16.splat(8)
+  let mut i: usize = 0
+  while i + 4 <= count {
+    let source = u8x16.toU16x16(u32x4.bitcastToU8x16(u32x4.load(colors, i)))
+    let below = u8x16.toU16x16(u8x16.load(&target, i * 4))
+    let alpha = u16x16.shuffle(source, source, [3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15])
+    // div255 as in `scalePacked`: t = x + 128, (t + (t >> 8)) >> 8, all within u16.
+    let t = u16x16.wrappingAdd(u16x16.wrappingMultiply(below, u16x16.wrappingSubtract(full, alpha)), half)
+    let scaled = u16x16.shiftRight(u16x16.wrappingAdd(t, u16x16.shiftRight(t, eight)), eight)
+    u8x16.store(&mut target, i * 4, u16x16.toU8x16(u16x16.wrappingAdd(scaled, source)))
+    i = i + 4
+  }
+  while i < count {
+    overPacked(&mut target, i * 4, colors[i])
+    i = i + 1
+  }
 }
 
 /// [`over`] with a packed premultiplied source.

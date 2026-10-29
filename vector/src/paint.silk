@@ -17,7 +17,7 @@ import silk.num.i64
 import silk.option { Option }
 import strips { Coverage, BAND, minU32 }
 import geometry { Affine, Point }
-import pixmap { Pixmap, Rgba8, div255, over, overPacked, pack, scalePacked, storePacked }
+import pixmap { Pixmap, Rgba8, div255, over, overPacked, overSpan, pack, scalePacked, storePacked }
 
 pub interface Shader {
   /// The premultiplied color at the center of device pixel `(x, y)`.
@@ -427,21 +427,14 @@ pub fn fill<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opa
       while x < right {
         let count = u32.toUsize(minU32(right - x, SPAN_U32))
         shader.shadeSpan(x, y, count, &mut colors)
-        let mut i: usize = 0
-        let mut at = row + u32.toUsize(x) * 4
-        if fullMask == 255 {
+        if fullMask != 255 {
+          let mut i: usize = 0
           while i < count {
-            overPacked(&mut d, at, colors[i])
-            at = at + 4
-            i = i + 1
-          }
-        } else {
-          while i < count {
-            overPacked(&mut d, at, scalePacked(colors[i], fullMask))
-            at = at + 4
+            colors[i] = scalePacked(colors[i], fullMask)
             i = i + 1
           }
         }
+        overSpan(&mut d, row + u32.toUsize(x) * 4, &colors, count)
         x = x + usize.toU32(count)
       }
       y = y + 1
@@ -464,18 +457,15 @@ pub fn fill<S: Shader>(target: &mut Pixmap, coverage: &Coverage, shader: &S, opa
         let count = u32.toUsize(minU32(right - x, SPAN_U32))
         shader.shadeSpan(x, y, count, &mut colors)
         let mut base = u32.toUsize(strip.alphaOffset + (x - strip.x) * BAND + row)
-        let mut at = line + u32.toUsize(x) * 4
         let mut i: usize = 0
         while i < count {
           let alpha = u8.toU32(alphas[base])
-          if alpha != 0 {
-            let mask = if fullMask == 255 { alpha } else { div255(alpha * fullMask) }
-            overPacked(&mut d, at, if mask == 255 { colors[i] } else { scalePacked(colors[i], mask) })
-          }
+          let mask = if fullMask == 255 { alpha } else { div255(alpha * fullMask) }
+          if mask != 255 { colors[i] = if mask == 0 { 0 } else { scalePacked(colors[i], mask) } }
           base = base + u32.toUsize(BAND)
-          at = at + 4
           i = i + 1
         }
+        overSpan(&mut d, line + u32.toUsize(x) * 4, &colors, count)
         x = x + usize.toU32(count)
       }
       row = row + 1

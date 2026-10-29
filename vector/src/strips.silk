@@ -260,7 +260,9 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
   if by <= topF || ay >= bottomF { return }
   // Both are in top ..= bottom, so the conversions need no check.
   let firstRow = Intrinsic.f32ToU32(f32.max(ay, topF))
-  let lastRow = Intrinsic.f32ToU32(f32.ceil(f32.min(by, bottomF)))
+  let lastBottom = f32.min(by, bottomF)
+  let lastTruncated = Intrinsic.f32ToU32(lastBottom)
+  let lastRow = if u32.toF32(lastTruncated) < lastBottom { lastTruncated + 1 } else { lastTruncated }
   let mut y = firstRow
   while y < lastRow {
     let rowTop = f32.max(u32.toF32(y), ay)
@@ -273,10 +275,13 @@ fn accumulate(area: &mut [f32], touched: &mut [u8], stride: usize, line: Line, o
     let flags = Slice.viewMut(&mut touched, u32.toUsize((y - top) / BAND) * stride, stride)
     let x0 = f32.min(xa, xb)
     let x1 = f32.max(xa, xb)
-    let x0floor = f32.floor(x0)
-    let x0i = Intrinsic.f32ToUsize(x0floor)
-    let x1ceil = f32.ceil(x1)
-    let x1i = Intrinsic.f32ToUsize(x1ceil)
+    // x0 and x1 are in 0 ..= localWidth, so truncating is the floor, and converting back is
+    // exact (silk-lang/silk#2561: f32.floor and ceil are software).
+    let x0i = Intrinsic.f32ToUsize(x0)
+    let x0floor = usize.toF32(x0i)
+    let x1t = Intrinsic.f32ToUsize(x1)
+    let x1i = if usize.toF32(x1t) < x1 { x1t + 1 } else { x1t }
+    let x1ceil = usize.toF32(x1i)
     if x1i <= x0i + 1 {
       flags[x0i] = 1
       flags[x0i + 1] = 1
