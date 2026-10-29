@@ -9,6 +9,7 @@ import silk.mem.allocator { Allocator, OutOfMemoryError }
 import silk.num.u8
 import silk.num.u32
 import silk.num.usize
+import silk.num.i64
 import silk.simd.simd
 import silk.simd.u8x16
 import silk.simd.u16x16
@@ -239,4 +240,13 @@ pub fn truncateF64ToU8(v: f64) -> u8 with Intrinsic.inlineAlways() {
 pub fn truncateToI64(v: f64) -> i64 with Intrinsic.inlineAlways() {
   if v >= -9223372036854775808.0 && v < 9223372036854775808.0 { return Intrinsic.f64ToI64(v) }
   return Intrinsic.trap("truncateToI64: the value is NaN, infinite, or outside the i64 range")
+}
+/// `floor(v)` for `|v| < 2^52`, where every such value converts exactly; larger magnitudes are
+/// already integers and NaN stays NaN.
+pub fn floorF64(v: f64) -> f64 with Intrinsic.inlineAlways() {
+  if v > -4503599627370496.0 && v < 4503599627370496.0 {
+    let t = i64.toF64(Intrinsic.f64ToI64(v))
+    return if t > v { t - 1.0 } else { t }
+  }
+  return v
 }
