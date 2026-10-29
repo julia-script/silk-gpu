@@ -2,7 +2,7 @@
 import silk.num.f64
 import silk.num.u8
 import silk.num.u32
-import pixmap { Rgba8, truncateF64ToU8 }
+import pixmap { Rgba8 }
 
 /// Decodes a straight sRGB channel in [0, 1] to linear light (CSS Color 4).
 pub fn srgbToLinear(v: f64) -> f64 {
@@ -37,7 +37,7 @@ pub fn encode(channel: f64, alpha: f64) -> u8 {
 }
 
 pub fn byte(value: f64) -> u8 {
-  return truncateF64ToU8(f64.min(f64.max(value, 0.0), 1.0) * 255.0 + 0.5)
+  return f64.toU8(f64.min(f64.max(value, 0.0), 1.0) * 255.0 + 0.5)
 }
 
 /// Source-over in linear light. `source` and destination are premultiplied sRGB bytes;
