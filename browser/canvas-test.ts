@@ -1,5 +1,18 @@
 import { WebGPUHost } from './host.ts';
 
+// Playwright serializes Error.message/stack, but not AggregateError.errors.
+// Keep all nested diagnostics in the thrown message at the browser boundary.
+function describeError(error, seen = new Set()) {
+  if (error === null || typeof error !== 'object') return String(error);
+  if (seen.has(error)) return '[circular error cause]';
+  seen.add(error);
+  const details = [error.stack ?? `${error.name ?? 'Error'}: ${error.message ?? String(error)}`];
+  if (error.cause !== undefined) details.push(`Caused by:\n${describeError(error.cause, seen)}`);
+  if (error instanceof AggregateError)
+    for (const [index, nested] of [...error.errors].entries()) details.push(`Aggregate member ${index + 1}:\n${describeError(nested, seen)}`);
+  return details.join('\n');
+}
+
 // Test-only helper. The caller owns the returned cleanup operation so Playwright
 // can screenshot the real last-presented canvas before unconfiguration/teardown.
 export async function runCanvas(wasmBytes, timeout = 30000) {
@@ -86,7 +99,10 @@ export async function runCanvas(wasmBytes, timeout = 30000) {
     return { canvas, frames, expectedRGBA: [64, 128, 191, 255], cleanup };
   } catch (error) {
     try { await cleanup(); }
-    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Canvas test and cleanup failed'); }
+    catch (cleanupError) {
+      const aggregate = new AggregateError([error, cleanupError], 'Canvas test and cleanup failed');
+      throw new Error(describeError(aggregate), { cause: aggregate });
+    }
     throw error;
   }
 }
