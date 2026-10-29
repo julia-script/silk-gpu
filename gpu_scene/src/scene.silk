@@ -16,6 +16,22 @@ pub const RUN_BYTES: usize = 24
 /// Words per paint record.
 pub const PAINT_WORDS: u32 = 16
 const SOLID_RUN: u32 = 0xffffffff
+/// Bytes per command record: op, then three operands.
+pub const COMMAND_BYTES: usize = 16
+/// Draws runs `a .. b` into the current target.
+pub const OP_DRAW: u32 = 0
+/// Starts an isolated, transparent layer (a group) or mask content.
+pub const OP_PUSH: u32 = 1
+/// Composites the top layer onto its parent: a = blend mode, b = opacity, c = mask id or NO_MASK.
+pub const OP_POP_LAYER: u32 = 2
+/// Turns the top layer into mask `a`: b = MASK_ALPHA or MASK_LUMINANCE, c = mask id to multiply
+/// by (clip intersection) or NO_MASK.
+pub const OP_POP_MASK: u32 = 3
+pub const NO_MASK: u32 = 0xffffffff
+/// `mask-type: alpha` (also clip paths drawn opaque): the content's alpha.
+pub const MASK_ALPHA: u32 = 0
+/// `mask-type: luminance`, like `vector.layer.Mask.fromLuminance`.
+pub const MASK_LUMINANCE: u32 = 1
 
 pub struct Scene {
   canvasWidth: u32,
@@ -24,6 +40,11 @@ pub struct Scene {
   alphaBytes: List<u8>,
   paintBytes: List<u8>,
   rampBytes: List<u8>,
+  commandBytes: List<u8>,
+  /// The first run not yet covered by a draw command.
+  pendingRuns: u32,
+  depth: u32,
+  masks: u32,
 }
 
 effect fn pushU32(bytes: &mut List<u8>, value: u32) -> () ! OutOfMemoryError ? &mut Allocator {
@@ -45,7 +66,8 @@ impl Scene {
   pub fn make(width: u32, height: u32) -> Scene {
     return Scene {
       canvasWidth: width, canvasHeight: height, runBytes: List<u8>.make(), alphaBytes: List<u8>.make(),
-      paintBytes: List<u8>.make(), rampBytes: List<u8>.make(),
+      paintBytes: List<u8>.make(), rampBytes: List<u8>.make(), commandBytes: List<u8>.make(), pendingRuns: 0, depth: 0,
+      masks: 0,
     }
   }
   pub fn width(self: &Self) -> u32 { return self.canvasWidth }
@@ -55,11 +77,65 @@ impl Scene {
   pub fn alphas(self: &Self) -> &[u8] { return self.alphaBytes.asSlice() }
   pub fn paints(self: &Self) -> &[u8] { return self.paintBytes.asSlice() }
   pub fn ramps(self: &Self) -> &[u8] { return self.rampBytes.asSlice() }
+  /// Command records ([`COMMAND_BYTES`] each). Empty when the scene has no layers or masks: then
+  /// every run draws straight onto the target.
+  pub fn commands(self: &Self) -> &[u8] { return self.commandBytes.asSlice() }
+  /// How many masks [`popMask`] has made.
+  pub fn maskCount(self: &Self) -> u32 { return self.masks }
+  /// Layers and masks pushed and not yet popped.
+  pub fn openLayers(self: &Self) -> u32 { return self.depth }
   pub fn clear(self: &mut Self) -> () {
     self.runBytes.clear()
     self.alphaBytes.clear()
     self.paintBytes.clear()
     self.rampBytes.clear()
+    self.commandBytes.clear()
+    self.pendingRuns = 0
+    self.depth = 0
+    self.masks = 0
+  }
+
+  /// Starts an isolated group: later draws go into a transparent layer until [`popLayer`] (or
+  /// mask content until [`popMask`]). Like drawing into a fresh `Pixmap` on the CPU.
+  pub effect fn pushLayer(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.command(OP_PUSH, 0, 0, 0)
+    self.depth = self.depth + 1
+  }
+
+  /// Composites the top layer onto its parent with blend `mode` (a `vector.layer` BLEND_ value)
+  /// and group `opacity`, through `mask` unless it is [`NO_MASK`]: like `vector.layer.composite`
+  /// or `compositeMasked`. Calls must pair with [`pushLayer`].
+  pub effect fn popLayer(self: &mut Self, mode: u8, opacity: u8, mask: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run self.command(OP_POP_LAYER, u8.toU32(mode), u8.toU32(opacity), mask)
+    self.depth = self.depth - 1
+  }
+
+  /// Ends the top layer as mask content and returns its mask id: its alpha or luminance
+  /// (`kind`), multiplied by mask `clip` unless that is [`NO_MASK`] (`Mask.intersect`). For a
+  /// clip path, fill its coverage in opaque white and use [`MASK_ALPHA`].
+  pub effect fn popMask(self: &mut Self, kind: u32, clip: u32) -> u32 ! OutOfMemoryError ? &mut Allocator {
+    let id = self.masks
+    run self.command(OP_POP_MASK, id, kind, clip)
+    self.depth = self.depth - 1
+    self.masks = self.masks + 1
+    return id
+  }
+
+  effect fn command(self: &mut Self, op: u32, a: u32, b: u32, c: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    let runs = self.runCount()
+    let pending = self.pendingRuns
+    if runs > pending {
+      run self.record(OP_DRAW, pending, runs, 0)
+      self.pendingRuns = runs
+    }
+    run self.record(op, a, b, c)
+  }
+
+  effect fn record(self: &mut Self, op: u32, a: u32, b: u32, c: u32) -> () ! OutOfMemoryError ? &mut Allocator {
+    run pushU32(&mut self.commandBytes, op)
+    run pushU32(&mut self.commandBytes, a)
+    run pushU32(&mut self.commandBytes, b)
+    run pushU32(&mut self.commandBytes, c)
   }
 
   /// Draws `coverage` with a straight-alpha `color`, like `Pixmap.fillCoverage` or

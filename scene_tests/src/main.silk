@@ -27,7 +27,9 @@ import vector.stroke { Stroke, Stroker, JOIN_ROUND, JOIN_MITER_CLIP, CAP_ROUND, 
 import vector.pixmap { Pixmap, Rgba8 }
 import vector.paint { Gradient, Stop, Solid, SPREAD_PAD, SPREAD_REFLECT, SPREAD_REPEAT }
 import vector.paint as painting
-import gpu_scene.scene { Scene }
+import vector.layer { Mask, BLEND_NORMAL }
+import vector.layer as layering
+import gpu_scene.scene { Scene, NO_MASK, MASK_ALPHA, MASK_LUMINANCE }
 import gpu_scene.renderer { SceneRenderer, FORMAT }
 
 const WIDTH: u32 = 128
@@ -140,6 +142,75 @@ effect fn gradients() -> Canvas ! OutOfMemoryError ? &mut Allocator {
   return move c
 }
 
+/// Fills `path` with `color` into the CPU `target` and records the same fill in the scene.
+effect fn fillBoth(c: &mut Canvas, target: &mut Pixmap, path: &Path, color: Rgba8, opacity: u8) -> () ! OutOfMemoryError ? &mut Allocator {
+  run c.raster.fill(path, &Affine.identity(), NONZERO, &mut c.coverage)
+  painting.fill(&mut target, &c.coverage, &Solid.make(color), opacity)
+  run c.scene.fill(&c.coverage, color, opacity)
+}
+
+/// Groups in all 16 blend modes over a striped backdrop, then a group through a luminance mask
+/// intersected with a clip path.
+effect fn layers() -> Canvas ! OutOfMemoryError ? &mut Allocator {
+  let mut c = run Canvas.make()
+  let id = Affine.identity()
+  let mut base = run Pixmap.make(WIDTH, HEIGHT)
+  base.clear(background())
+  let mut stripe: u32 = 0
+  while stripe < 8 {
+    let mut bar = Path.make()
+    run bar.rect(Rect.make(u32.toF64(stripe) * 16.0, 0.0, 16.0, 96.0))
+    let color = Rgba8.make(u32.toU8(stripe * 30), u32.toU8(255 - stripe * 25), u32.toU8(60 + stripe * 20), u32.toU8(140 + stripe * 15))
+    run fillBoth(&mut c, &mut base, &bar, color, 255)
+    stripe = stripe + 1
+  }
+  let mut mode: u32 = 0
+  while mode < 16 {
+    let cx = u32.toF64(mode % 4) * 32.0 + 16.0
+    let cy = u32.toF64(mode / 4) * 18.0 + 10.0
+    let mut group = run Pixmap.make(WIDTH, HEIGHT)
+    run c.scene.pushLayer()
+    let mut disk = Path.make()
+    run disk.circle(cx, cy, 11.0)
+    run fillBoth(&mut c, &mut group, &disk, Rgba8.make(u32.toU8(255 - mode * 9), u32.toU8(40 + mode * 12), 200, 210), 255)
+    let mut square = Path.make()
+    run square.rect(Rect.make(cx - 3.0, cy - 8.0, 13.0, 13.0))
+    run fillBoth(&mut c, &mut group, &square, Rgba8.make(250, 230, 20, 255), 255)
+    layering.composite(&mut base, &group, u32.toU8(mode), 200)
+    run c.scene.popLayer(u32.toU8(mode), 200, NO_MASK)
+    mode = mode + 1
+  }
+  // A clip path as an alpha mask, intersected with a luminance mask, on a normal group.
+  let mut clipContent = run Pixmap.make(WIDTH, HEIGHT)
+  run c.scene.pushLayer()
+  let mut clipShape = Path.make()
+  run clipShape.circle(64.0, 84.0, 30.0)
+  run fillBoth(&mut c, &mut clipContent, &clipShape, Rgba8.make(255, 255, 255, 255), 255)
+  let clip = run c.scene.popMask(MASK_ALPHA, NO_MASK)
+  let mut lumContent = run Pixmap.make(WIDTH, HEIGHT)
+  run c.scene.pushLayer()
+  let mut lumBand = Path.make()
+  run lumBand.rect(Rect.make(20.0, 66.0, 90.0, 30.0))
+  let stops = [Stop { offset: 0.0, color: Rgba8.make(255, 255, 255, 255) }, Stop { offset: 1.0, color: Rgba8.make(40, 0, 90, 120) }]
+  let mut fade = Gradient.linear(20.0, 0.0, 110.0, 0.0, SPREAD_PAD, &id)
+  run fade.setStops(&stops)
+  run c.raster.fill(&lumBand, &id, NONZERO, &mut c.coverage)
+  painting.fill(&mut lumContent, &c.coverage, &fade, 255)
+  run c.scene.fillGradient(&c.coverage, &fade, 255)
+  let lum = run c.scene.popMask(MASK_LUMINANCE, clip)
+  let mut group = run Pixmap.make(WIDTH, HEIGHT)
+  run c.scene.pushLayer()
+  let mut wide = Path.make()
+  run wide.rect(Rect.make(0.0, 60.0, 128.0, 36.0))
+  run fillBoth(&mut c, &mut group, &wide, Rgba8.make(200, 20, 60, 255), 255)
+  let mut mask = run Mask.fromLuminance(&lumContent)
+  mask.intersect(&run Mask.fromAlpha(&clipContent))
+  layering.compositeMasked(&mut base, &group, BLEND_NORMAL, 230, &mask)
+  run c.scene.popLayer(BLEND_NORMAL, 230, lum)
+  c.cpu = move base
+  return move c
+}
+
 fn extent(width: u32, height: u32) -> Extent3D {
   let mut size = Extent3D.default()
   size.setWidth(width)
@@ -148,7 +219,7 @@ fn extent(width: u32, height: u32) -> Extent3D {
   return size
 }
 
-effect fn renderOnGpu(device: &Device, queue: &Queue, renderer: &SceneRenderer, scene: &Scene) -> List<u8> ! GpuError | OutOfMemoryError {
+effect fn renderOnGpu(device: &Device, queue: &Queue, renderer: &SceneRenderer, scene: &Scene) -> List<u8> ! GpuError | OutOfMemoryError ? &mut Allocator {
   let mut descriptor = TextureDescriptor.default().withLabel(b"scene target")
   descriptor.setSize(extent(WIDTH, HEIGHT))
   descriptor.setFormat(FORMAT)
@@ -218,13 +289,17 @@ effect fn program() -> i32 ! GpuError | OutOfMemoryError {
   let queue = run gpu.getQueue(&device)
   let renderer = run SceneRenderer.make(&device)
   let solid = run solids() |> Effect.provideMut<Allocator>(&mut allocator)
-  let solidGpu = run renderOnGpu(&device, &queue, &renderer, &solid.scene)
+  let solidGpu = run renderOnGpu(&device, &queue, &renderer, &solid.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   let gradient = run gradients() |> Effect.provideMut<Allocator>(&mut allocator)
-  let gradientGpu = run renderOnGpu(&device, &queue, &renderer, &gradient.scene)
+  let gradientGpu = run renderOnGpu(&device, &queue, &renderer, &gradient.scene) |> Effect.provideMut<Allocator>(&mut allocator)
   let solidOk = compare("solids", solid.cpu.data(), solidGpu.asSlice(), 0)
   let gradientOk = compare("gradients", gradient.cpu.data(), gradientGpu.asSlice(), 2)
-  let drawn = painted("solids", solid.cpu.data(), 4000) && painted("gradients", gradient.cpu.data(), 8000)
-  return if solidOk && gradientOk && drawn { 0 } else { 1 }
+  let layered = run layers() |> Effect.provideMut<Allocator>(&mut allocator)
+  let layeredGpu = run renderOnGpu(&device, &queue, &renderer, &layered.scene) |> Effect.provideMut<Allocator>(&mut allocator)
+  // Non-separable and other non-normal modes run in f32 on both sides; allow one level.
+  let layersOk = compare("layers", layered.cpu.data(), layeredGpu.asSlice(), 1)
+  let drawn = painted("solids", solid.cpu.data(), 4000) && painted("gradients", gradient.cpu.data(), 8000) && painted("layers", layered.cpu.data(), 9000)
+  return if solidOk && gradientOk && layersOk && drawn { 0 } else { 1 }
 }
 
 effect fn failed<E>(error: E) -> i32 {
