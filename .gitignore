@@ -1,0 +1,8 @@
+.cache/
+.silk/
+build/
+target/
+node_modules/
+__pycache__/
+*.dSYM/
+.DS_Store
