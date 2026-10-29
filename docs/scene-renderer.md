@@ -100,6 +100,20 @@ without Dawn.
    luminance mask through a clip, and image patterns, and matches the CPU byte for byte on lavapipe. Textures are
    allocated per render; pooling them is future work.
 
+10. **Filters** (`vector.filter`, `gpu_scene.filter`): the Filter Effects primitives on
+   canvas-sized premultiplied images, each writing the result inside its primitive subregion and
+   transparent black elsewhere. Done so far: `feFlood`, `feOffset`, `feGaussianBlur` (the spec's
+   three-box approximation for sigma >= 2 with the even-size offsets, a fixed-point kernel
+   summing to 65536 below that), `feColorMatrix`, `feComposite` (Porter-Duff in integer
+   `div255`, arithmetic in f32), `feMerge`, `feBlend` and the linearRGB conversions. Conversions
+   go through a 256 x 256 table of `(alpha, channel)` so the GPU applies exactly the CPU's
+   result. On the GPU each primitive is a full-target pass of `shaders/filter.wgsl` (blur takes
+   one pass per box or kernel and ping-pongs through a scratch image); `blend.wgsl` holds the
+   blend math shared with `compose.wgsl`, and `scripts/embed-shaders` prepends it. The scene test
+   runs every primitive, operator, blend mode and several blur sizes on both sides and matches
+   byte for byte on lavapipe. Scene integration (filter commands in `Scene`) comes with the SVG
+   renderer, which decides the filter graph and region.
+
 ## Planned work
 
 | PR | Content | Exit test |

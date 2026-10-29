@@ -5,7 +5,7 @@
 import webgpu.runtime { Instance, RequestAdapterOptions, Device, GpuError }
 import webgpu.runtime as runtime
 import webgpu.resources as gpu
-import webgpu.resources { Queue }
+import webgpu.resources { Queue, CommandEncoder }
 import webgpu.descriptors {
   DeviceDescriptor, BufferDescriptor, TextureDescriptor, TextureViewDescriptor, Extent3D,
   TexelCopyTextureInfo, TexelCopyBufferInfo, TexelCopyBufferLayout,
@@ -31,6 +31,9 @@ import vector.layer { Mask, BLEND_NORMAL }
 import vector.layer as layering
 import gpu_scene.scene { Scene, NO_MASK, MASK_ALPHA, MASK_LUMINANCE }
 import gpu_scene.renderer { SceneRenderer, FORMAT }
+import gpu_scene.filter { FilterRenderer, FilterImage }
+import vector.filter as filtering
+import vector.filter { Region, BlurPlan, colorMatrixOf, MATRIX, SATURATE, HUE_ROTATE, LUMINANCE_TO_ALPHA }
 
 const WIDTH: u32 = 128
 const HEIGHT: u32 = 96
@@ -321,6 +324,161 @@ fn painted(name: string<'static>, cpu: &[u8], minimum: u32) -> bool {
   return count >= minimum
 }
 
+/// A transparent canvas with overlapping translucent shapes, the source graphic for filters.
+effect fn filterSource(dx: f64, color: Rgba8) -> Pixmap ! OutOfMemoryError ? &mut Allocator {
+  let mut p = run Pixmap.make(WIDTH, HEIGHT)
+  p.clear(Rgba8.make(0, 0, 0, 0))
+  let mut raster = Rasterizer.make()
+  let mut coverage = Coverage.make(WIDTH, HEIGHT)
+  let id = Affine.identity()
+  let s = run star(44.0 + dx, 46.0, 36.0, 15.0)
+  run raster.fill(&s, &id, NONZERO, &mut coverage)
+  painting.fill(&mut p, &coverage, &Solid.make(color), 220)
+  let mut circle = Path.make()
+  run circle.circle(80.0 - dx, 52.0, 30.0)
+  run raster.fill(&circle, &id, NONZERO, &mut coverage)
+  painting.fill(&mut p, &coverage, &Solid.make(Rgba8.make(30, 150, 210, 140)), 255)
+  let mut rect = Path.make()
+  run rect.rect(Rect.make(4.5, 70.25, 120.0, 14.0))
+  run raster.fill(&rect, &id, NONZERO, &mut coverage)
+  painting.fill(&mut p, &coverage, &Solid.make(Rgba8.make(250, 200, 40, 255)), 255)
+  return move p
+}
+
+effect fn readImage(device: &Device, queue: &Queue, image: &FilterImage) -> List<u8> ! GpuError | OutOfMemoryError ? &mut Allocator {
+  let size = u32.toUsize(WIDTH * HEIGHT * 4)
+  let readback = run gpu.createBuffer(device, &BufferDescriptor.make(b"filter readback", usize.toU64(size), flags.WGPUBufferUsage_CopyDst | flags.WGPUBufferUsage_MapRead, false))
+  let mut encoder = run gpu.createCommandEncoder(device, b"filter readback")
+  let source = TexelCopyTextureInfo.default().withTexture(&image.texture)
+  let mut layout: TexelCopyBufferLayout = TexelCopyBufferLayout.default()
+  layout.setBytesPerRow(WIDTH * 4)
+  layout.setRowsPerImage(HEIGHT)
+  let mut destination = TexelCopyBufferInfo.default().withBuffer(&readback)
+  destination.setLayout(layout)
+  encoder.copyTextureToBuffer(&source, &destination, &extent(WIDTH, HEIGHT))
+  drop destination
+  drop source
+  let commands = run encoder.finish(b"filter readback")
+  queue.submit(&[commands.reference()])
+  run device.checkErrors()
+  return run runtime.mapRead(device, &readback, 0, size)
+}
+
+effect fn submit(queue: &Queue, encoder: CommandEncoder) -> () ! GpuError {
+  let commands = run encoder.finish(b"filter test")
+  queue.submit(&[commands.reference()])
+}
+
+/// Compares every primitive of vector.filter with gpu_scene.filter on the same inputs.
+effect fn filters(device: &Device, queue: &Queue) -> bool ! GpuError | OutOfMemoryError ? &mut Allocator {
+  let f = run FilterRenderer.make(device, queue)
+  let a = run filterSource(0.0, Rgba8.make(220, 60, 30, 255))
+  let b = run filterSource(10.0, Rgba8.make(90, 20, 160, 255))
+  let gpuA = run FilterImage.make(device, WIDTH, HEIGHT)
+  gpuA.write(queue, &a)
+  let gpuB = run FilterImage.make(device, WIDTH, HEIGHT)
+  gpuB.write(queue, &b)
+  let gpuOut = run FilterImage.make(device, WIDTH, HEIGHT)
+  let spare = run FilterImage.make(device, WIDTH, HEIGHT)
+  let scratch = run FilterImage.make(device, WIDTH, HEIGHT)
+  let mut out = run Pixmap.make(WIDTH, HEIGHT)
+  let region = Region.make(9, 7, 117, 90)
+  let mut ok = painted("filter source", a.data(), 5000)
+
+  filtering.flood(&mut out, Rgba8.make(30, 140, 220, 200), 180, region)
+  let mut encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.flood(device, queue, &mut encoder, &gpuOut, Rgba8.make(30, 140, 220, 200), 180, region)
+  run submit(queue, move encoder)
+  let flooded = run readImage(device, queue, &gpuOut)
+  ok = compare("feFlood", out.data(), flooded.asSlice(), 0) && ok
+
+  filtering.offset(&mut out, &a, 5, -3, region)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.offset(device, queue, &mut encoder, &gpuOut, &gpuA, 5, -3, region)
+  run submit(queue, move encoder)
+  let moved = run readImage(device, queue, &gpuOut)
+  ok = compare("feOffset", out.data(), moved.asSlice(), 0) && ok
+
+  filtering.copy(&mut out, &b, region)
+  filtering.mergeOver(&mut out, &a, region)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.copy(device, queue, &mut encoder, &spare, &gpuB, region)
+  run f.mergeOver(device, queue, &mut encoder, &gpuOut, &spare, &gpuA, region)
+  run submit(queue, move encoder)
+  let merged = run readImage(device, queue, &gpuOut)
+  ok = compare("feMerge", out.data(), merged.asSlice(), 0) && ok
+
+  let k: [f32; 4] = [0.5, 0.7, 0.3, -0.1]
+  let mut operator: u8 = 0
+  while operator <= filtering.COMPOSITE_ARITHMETIC {
+    filtering.composite(&mut out, &a, &b, operator, k, region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.composite(device, queue, &mut encoder, &gpuOut, &gpuA, &gpuB, operator, k, region)
+    run submit(queue, move encoder)
+    let composited = run readImage(device, queue, &gpuOut)
+    // Arithmetic runs in f32 on both sides; allow one level.
+    ok = compare("feComposite", out.data(), composited.asSlice(), if operator == filtering.COMPOSITE_ARITHMETIC { 1 } else { 0 }) && ok
+    operator = operator + 1
+  }
+
+  let mut mode: u8 = 0
+  while mode < 15 {
+    filtering.blend(&mut out, &a, &b, mode, region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.blend(device, queue, &mut encoder, &gpuOut, &gpuA, &gpuB, mode, region)
+    run submit(queue, move encoder)
+    let blended = run readImage(device, queue, &gpuOut)
+    ok = compare("feBlend", out.data(), blended.asSlice(), if mode == 0 { 0 } else { 1 }) && ok
+    mode = mode + 1
+  }
+
+  let saturate: [f32; 1] = [0.3]
+  let hue: [f32; 1] = [90.0]
+  let none: [f32; 0] = []
+  let custom: [f32; 20] = [0.2, 0.7, 0.1, 0.0, 0.05, 0.9, 0.0, 0.3, 0.0, 0.0, 0.0, 0.4, 0.6, 0.1, -0.05, 0.0, 0.0, 0.0, 0.8, 0.1]
+  let mut kind: u8 = 0
+  while kind < 4 {
+    let m = if kind == SATURATE { colorMatrixOf(kind, &saturate) } else if kind == HUE_ROTATE { colorMatrixOf(kind, &hue) }
+      else if kind == MATRIX { colorMatrixOf(kind, &custom) } else { colorMatrixOf(kind, &none) }
+    filtering.colorMatrix(&mut out, &a, m, region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.colorMatrix(device, queue, &mut encoder, &gpuOut, &gpuA, m, region)
+    run submit(queue, move encoder)
+    let matrixed = run readImage(device, queue, &gpuOut)
+    ok = compare("feColorMatrix", out.data(), matrixed.asSlice(), 1) && ok
+    kind = kind + 1
+  }
+
+  let sigmas: [f64; 8] = [3.0, 3.0, 1.0, 1.0, 0.5, 4.5, 2.5, 0.0]
+  let mut s: usize = 0
+  while s < 8 {
+    let horizontal = run BlurPlan.make(sigmas[s])
+    let vertical = run BlurPlan.make(sigmas[s + 1])
+    run filtering.gaussianBlur(&mut out, &a, &horizontal, &vertical, region)
+    encoder = run gpu.createCommandEncoder(device, b"filter test")
+    run f.gaussianBlur(device, queue, &mut encoder, &gpuOut, &gpuA, &scratch, &horizontal, &vertical, region)
+    run submit(queue, move encoder)
+    let blurred = run readImage(device, queue, &gpuOut)
+    ok = compare("feGaussianBlur", out.data(), blurred.asSlice(), 0) && ok
+    s = s + 2
+  }
+
+  filtering.copy(&mut out, &a, Region.of(&a))
+  filtering.toLinear(&mut out)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.toLinear(device, queue, &mut encoder, &gpuOut, &gpuA)
+  run submit(queue, move encoder)
+  let linear = run readImage(device, queue, &gpuOut)
+  ok = compare("toLinear", out.data(), linear.asSlice(), 0) && ok
+  filtering.toSrgb(&mut out)
+  encoder = run gpu.createCommandEncoder(device, b"filter test")
+  run f.toSrgb(device, queue, &mut encoder, &spare, &gpuOut)
+  run submit(queue, move encoder)
+  let srgb = run readImage(device, queue, &spare)
+  ok = compare("toSrgb", out.data(), srgb.asSlice(), 0) && ok
+  return ok
+}
+
 effect fn program() -> i32 ! GpuError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let instance = run Instance.create()
@@ -343,7 +501,8 @@ effect fn program() -> i32 ! GpuError | OutOfMemoryError {
   let imagesOk = compare("images", imaged.cpu.data(), imagedGpu.asSlice(), 0)
   let drawn = painted("solids", solid.cpu.data(), 4000) && painted("gradients", gradient.cpu.data(), 8000) && painted("layers", layered.cpu.data(), 9000)
     && painted("images", imaged.cpu.data(), 6000)
-  return if solidOk && gradientOk && layersOk && imagesOk && drawn { 0 } else { 1 }
+  let filtersOk = run filters(&device, &queue) |> Effect.provideMut<Allocator>(&mut allocator)
+  return if solidOk && gradientOk && layersOk && imagesOk && drawn && filtersOk { 0 } else { 1 }
 }
 
 effect fn failed<E>(error: E) -> i32 {
@@ -352,4 +511,9 @@ effect fn failed<E>(error: E) -> i32 {
   return 2
 }
 
-pub fn main() -> i32 { return run Effect.catchAll(program(), failed) }
+effect fn gpuFailed(error: GpuError) -> i32 ! never {
+  StderrWriter.print("scene test failed with GPU error {}: {:?}\n", &(error.code, error.message.asSlice()))
+  return 2
+}
+
+pub fn main() -> i32 { return run Effect.catchAll(Effect.catch<GpuError>(program(), gpuFailed), failed) }

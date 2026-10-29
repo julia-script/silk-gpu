@@ -35,7 +35,8 @@ impl Region {
   pub fn make(x0: u32, y0: u32, x1: u32, y1: u32) -> Region { return Region { x0: x0, y0: y0, x1: x1, y1: y1 } }
   /// The whole of `pixmap`.
   pub fn of(pixmap: &Pixmap) -> Region { return Region { x0: 0, y0: 0, x1: pixmap.width(), y1: pixmap.height() } }
-  fn clampTo(self: &Self, width: u32, height: u32) -> Region {
+  /// The region limited to a `width` x `height` canvas.
+  pub fn clampTo(self: &Self, width: u32, height: u32) -> Region {
     let x1 = minU32(self.x1, width)
     let y1 = minU32(self.y1, height)
     return Region { x0: minU32(self.x0, x1), y0: minU32(self.y0, y1), x1: x1, y1: y1 }
@@ -510,17 +511,39 @@ fn convert(pixmap: &mut Pixmap, linear: bool) -> () {
   while i < d.length {
     let a = d[i + 3]
     if a != 0 {
-      let af = u8.toF64(a) / 255.0
-      let mut c: usize = 0
-      while c < 3 {
-        let v = f64.min(u8.toF64(d[i + c]) / 255.0 / af, 1.0)
-        let t = if linear { srgbToLinear(v) } else { linearToSrgb(v) }
-        d[i + c] = f64.toU8(f64.floor(t * af * 255.0 + 0.5))
-        c = c + 1
-      }
+      d[i] = convertByte(d[i], a, linear)
+      d[i + 1] = convertByte(d[i + 1], a, linear)
+      d[i + 2] = convertByte(d[i + 2], a, linear)
     }
     i = i + 4
   }
+}
+
+/// One premultiplied channel `c` of a pixel with alpha `a` (nonzero), converted to linear light
+/// when `linear` is true or back to sRGB otherwise.
+pub fn convertByte(c: u8, a: u8, linear: bool) -> u8 {
+  let af = u8.toF64(a) / 255.0
+  let v = f64.min(u8.toF64(c) / 255.0 / af, 1.0)
+  let t = if linear { srgbToLinear(v) } else { linearToSrgb(v) }
+  return f64.toU8(f64.floor(t * af * 255.0 + 0.5))
+}
+
+/// [`convertByte`] for every alpha and channel byte, at `a * 256 + c` (alpha 0 maps to 0), so
+/// other renderers can match the conversion exactly with a lookup.
+pub effect fn conversionTable(linear: bool) -> List<u8> ! OutOfMemoryError ? &mut Allocator {
+  let mut table = List<u8>.make()
+  run table.appendRepeated(0, 65536)
+  let t = table.asMutSlice()
+  let mut a: u32 = 1
+  while a < 256 {
+    let mut c: u32 = 0
+    while c < 256 {
+      t[u32.toUsize(a * 256 + c)] = convertByte(u32.toU8(c), u32.toU8(a), linear)
+      c = c + 1
+    }
+    a = a + 1
+  }
+  return move table
 }
 
 fn srgbToLinear(v: f64) -> f64 {

@@ -1,3 +1,4 @@
 //! GPU scene renderer: draws `vector` coverage strips with paints through WebGPU.
 import scene
 import renderer
+import filter
